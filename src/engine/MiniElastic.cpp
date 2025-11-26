@@ -2,7 +2,6 @@
 #include "MiniElastic.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <set>
 #include <stdexcept>
 
@@ -11,15 +10,33 @@ using json = nlohmann::json;
 namespace minielastic {
 
 // -----------------------------------------------------------
+// CTOR/DTOR
+// -----------------------------------------------------------
+MiniElastic::MiniElastic(const std::string& dataDir) {
+    if (!dataDir.empty()) {
+        logStore_ = std::make_unique<LogStore>(dataDir);
+        persistenceEnabled_ = logStore_->good();
+        if (persistenceEnabled_) {
+            loadFromLog();
+        }
+    }
+}
+
+MiniElastic::~MiniElastic() {
+}
+
+// -----------------------------------------------------------
 // PUBLIC: Index a document
 // -----------------------------------------------------------
 MiniElastic::DocId MiniElastic::indexDocument(const std::string& jsonStr) {
     json j = json::parse(jsonStr); // may throw; callers should catch
 
     DocId id = nextId_++;
-    documents_[id] = j;
+    putDocumentInternal(id, j);
 
-    indexJson(id, j);
+    if (persistenceEnabled_) {
+        logStore_->append(LogRecord{LogRecord::Op::Put, id, j});
+    }
 
     return id;
 }
@@ -33,6 +50,30 @@ json MiniElastic::getDocument(DocId id) const {
         throw std::runtime_error("Document ID not found");
     }
     return it->second;
+}
+
+// -----------------------------------------------------------
+// PUBLIC: Delete a document
+// -----------------------------------------------------------
+bool MiniElastic::deleteDocument(DocId id) {
+    return deleteDocumentInternal(id, true);
+}
+
+bool MiniElastic::deleteDocumentInternal(DocId id, bool persist) {
+    auto it = documents_.find(id);
+    if (it == documents_.end()) {
+        return false;
+    }
+
+    // Remove indexed terms before dropping the document
+    removeJson(id, it->second);
+    documents_.erase(it);
+
+    if (persist && persistenceEnabled_) {
+        logStore_->append(LogRecord{LogRecord::Op::Del, id, {}});
+    }
+
+    return true;
 }
 
 // -----------------------------------------------------------
@@ -82,24 +123,7 @@ std::vector<MiniElastic::DocId> MiniElastic::search(const std::string& query) co
 // PRIVATE: Tokenizer
 // -----------------------------------------------------------
 std::vector<std::string> MiniElastic::tokenize(const std::string& text) const {
-    std::vector<std::string> tokens;
-    std::string current;
-
-    for (unsigned char ch : text) {
-        if (std::isalnum(ch)) {
-            current.push_back(std::tolower(ch));
-        } else {
-            if (!current.empty()) {
-                tokens.push_back(current);
-                current.clear();
-            }
-        }
-    }
-    if (!current.empty()) {
-        tokens.push_back(current);
-    }
-
-    return tokens;
+    return Analyzer::tokenize(text);
 }
 
 // -----------------------------------------------------------
@@ -134,6 +158,32 @@ void MiniElastic::indexJsonRecursive(DocId id, const json& node) {
 }
 
 // -----------------------------------------------------------
+// PRIVATE: Remove all postings for a document
+// -----------------------------------------------------------
+void MiniElastic::removeJson(DocId id, const json& j) {
+    removeJsonRecursive(id, j);
+}
+
+void MiniElastic::removeJsonRecursive(DocId id, const json& node) {
+    if (node.is_string()) {
+        auto terms = Analyzer::tokenize(node.get<std::string>());
+        for (const auto& term : terms) {
+            removePosting(term, id);
+        }
+    }
+    else if (node.is_array()) {
+        for (const auto& element : node) {
+            removeJsonRecursive(id, element);
+        }
+    }
+    else if (node.is_object()) {
+        for (const auto& it : node.items()) {
+            removeJsonRecursive(id, it.value());
+        }
+    }
+}
+
+// -----------------------------------------------------------
 // PRIVATE: Add posting with no duplicates inside the vector
 // -----------------------------------------------------------
 void MiniElastic::addPosting(const std::string& term, DocId id) {
@@ -143,6 +193,38 @@ void MiniElastic::addPosting(const std::string& term, DocId id) {
     if (vec.empty() || vec.back() != id) {
         vec.push_back(id);
     }
+}
+
+void MiniElastic::removePosting(const std::string& term, DocId id) {
+    auto it = invertedIndex_.find(term);
+    if (it == invertedIndex_.end()) return;
+
+    auto& vec = it->second;
+    vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
+
+    if (vec.empty()) {
+        invertedIndex_.erase(it);
+    }
+}
+
+// -----------------------------------------------------------
+// PRIVATE: Persistence helpers
+// -----------------------------------------------------------
+void MiniElastic::loadFromLog() {
+    if (!logStore_) return;
+    logStore_->load([this](const LogRecord& rec) {
+        if (rec.op == LogRecord::Op::Put) {
+            putDocumentInternal(rec.id, rec.doc);
+            nextId_ = std::max<DocId>(nextId_, rec.id + 1);
+        } else if (rec.op == LogRecord::Op::Del) {
+            deleteDocumentInternal(rec.id, false);
+        }
+    });
+}
+
+void MiniElastic::putDocumentInternal(DocId id, const json& doc) {
+    documents_[id] = doc;
+    indexJson(id, doc);
 }
 
 } // namespace minielastic

@@ -7,7 +7,7 @@
 
 class MiniElasticHttpServer {
 public:
-    MiniElasticHttpServer(std::string host, int port);
+    MiniElasticHttpServer(std::string host, int port, std::string dataDir = "");
     void run();
 
 private:

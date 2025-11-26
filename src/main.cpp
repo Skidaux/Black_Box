@@ -1,7 +1,7 @@
 #include "MiniElasticHttpServer.hpp"
 
 int main() {
-    MiniElasticHttpServer app("0.0.0.0", 8080);
+    MiniElasticHttpServer app("0.0.0.0", 8080, "data");
     app.run();
     return 0;
 }

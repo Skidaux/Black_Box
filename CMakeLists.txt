@@ -12,6 +12,8 @@ include_directories(include)
 set(SOURCES
     src/main.cpp
     src/engine/MiniElastic.cpp
+    src/core/Analyzer.cpp
+    src/storage/LogStore.cpp
     src/server/MiniElasticHttpServer.cpp
 )
 
