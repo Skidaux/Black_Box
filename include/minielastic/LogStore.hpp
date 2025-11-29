@@ -5,6 +5,7 @@
 #include <fstream>
 #include <string>
 #include <nlohmann/json.hpp>
+#include "minielastic/Checksum.hpp"
 
 namespace minielastic {
 
@@ -34,7 +35,6 @@ private:
     std::string logPath_;
     std::ofstream stream_;
 
-    static uint32_t crc32(const std::string& data);
     void ensureOpen();
 };
 

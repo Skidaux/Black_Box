@@ -98,16 +98,4 @@ void LogStore::append(const LogRecord& record) {
     stream_.flush();
 }
 
-uint32_t LogStore::crc32(const std::string& data) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (unsigned char b : data) {
-        crc ^= b;
-        for (int i = 0; i < 8; ++i) {
-            uint32_t mask = -(crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
-        }
-    }
-    return ~crc;
-}
-
 } // namespace minielastic

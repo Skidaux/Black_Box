@@ -1,4 +1,4 @@
-# MiniElastic Design Outline
+# BlackBox Design Outline
 
 ## API Standards
 - Version all endpoints under `/v1/`.
@@ -38,6 +38,6 @@
 ## Code Layout
 - `src/core/Analyzer.cpp` / `include/minielastic/Analyzer.hpp`: tokenization/analyzers.
 - `src/storage/LogStore.cpp` / `include/minielastic/LogStore.hpp`: append-only log with per-record checksums.
-- `src/engine/MiniElastic.cpp` / `include/MiniElastic.hpp`: in-memory index + persistence wiring.
-- `src/server/MiniElasticHttpServer.cpp` / `include/MiniElasticHttpServer.hpp`: HTTP API surface.
+- `src/engine/BlackBox.cpp` / `include/BlackBox.hpp`: in-memory index + persistence wiring.
+- `src/server/BlackBoxHttpServer.cpp` / `include/BlackBoxHttpServer.hpp`: HTTP API surface.
 - `src/main.cpp`: entry point wiring server + data directory.

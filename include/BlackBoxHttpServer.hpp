@@ -2,12 +2,12 @@
 
 #include <string>
 #include "httplib.h"
-#include "MiniElastic.hpp"
+#include "BlackBox.hpp"
 #include <nlohmann/json.hpp>
 
-class MiniElasticHttpServer {
+class BlackBoxHttpServer {
 public:
-    MiniElasticHttpServer(std::string host, int port, std::string dataDir = "");
+    BlackBoxHttpServer(std::string host, int port, std::string dataDir = "");
     void run();
 
 private:
@@ -16,5 +16,6 @@ private:
     std::string host_;
     int port_;
     httplib::Server server_;
-    minielastic::MiniElastic db_;
+    minielastic::BlackBox db_;
+    std::string dataDir_;
 };
