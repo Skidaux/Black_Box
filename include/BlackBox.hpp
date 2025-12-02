@@ -17,8 +17,13 @@ public:
     using DocId = uint32_t;
     using SearchHit = algo::SearchHit;
 
+    enum class FieldType { Text, ArrayString, Bool, Number, Vector, Unknown };
+
     struct IndexSchema {
         nlohmann::json schema;
+        uint32_t vectorDim = 0; // optional vector dimension for vector field
+        std::unordered_map<std::string, FieldType> fieldTypes;
+        std::string vectorField;
     };
 
     explicit BlackBox(const std::string& dataDir = "");
@@ -27,15 +32,21 @@ public:
     // Index management
     bool createIndex(const std::string& name, const IndexSchema& schema);
     bool indexExists(const std::string& name) const;
+    const IndexSchema* getSchema(const std::string& name) const;
 
     // Index a document from a JSON string and return its ID in the given index.
     DocId indexDocument(const std::string& index, const std::string& jsonStr);
+    // Update a document (partial merge if partial=true, else replace).
+    bool updateDocument(const std::string& index, DocId id, const std::string& jsonStr, bool partial);
 
     // Search with selectable algorithm: "lexical", "bm25", "fuzzy", "semantic"
     std::vector<SearchHit> search(const std::string& index, const std::string& query, const std::string& mode = "bm25", size_t maxResults = 10, int maxEditDistance = 1) const;
 
     // Hybrid search: blend bm25 + semantic + lexical with weights
     std::vector<SearchHit> searchHybrid(const std::string& index, const std::string& query, double wBm25, double wSemantic, double wLexical, size_t maxResults) const;
+
+    // Vector search (cosine similarity)
+    std::vector<SearchHit> searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults) const;
 
     // Retrieve a single document.
     nlohmann::json getDocument(const std::string& index, DocId id) const;
@@ -59,6 +70,11 @@ private:
         std::unordered_map<DocId, uint32_t> docLengths;
         double avgDocLen = 0.0;
         IndexSchema schema;
+        std::unordered_map<DocId, std::vector<float>> vectors;
+        // Doc-values for filters
+        std::unordered_map<std::string, std::unordered_map<DocId, double>> numericValues;
+        std::unordered_map<std::string, std::unordered_map<DocId, bool>> boolValues;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::vector<DocId>>> stringLists; // for array<string> fields
     };
 
     std::string dataDir_;
@@ -72,6 +88,7 @@ private:
     // Recursively walk JSON and index string fields
     void indexJson(IndexState& idx, DocId id, const nlohmann::json& j);
     void indexJsonRecursive(IndexState& idx, DocId id, const nlohmann::json& node);
+    void indexStructured(IndexState& idx, DocId id, const nlohmann::json& doc);
 
     // Remove indexed terms for a document
     void removeJson(IndexState& idx, DocId id, const nlohmann::json& j);
@@ -80,6 +97,8 @@ private:
     // Posting helpers
     void addPosting(IndexState& idx, const std::string& term, DocId id, uint32_t tf);
     void removePosting(IndexState& idx, const std::string& term, DocId id);
+
+    bool validateDocument(const IndexState& idx, const nlohmann::json& doc) const;
 
     // Snapshot helpers are implemented in the cpp.
 };

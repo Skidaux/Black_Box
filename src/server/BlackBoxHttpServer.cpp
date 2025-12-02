@@ -176,6 +176,42 @@ void BlackBoxHttpServer::setupRoutes() {
         addCors(res);
     });
 
+    // --- UPDATE DOCUMENT (PUT = replace, PATCH = partial) ---
+    auto updateDoc = [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res, bool partial) {
+        std::string index = req.matches[1];
+        if (!isJsonContent(req)) {
+            res.status = 415;
+            res.set_content(err(415, "Content-Type must be application/json").dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        minielastic::BlackBox::DocId id{};
+        try { id = static_cast<minielastic::BlackBox::DocId>(std::stoul(req.matches[2])); }
+        catch (...) {
+            res.status = 400;
+            res.set_content(err(400, "Invalid document id").dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        try {
+            if (!db_.updateDocument(index, id, req.body, partial)) {
+                res.status = 404;
+                res.set_content(err(404, "Document not found").dump(), "application/json");
+            } else {
+                res.set_content(ok(json{{"id", id}}).dump(), "application/json");
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(err(400, std::string("Invalid JSON or schema: ") + e.what()).dump(), "application/json");
+        } catch (...) {
+            res.status = 500;
+            res.set_content(err(500, "update failed").dump(), "application/json");
+        }
+        addCors(res);
+    };
+    server_.Put(R"(/v1/([^/]+)/doc/(\d+))", [updateDoc](const httplib::Request& req, httplib::Response& res){ updateDoc(req, res, false); });
+    server_.Patch(R"(/v1/([^/]+)/doc/(\d+))", [updateDoc](const httplib::Request& req, httplib::Response& res){ updateDoc(req, res, true); });
+
     // --- DELETE DOCUMENT ---
     server_.Delete(R"(/v1/([^/]+)/doc/(\d+))", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];
@@ -205,7 +241,9 @@ void BlackBoxHttpServer::setupRoutes() {
     server_.Get(R"(/v1/([^/]+)/search)", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];
         auto q = req.get_param_value("q");
-        if (q.empty()) {
+        auto mode = req.get_param_value("mode");
+        if (mode.empty()) mode = "bm25";
+        if (mode != "vector" && q.empty()) {
             res.status = 400;
             res.set_content(err(400, "Missing query parameter 'q'").dump(), "application/json");
             addCors(res);
@@ -224,8 +262,6 @@ void BlackBoxHttpServer::setupRoutes() {
         int from = parseBounded(req.get_param_value("from"), 0, 0, 1'000'000);
         int size = parseBounded(req.get_param_value("size"), 10, 1, 500);
         int maxDist = parseBounded(req.get_param_value("distance"), 1, 0, 3);
-        auto mode = req.get_param_value("mode");
-        if (mode.empty()) mode = "bm25";
 
         // Hybrid weights
         auto parseDouble = [](const std::string& v, double def) {
@@ -239,9 +275,30 @@ void BlackBoxHttpServer::setupRoutes() {
         size_t need = static_cast<size_t>(from + size);
         std::vector<minielastic::BlackBox::SearchHit> results;
         try {
-            if (mode == "hybrid") {
+            if (mode == "vector") {
+                auto vecStr = req.get_param_value("vec");
+                if (vecStr.empty()) {
+                    res.status = 400;
+                    res.set_content(err(400, "Missing vector 'vec' parameter").dump(), "application/json");
+                    addCors(res);
+                    return;
+                }
+                std::vector<float> qvec;
+                std::stringstream ss(vecStr);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    try { qvec.push_back(static_cast<float>(std::stof(item))); } catch (...) {}
+                }
+                results = db_.searchVector(index, qvec, need);
+            } else if (mode == "hybrid") {
                 results = db_.searchHybrid(index, q, wBm25, wSem, wLex, need);
             } else {
+                if (q.empty()) {
+                    res.status = 400;
+                    res.set_content(err(400, "Missing query parameter 'q'").dump(), "application/json");
+                    addCors(res);
+                    return;
+                }
                 results = db_.search(index, q, mode, need, maxDist);
             }
         } catch (const std::exception& e) {
@@ -256,16 +313,111 @@ void BlackBoxHttpServer::setupRoutes() {
             return;
         }
 
-        size_t total = results.size();
+        // Optional filters: tag, label, flag
+        auto tagFilter = req.get_param_value("tag");
+    auto labelFilter = req.get_param_value("label");
+    auto flagParam = req.get_param_value("flag");
+    bool flagHasFilter = !flagParam.empty();
+    bool flagValue = flagParam == "true" || flagParam == "1";
+        // schema-driven filters: filter_<field>=value, filter_<field>_min/_max for numbers, filter_<field>_bool
+        const auto* schema = db_.getSchema(index);
+
+    // Apply filters before pagination
+    std::vector<minielastic::BlackBox::SearchHit> filtered;
+    filtered.reserve(results.size());
+    for (const auto& hit : results) {
+            // If schema doc-values can satisfy filters without doc fetch, prefer that; else fetch doc.
+            json doc;
+            try { doc = db_.getDocument(index, hit.id); } catch (...) { continue; }
+            if (!tagFilter.empty()) {
+                bool okTag = false;
+                if (doc.contains("tags") && doc["tags"].is_array()) {
+                    for (const auto& t : doc["tags"]) {
+                        if (t.is_string() && t.get<std::string>() == tagFilter) {
+                            okTag = true;
+                            break;
+                        }
+                    }
+                }
+                if (!okTag) continue;
+            }
+            if (!labelFilter.empty()) {
+                bool okLabel = false;
+                if (doc.contains("labels") && doc["labels"].is_array()) {
+                    for (const auto& t : doc["labels"]) {
+                        if (t.is_string() && t.get<std::string>() == labelFilter) {
+                            okLabel = true;
+                            break;
+                        }
+                    }
+                }
+                if (!okLabel) continue;
+            }
+            if (flagHasFilter) {
+                if (!doc.contains("flag") || !doc["flag"].is_boolean() || doc["flag"].get<bool>() != flagValue) {
+                    continue;
+                }
+            }
+            if (schema) {
+                bool passed = true;
+                for (const auto& ft : schema->fieldTypes) {
+                    const auto& field = ft.first;
+                    auto type = ft.second;
+                    // Equals filter
+                    auto eqParam = req.get_param_value("filter_" + field);
+                    if (!eqParam.empty()) {
+                        if (!doc.contains(field)) { passed = false; break; }
+                        const auto& val = doc[field];
+                        if (type == minielastic::BlackBox::FieldType::Text) {
+                            if (!val.is_string() || val.get<std::string>() != eqParam) { passed = false; break; }
+                        } else if (type == minielastic::BlackBox::FieldType::ArrayString) {
+                            if (!val.is_array()) { passed = false; break; }
+                            bool found = false;
+                            for (const auto& e : val) {
+                                if (e.is_string() && e.get<std::string>() == eqParam) { found = true; break; }
+                            }
+                            if (!found) { passed = false; break; }
+                        } else if (type == minielastic::BlackBox::FieldType::Bool) {
+                            bool target = eqParam == "true" || eqParam == "1";
+                            if (!val.is_boolean() || val.get<bool>() != target) { passed = false; break; }
+                        } else if (type == minielastic::BlackBox::FieldType::Number) {
+                            double target = std::stod(eqParam);
+                            if (!val.is_number() || val.get<double>() != target) { passed = false; break; }
+                        }
+                    }
+                    // Range filter for numbers
+                    if (type == minielastic::BlackBox::FieldType::Number) {
+                        auto minParam = req.get_param_value("filter_" + field + "_min");
+                        auto maxParam = req.get_param_value("filter_" + field + "_max");
+                        if (!minParam.empty() || !maxParam.empty()) {
+                            if (!doc.contains(field) || !doc[field].is_number()) { passed = false; break; }
+                            double v = doc[field].get<double>();
+                            if (!minParam.empty()) {
+                                double mn = std::stod(minParam);
+                                if (v < mn) { passed = false; break; }
+                            }
+                            if (!maxParam.empty()) {
+                                double mx = std::stod(maxParam);
+                                if (v > mx) { passed = false; break; }
+                            }
+                        }
+                    }
+                }
+                if (!passed) continue;
+            }
+            filtered.push_back(hit);
+        }
+
+        size_t total = filtered.size();
         size_t start = std::min<size_t>(from, total);
         size_t end   = std::min<size_t>(start + size, total);
 
         json hits = json::array();
         for (size_t i = start; i < end; ++i) {
-            auto id = results[i].id;
+            auto id = filtered[i].id;
             hits.push_back({
                 {"id", id},
-                {"score", results[i].score},
+                {"score", filtered[i].score},
                 {"doc", db_.getDocument(index, id)}
             });
         }
