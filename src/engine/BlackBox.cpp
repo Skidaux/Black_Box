@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <unordered_set>
+#include <cstdlib>
 #include <stdexcept>
 #include <string_view>
 #include <sstream>
@@ -119,7 +120,8 @@ static bool maybeDecompress(std::string_view in, uint16_t encoding, std::string&
 static bool writeSnapshotFile(const std::string& path,
                               const SnapshotChunk& chunk,
                               uint32_t nextId,
-                              double avgDocLen) {
+                              double avgDocLen,
+                              bool compressSections) {
     struct Section {
         uint16_t id;
         uint16_t encoding;
@@ -166,15 +168,15 @@ static bool writeSnapshotFile(const std::string& path,
 
         docBlob.append(serialized);
     }
-    Section docTableSec = makeSection(3, std::move(docTable), true);
-    Section docBlobSec = makeSection(4, std::move(docBlob), true);
+    Section docTableSec = makeSection(3, std::move(docTable), compressSections);
+    Section docBlobSec = makeSection(4, std::move(docBlob), compressSections);
 
     std::string docLensPayload;
     for (const auto& kv : chunk.docLens) {
         writeLE(docLensPayload, kv.first);
         writeLE(docLensPayload, static_cast<uint32_t>(kv.second));
     }
-    Section docLenSec = makeSection(5, std::move(docLensPayload), true);
+    Section docLenSec = makeSection(5, std::move(docLensPayload), compressSections);
 
     std::vector<std::pair<std::string, std::vector<minielastic::algo::Posting>>> terms(chunk.index.begin(), chunk.index.end());
     std::sort(terms.begin(), terms.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -212,8 +214,8 @@ static bool writeSnapshotFile(const std::string& path,
         writeLE(termDict, postingsCrc);
     }
 
-    Section termDictSec = makeSection(6, std::move(termDict), true);
-    Section postingsSec = makeSection(7, std::move(postings), true);
+    Section termDictSec = makeSection(6, std::move(termDict), compressSections);
+    Section postingsSec = makeSection(7, std::move(postings), compressSections);
 
     // Section 8: vectors (id + floats)
     std::string vecPayload;
@@ -227,10 +229,10 @@ static bool writeSnapshotFile(const std::string& path,
             }
         }
     }
-    Section vecSec = makeSection(8, std::move(vecPayload), true);
+    Section vecSec = makeSection(8, std::move(vecPayload), compressSections);
 
     // Section 9: doc-values (JSON)
-    Section dvSec = makeSection(9, chunk.docValues.dump(), true);
+    Section dvSec = makeSection(9, chunk.docValues.dump(), compressSections);
 
     std::vector<Section> sections;
     sections.push_back(std::move(metaSec));
@@ -630,12 +632,24 @@ std::vector<WalRecord> readWalRecords(const std::string& path) {
 }
 
 BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
+    // Configure tunables via environment
+    if (const char* envFlush = std::getenv("BLACKBOX_FLUSH_DOCS")) {
+        try { flushEveryDocs_ = std::max<size_t>(1, static_cast<size_t>(std::stoull(envFlush))); } catch (...) {}
+    }
+    if (const char* envComp = std::getenv("BLACKBOX_COMPRESS")) {
+        std::string v(envComp);
+        compressSnapshots_ = !(v == "0" || v == "false" || v == "off");
+    }
+    if (const char* envAnn = std::getenv("BLACKBOX_ANN_CLUSTERS")) {
+        try { defaultAnnClusters_ = static_cast<uint32_t>(std::max<uint64_t>(1, std::stoull(envAnn))); } catch (...) {}
+    }
+
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
         fs::path dataPath = fs::absolute(fs::path(dataDir_));
         dataDir_ = dataPath.string();
         fs::create_directories(dataDir_);
-        std::cerr << "BlackBox: dataDir=" << dataDir_ << "\n";
+        std::cerr << "BlackBox: dataDir=" << dataDir_ << " flushEveryDocs=" << flushEveryDocs_ << " compress=" << (compressSnapshots_ ? "on" : "off") << " annClusters=" << defaultAnnClusters_ << "\n";
         bool loaded = loadSnapshot();
         if (!loaded) {
             std::cerr << "BlackBox: loadSnapshot failed, trying WAL only\n";
@@ -667,10 +681,12 @@ BlackBox::~BlackBox() {
 }
 
 bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     if (name.empty()) return false;
     if (indexes_.count(name)) return false;
     indexes_[name] = IndexState{};
     indexes_[name].schema = schema;
+    indexes_[name].annClusters = defaultAnnClusters_;
     // Parse field types
     if (schema.schema.contains("fields") && schema.schema["fields"].is_object()) {
         for (auto it = schema.schema["fields"].begin(); it != schema.schema["fields"].end(); ++it) {
@@ -701,34 +717,40 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
 }
 
 bool BlackBox::indexExists(const std::string& name) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     return indexes_.count(name) > 0;
 }
 
 const BlackBox::IndexSchema* BlackBox::getSchema(const std::string& name) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.schema;
 }
 
 const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, double>>* BlackBox::getNumericValues(const std::string& name) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.numericValues;
 }
 
 const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, bool>>* BlackBox::getBoolValues(const std::string& name) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.boolValues;
 }
 
 const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<BlackBox::DocId>>>* BlackBox::getStringLists(const std::string& name) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.stringLists;
 }
 
 BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::string& jsonStr) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
     IndexState& idx = it->second;
@@ -746,6 +768,7 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
 }
 
 nlohmann::json BlackBox::getDocument(const std::string& index, DocId id) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
     const auto& docs = it->second.documents;
@@ -755,6 +778,7 @@ nlohmann::json BlackBox::getDocument(const std::string& index, DocId id) const {
 }
 
 bool BlackBox::deleteDocument(const std::string& index, DocId id) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return false;
     IndexState& idx = it->second;
@@ -769,6 +793,7 @@ bool BlackBox::deleteDocument(const std::string& index, DocId id) {
 }
 
 bool BlackBox::updateDocument(const std::string& index, DocId id, const std::string& jsonStr, bool partial) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return false;
     IndexState& idx = it->second;
@@ -797,12 +822,14 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
     return true;
 }
 std::size_t BlackBox::documentCount(const std::string& index) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return 0;
     return it->second.documents.size();
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, const std::string& query, const std::string& mode, size_t maxResults, int maxEditDistance) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     const IndexState& idx = it->second;
@@ -822,6 +849,7 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index, const std::string& query, double wBm25, double wSemantic, double wLexical, size_t maxResults) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     const IndexState& idx = it->second;
@@ -852,6 +880,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     IndexState& idx = const_cast<IndexState&>(it->second);
@@ -1230,6 +1259,7 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann:
     }
     rebuildSkipPointers(idx);
     idx.annDirty = true;
+    ++idx.opsSinceFlush;
     return assignId;
 }
 
@@ -1266,12 +1296,13 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
     }
     rebuildSkipPointers(idx);
     idx.annDirty = true;
+    ++idx.opsSinceFlush;
     return true;
 }
 
 void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
-    constexpr size_t kFlushOps = 5000;
-    if (idx.documents.size() % kFlushOps != 0) return;
+    if (flushEveryDocs_ == 0) return;
+    if (idx.opsSinceFlush < flushEveryDocs_) return;
     // build a new segment for the index and write manifest
     namespace fs = std::filesystem;
     if (dataDir_.empty()) return;
@@ -1296,7 +1327,7 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
     }();
 
     fs::path segFile = fs::path(dataDir_) / (index + "_seg" + std::to_string(idx.segments.size()) + ".skd");
-    if (writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg)) {
+    if (writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
         SegmentMetadata meta;
         if (!idx.documents.empty()) {
             auto minmax = std::minmax_element(idx.documents.begin(), idx.documents.end(),
@@ -1310,6 +1341,7 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         // reset WAL
         idx.wal.reset();
         idx.wal.open();
+        idx.opsSinceFlush = 0;
         writeManifest();
     }
 }
@@ -1327,7 +1359,8 @@ void BlackBox::writeManifest() const {
         manifest["indexes"].push_back({
             {"name", entry.first},
             {"segments", segs},
-            {"schema", entry.second.schema.schema}
+            {"schema", entry.second.schema.schema},
+            {"ann_clusters", entry.second.annClusters}
         });
     }
     std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
@@ -1351,6 +1384,7 @@ void BlackBox::replayWal(IndexState& idx) {
 }
 
 bool BlackBox::saveSnapshot(const std::string& path) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     namespace fs = std::filesystem;
     fs::path manifestPath = path.empty() ? fs::path(dataDir_) / "index.manifest" : fs::path(path);
     fs::create_directories(manifestPath.parent_path());
@@ -1416,7 +1450,7 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
             }();
 
             fs::path shardFile = manifestPath.parent_path() / (name + "_seg" + std::to_string(segs.size()) + ".skd");
-            if (!writeSnapshotFile(shardFile.string(), chunk, tmp.nextId, avg)) {
+            if (!writeSnapshotFile(shardFile.string(), chunk, tmp.nextId, avg, compressSnapshots_)) {
                 return false;
             }
             uint32_t segMin = ids[start];
@@ -1431,7 +1465,8 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
         manifest["indexes"].push_back({
             {"name", name},
             {"segments", segs},
-            {"schema", idx.schema.schema}
+            {"schema", idx.schema.schema},
+            {"ann_clusters", idx.annClusters}
         });
     }
     std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
@@ -1440,6 +1475,7 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
 }
 
 bool BlackBox::loadSnapshot(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
     namespace fs = std::filesystem;
     fs::path manifestPath = path.empty() ? fs::path(dataDir_) / "index.manifest" : fs::path(path);
     if (!fs::exists(manifestPath)) {
@@ -1474,6 +1510,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         }
 
         IndexState state;
+        state.annClusters = idxJson.value("ann_clusters", defaultAnnClusters_);
         state.schema.schema = idxJson.value("schema", json::object());
         state.schema.fieldTypes.clear();
         if (state.schema.schema.contains("fields") && state.schema.schema["fields"].is_object()) {
@@ -1593,6 +1630,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             vec.erase(std::unique(vec.begin(), vec.end(), [](const algo::Posting& a, const algo::Posting& b){return a.id==b.id;}), vec.end());
         }
         rebuildSkipPointers(state);
+        state.annDirty = !state.vectors.empty();
 
         refreshAverages(state);
         // init WAL
@@ -1618,6 +1656,7 @@ void BlackBox::loadWalOnly() {
         std::string name = path.stem().string();
         if (indexes_.count(name)) continue;
         IndexState state;
+        state.annClusters = defaultAnnClusters_;
         state.wal.path = path.string();
         state.wal.open();
         replayWal(state);

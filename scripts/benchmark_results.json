@@ -1,39 +1,39 @@
 {
-  "timestamp": "2025-12-03T06:39:25.347Z",
+  "timestamp": "2025-12-03T06:51:51.620Z",
   "baseURL": "http://127.0.0.1:8080",
   "index": "demo",
   "docsIndexed": 3,
   "timings": [
     {
       "step": "create_index",
-      "ms": 7.634200006723404,
-      "status": 400
+      "ms": 9.346100002527237,
+      "status": 201
     },
     {
       "step": "index_documents_total",
-      "ms": 7.367100030183792,
+      "ms": 6.079699993133545,
       "status": "aggregate",
       "perDoc": [
         {
           "doc": "Doc1",
-          "ms": 3.6637000143527985,
+          "ms": 2.45550000667572,
           "status": 201
         },
         {
           "doc": "Doc2",
-          "ms": 1.9293000102043152,
+          "ms": 1.9242999851703644,
           "status": 201
         },
         {
           "doc": "Doc3",
-          "ms": 1.7741000056266785,
+          "ms": 1.6999000012874603,
           "status": 201
         }
       ]
     },
     {
       "step": "patch_doc2",
-      "ms": 2.2734000086784363,
+      "ms": 2.161100000143051,
       "status": 200
     }
   ],
@@ -44,10 +44,10 @@
         "q": "quick fox",
         "mode": "bm25"
       },
-      "ms": 0.8899999856948853,
+      "ms": 1.2528000175952911,
       "status": 200,
-      "hits": 3,
-      "total": 3
+      "hits": 1,
+      "total": 1
     },
     {
       "name": "lexical",
@@ -55,10 +55,10 @@
         "q": "quick fox",
         "mode": "lexical"
       },
-      "ms": 0.6906999945640564,
+      "ms": 0.5781999826431274,
       "status": 200,
-      "hits": 3,
-      "total": 3
+      "hits": 1,
+      "total": 1
     },
     {
       "name": "fuzzy",
@@ -67,10 +67,10 @@
         "mode": "fuzzy",
         "distance": 2
       },
-      "ms": 0.7752000093460083,
+      "ms": 0.7170000076293945,
       "status": 200,
-      "hits": 3,
-      "total": 3
+      "hits": 1,
+      "total": 1
     },
     {
       "name": "semantic",
@@ -78,10 +78,10 @@
         "q": "quick brown fox",
         "mode": "semantic"
       },
-      "ms": 1.3763999938964844,
+      "ms": 1.2195000052452087,
       "status": 200,
-      "hits": 6,
-      "total": 6
+      "hits": 2,
+      "total": 2
     },
     {
       "name": "hybrid",
@@ -92,10 +92,10 @@
         "w_semantic": 1,
         "w_lexical": 0.5
       },
-      "ms": 0.9636000096797943,
+      "ms": 0.8044999837875366,
       "status": 200,
-      "hits": 6,
-      "total": 6
+      "hits": 2,
+      "total": 2
     },
     {
       "name": "bm25_tag",
@@ -104,10 +104,10 @@
         "mode": "bm25",
         "tag": "animal"
       },
-      "ms": 0.570000022649765,
+      "ms": 0.4497999846935272,
       "status": 200,
-      "hits": 4,
-      "total": 4
+      "hits": 2,
+      "total": 2
     },
     {
       "name": "bm25_label_flag",
@@ -117,10 +117,10 @@
         "label": "short",
         "flag": "true"
       },
-      "ms": 0.7581000030040741,
+      "ms": 0.5034000277519226,
       "status": 200,
-      "hits": 3,
-      "total": 3
+      "hits": 1,
+      "total": 1
     },
     {
       "name": "bm25_priority_range",
@@ -129,10 +129,10 @@
         "mode": "bm25",
         "filter_priority_min": 3
       },
-      "ms": 0.635699987411499,
+      "ms": 0.5543999969959259,
       "status": 200,
-      "hits": 4,
-      "total": 4
+      "hits": 2,
+      "total": 2
     },
     {
       "name": "vector",
@@ -141,10 +141,10 @@
         "mode": "vector",
         "vec": "1,0,0"
       },
-      "ms": 0.536300003528595,
+      "ms": 0.4952000081539154,
       "status": 200,
-      "hits": 3,
-      "total": 3
+      "hits": 2,
+      "total": 2
     }
   ],
   "notes": "Measures create/index/update/search latencies. Vector search uses ANN+fallback."

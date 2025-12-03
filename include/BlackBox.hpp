@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <nlohmann/json.hpp>
 #include "minielastic/Analyzer.hpp"
@@ -142,9 +143,14 @@ private:
         std::vector<std::vector<DocId>> annBuckets;
         std::vector<SegmentMetadata> segments;
         WalWriter wal;
+        size_t opsSinceFlush = 0;
     };
 
     std::string dataDir_;
+    mutable std::recursive_mutex mutex_;
+    size_t flushEveryDocs_ = 5000;
+    bool compressSnapshots_ = true;
+    uint32_t defaultAnnClusters_ = 8;
     std::unordered_map<std::string, IndexState> indexes_;
 
     void refreshAverages(IndexState& idx);
