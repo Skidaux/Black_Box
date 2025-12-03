@@ -7,10 +7,13 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <stdexcept>
 #include <string_view>
 #include <sstream>
 #include <cstring>
+#include <iostream>
+#include <optional>
 #include "minielastic/Checksum.hpp"
 
 using json = nlohmann::json;
@@ -45,6 +48,74 @@ struct SnapshotChunk {
     json docValues; // numeric, bool, string lists
 };
 
+template <typename T>
+void walWriteLE(std::ostream& out, T value) {
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        char byte = static_cast<char>((static_cast<uint64_t>(value) >> (8 * i)) & 0xFFu);
+        out.write(&byte, 1);
+    }
+}
+
+template <typename T>
+bool walReadLE(std::istream& in, T& value) {
+    value = 0;
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        char byte = 0;
+        if (!in.read(&byte, 1)) return false;
+        value |= static_cast<uint64_t>(static_cast<unsigned char>(byte)) << (8 * i);
+    }
+    return true;
+}
+
+enum class SectionEncoding : uint16_t { Raw = 0, Zstd = 1 };
+
+#ifdef BLACKBOX_USE_ZSTD
+#include <zstd.h>
+static bool compressZstd(const std::string& in, std::string& out, int level = 3) {
+    size_t maxSize = ZSTD_compressBound(in.size());
+    out.resize(maxSize);
+    size_t written = ZSTD_compress(out.data(), maxSize, in.data(), in.size(), level);
+    if (ZSTD_isError(written)) return false;
+    out.resize(written);
+    return true;
+}
+static bool decompressZstd(std::string_view in, std::string& out) {
+    unsigned long long rawSize = ZSTD_getFrameContentSize(in.data(), in.size());
+    if (rawSize == ZSTD_CONTENTSIZE_ERROR || rawSize == ZSTD_CONTENTSIZE_UNKNOWN) return false;
+    out.resize(static_cast<size_t>(rawSize));
+    size_t res = ZSTD_decompress(out.data(), rawSize, in.data(), in.size());
+    if (ZSTD_isError(res)) return false;
+    out.resize(res);
+    return true;
+}
+#endif
+
+static uint16_t maybeCompress(std::string& payload, bool enable) {
+    if (!enable) return static_cast<uint16_t>(SectionEncoding::Raw);
+#ifdef BLACKBOX_USE_ZSTD
+    std::string compressed;
+    if (compressZstd(payload, compressed)) {
+        payload.swap(compressed);
+        return static_cast<uint16_t>(SectionEncoding::Zstd);
+    }
+#endif
+    return static_cast<uint16_t>(SectionEncoding::Raw);
+}
+
+static bool maybeDecompress(std::string_view in, uint16_t encoding, std::string& out) {
+    if (encoding == static_cast<uint16_t>(SectionEncoding::Raw)) {
+        out.assign(in.begin(), in.end());
+        return true;
+    }
+#ifdef BLACKBOX_USE_ZSTD
+    if (encoding == static_cast<uint16_t>(SectionEncoding::Zstd)) {
+        return decompressZstd(in, out);
+    }
+#endif
+    std::cerr << "Snapshot: unsupported encoding=" << encoding << "\n";
+    return false;
+}
+
 static bool writeSnapshotFile(const std::string& path,
                               const SnapshotChunk& chunk,
                               uint32_t nextId,
@@ -57,8 +128,9 @@ static bool writeSnapshotFile(const std::string& path,
         uint32_t crc = 0;
     };
 
-    auto makeSection = [](uint16_t id, std::string payload) {
+    auto makeSection = [](uint16_t id, std::string payload, bool compress) {
         Section s{id, 0, 0, std::move(payload), 0};
+        s.encoding = maybeCompress(s.payload, compress);
         s.crc = minielastic::crc32(s.payload);
         return s;
     };
@@ -70,7 +142,7 @@ static bool writeSnapshotFile(const std::string& path,
         {"avg_doc_len", avgDocLen},
         {"vector_dim", chunk.vectorDim}
     };
-    Section metaSec = makeSection(1, meta.dump());
+    Section metaSec = makeSection(1, meta.dump(), false);
 
     std::vector<std::pair<uint32_t, json>> docs(chunk.docs.begin(), chunk.docs.end());
     std::sort(docs.begin(), docs.end(), [](auto& a, auto& b) { return a.first < b.first; });
@@ -94,15 +166,15 @@ static bool writeSnapshotFile(const std::string& path,
 
         docBlob.append(serialized);
     }
-    Section docTableSec = makeSection(3, std::move(docTable));
-    Section docBlobSec = makeSection(4, std::move(docBlob));
+    Section docTableSec = makeSection(3, std::move(docTable), true);
+    Section docBlobSec = makeSection(4, std::move(docBlob), true);
 
     std::string docLensPayload;
     for (const auto& kv : chunk.docLens) {
         writeLE(docLensPayload, kv.first);
         writeLE(docLensPayload, static_cast<uint32_t>(kv.second));
     }
-    Section docLenSec = makeSection(5, std::move(docLensPayload));
+    Section docLenSec = makeSection(5, std::move(docLensPayload), true);
 
     std::vector<std::pair<std::string, std::vector<minielastic::algo::Posting>>> terms(chunk.index.begin(), chunk.index.end());
     std::sort(terms.begin(), terms.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -140,8 +212,8 @@ static bool writeSnapshotFile(const std::string& path,
         writeLE(termDict, postingsCrc);
     }
 
-    Section termDictSec = makeSection(6, std::move(termDict));
-    Section postingsSec = makeSection(7, std::move(postings));
+    Section termDictSec = makeSection(6, std::move(termDict), true);
+    Section postingsSec = makeSection(7, std::move(postings), true);
 
     // Section 8: vectors (id + floats)
     std::string vecPayload;
@@ -155,10 +227,10 @@ static bool writeSnapshotFile(const std::string& path,
             }
         }
     }
-    Section vecSec = makeSection(8, std::move(vecPayload));
+    Section vecSec = makeSection(8, std::move(vecPayload), true);
 
     // Section 9: doc-values (JSON)
-    Section dvSec = makeSection(9, chunk.docValues.dump());
+    Section dvSec = makeSection(9, chunk.docValues.dump(), true);
 
     std::vector<Section> sections;
     sections.push_back(std::move(metaSec));
@@ -274,17 +346,28 @@ static bool readSnapshotFile(const std::string& path,
         toc[e.id] = e;
     }
 
-    auto getSection = [&](uint16_t id) -> std::string_view {
+    auto getSection = [&](uint16_t id) -> std::optional<std::pair<std::string_view, uint16_t>> {
         auto it = toc.find(id);
-        if (it == toc.end()) return {};
+        if (it == toc.end()) return std::nullopt;
         const auto& e = it->second;
-        return std::string_view(view.data() + e.offset, e.length);
+        return std::make_pair(std::string_view(view.data() + e.offset, e.length), e.encoding);
     };
 
-    const auto docTableView = getSection(3);
-    const auto docBlobView = getSection(4);
-    const auto docLensView = getSection(5);
-    if (docTableView.empty() || docBlobView.data() == nullptr) return false;
+    const auto docTableSec = getSection(3);
+    const auto docBlobSec = getSection(4);
+    const auto docLensSec = getSection(5);
+    if (!docTableSec || !docBlobSec) return false;
+    const auto docTableViewCompressed = docTableSec->first;
+    const auto docBlobViewCompressed = docBlobSec->first;
+    std::string docTableDecoded;
+    std::string docBlobViewStorage;
+    std::string docLensStorage;
+    const std::string_view docLensViewRaw = docLensSec ? docLensSec->first : std::string_view();
+    std::string_view docLensView = docLensViewRaw;
+    if (docLensSec && docLensSec->second != static_cast<uint16_t>(SectionEncoding::Raw)) {
+        if (!maybeDecompress(docLensViewRaw, docLensSec->second, docLensStorage)) return false;
+        docLensView = std::string_view(docLensStorage);
+    }
 
     auto validateCrc = [&](uint16_t id, std::string_view section) {
         auto it = toc.find(id);
@@ -292,11 +375,11 @@ static bool readSnapshotFile(const std::string& path,
         return minielastic::crc32(section) == it->second.crc;
     };
 
-    if (!validateCrc(3, docTableView) || !validateCrc(4, docBlobView)) return false;
+    if (!validateCrc(3, docTableViewCompressed) || !validateCrc(4, docBlobViewCompressed)) return false;
     if (!toc.empty()) {
-        auto metaView = getSection(1);
-        if (!metaView.empty() && validateCrc(1, metaView)) {
-            auto parsed = json::parse(metaView, nullptr, false);
+        auto metaSec = getSection(1);
+        if (metaSec && validateCrc(1, metaSec->first)) {
+            auto parsed = json::parse(metaSec->first, nullptr, false);
             if (!parsed.is_discarded()) {
                 nextId = parsed.value("next_id", nextIdLocal);
                 avgDocLen = parsed.value("avg_doc_len", avgDocLen);
@@ -304,6 +387,22 @@ static bool readSnapshotFile(const std::string& path,
             }
         }
     }
+
+    // Decompress doc table if needed
+    std::string_view docTableView = docTableViewCompressed;
+    if (docTableSec->second != static_cast<uint16_t>(SectionEncoding::Raw)) {
+        if (!maybeDecompress(docTableViewCompressed, docTableSec->second, docTableDecoded)) return false;
+        docTableView = std::string_view(docTableDecoded);
+    }
+
+    // Decompress doc blob if needed
+    std::string docBlobDecoded;
+    if (docBlobSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+        docBlobDecoded.assign(docBlobViewCompressed.begin(), docBlobViewCompressed.end());
+    } else {
+        if (!maybeDecompress(docBlobViewCompressed, docBlobSec->second, docBlobDecoded)) return false;
+    }
+    std::string_view docBlobView(docBlobDecoded);
 
     const size_t entrySize = sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t);
     size_t dtCursor = 0;
@@ -330,7 +429,7 @@ static bool readSnapshotFile(const std::string& path,
         nextId = std::max<uint32_t>(nextId, id + 1);
     }
 
-    if (!docLensView.empty() && validateCrc(5, docLensView)) {
+    if (docLensSec && !docLensView.empty() && validateCrc(5, docLensSec->first)) {
         size_t lc = 0;
         while (lc + sizeof(uint32_t) + sizeof(uint32_t) <= docLensView.size()) {
             uint32_t id{};
@@ -341,12 +440,27 @@ static bool readSnapshotFile(const std::string& path,
         }
     }
 
-    const auto termDictView = getSection(6);
-    const auto postingsView = getSection(7);
-    const auto vecView = getSection(8);
-    const auto dvView = getSection(9);
-    if (!termDictView.empty() && !postingsView.empty() &&
-        validateCrc(6, termDictView) && validateCrc(7, postingsView)) {
+    const auto termDictSec = getSection(6);
+    const auto postingsSec = getSection(7);
+    const auto vecSec = getSection(8);
+    const auto dvSec = getSection(9);
+
+    std::string termDictDecoded;
+    std::string postingsDecoded;
+    if (termDictSec && postingsSec &&
+        validateCrc(6, termDictSec->first) && validateCrc(7, postingsSec->first)) {
+        if (termDictSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+            termDictDecoded.assign(termDictSec->first.begin(), termDictSec->first.end());
+        } else {
+            if (!maybeDecompress(termDictSec->first, termDictSec->second, termDictDecoded)) return false;
+        }
+        if (postingsSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+            postingsDecoded.assign(postingsSec->first.begin(), postingsSec->first.end());
+        } else {
+            if (!maybeDecompress(postingsSec->first, postingsSec->second, postingsDecoded)) return false;
+        }
+        std::string_view termDictView(termDictDecoded);
+        std::string_view postingsView(postingsDecoded);
         size_t tdCursor = 0;
         while (tdCursor < termDictView.size()) {
             uint16_t termLen{};
@@ -387,7 +501,15 @@ static bool readSnapshotFile(const std::string& path,
     }
 
     // Vectors
-    if (outChunk.vectorDim > 0 && !vecView.empty() && validateCrc(8, vecView)) {
+    if (outChunk.vectorDim > 0 && vecSec && validateCrc(8, vecSec->first)) {
+        std::string vecDecoded;
+        std::string_view vecView;
+        if (vecSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+            vecDecoded.assign(vecSec->first.begin(), vecSec->first.end());
+        } else {
+            if (!maybeDecompress(vecSec->first, vecSec->second, vecDecoded)) return false;
+        }
+        vecView = std::string_view(vecDecoded);
         size_t vc = 0;
         while (vc + sizeof(uint32_t) * (1 + outChunk.vectorDim) <= vecView.size()) {
             uint32_t id{};
@@ -405,10 +527,20 @@ static bool readSnapshotFile(const std::string& path,
     }
 
     // Doc-values
-    if (!dvView.empty() && validateCrc(9, dvView)) {
-        auto dv = json::parse(dvView, nullptr, false);
-        if (!dv.is_discarded()) {
-            outChunk.docValues = dv;
+    if (dvSec && validateCrc(9, dvSec->first)) {
+        std::string dvDecoded;
+        std::string_view dvView;
+        if (dvSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+            dvDecoded.assign(dvSec->first.begin(), dvSec->first.end());
+        } else {
+            if (!maybeDecompress(dvSec->first, dvSec->second, dvDecoded)) return false;
+        }
+        dvView = std::string_view(dvDecoded);
+        if (!dvView.empty()) {
+            auto dv = json::parse(dvView, nullptr, false);
+            if (!dv.is_discarded()) {
+                outChunk.docValues = dv;
+            }
         }
     }
 
@@ -419,14 +551,120 @@ static bool readSnapshotFile(const std::string& path,
 
 namespace minielastic {
 
-BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
-    if (!dataDir_.empty()) {
-        std::filesystem::create_directories(dataDir_);
-        loadSnapshot();
+bool WalWriter::open() {
+    if (path.empty()) return false;
+    try {
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+    } catch (...) {
+        std::cerr << "WalWriter: failed to create dir for " << path << "\n";
+    }
+    stream.open(path, std::ios::binary | std::ios::app | std::ios::out);
+    if (!stream) {
+        std::cerr << "WalWriter: failed to open " << path << "\n";
+        return false;
+    }
+    stream.seekp(0, std::ios::end);
+    offset = static_cast<uint64_t>(stream.tellp());
+    return true;
+}
+
+void WalWriter::close() {
+    if (stream.is_open()) stream.close();
+}
+
+bool WalWriter::append(const WalRecord& rec) {
+    if (!stream.is_open()) return false;
+    if (!stream.good()) {
+        std::cerr << "WalWriter: stream not good for " << path << "\n";
+        return false;
+    }
+    stream.write(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+    walWriteLE(stream, rec.docId);
+    uint32_t len = static_cast<uint32_t>(rec.payload.size());
+    walWriteLE(stream, len);
+    if (!rec.payload.empty()) stream.write(rec.payload.data(), static_cast<std::streamsize>(rec.payload.size()));
+    stream.flush();
+    offset += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len;
+    if (!stream) {
+        std::cerr << "WalWriter: stream write failed for " << path << "\n";
+    }
+    return static_cast<bool>(stream);
+}
+
+void WalWriter::reset() {
+    close();
+    if (!path.empty()) {
+        try {
+            std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+        } catch (...) {
+            std::cerr << "WalWriter: failed to create dir for " << path << "\n";
+        }
+        // truncate file
+        std::ofstream truncStream(path, std::ios::binary | std::ios::trunc | std::ios::out);
+        if (!truncStream) {
+            std::cerr << "WalWriter: failed to truncate " << path << "\n";
+        }
+        truncStream.close();
+        offset = 0;
     }
 }
 
-BlackBox::~BlackBox() = default;
+std::vector<WalRecord> readWalRecords(const std::string& path) {
+    std::vector<WalRecord> out;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return out;
+    while (true) {
+        WalOp op;
+        if (!in.read(reinterpret_cast<char*>(&op), sizeof(op))) break;
+        uint32_t docId = 0;
+        if (!walReadLE(in, docId)) break;
+        uint32_t len = 0;
+        if (!walReadLE(in, len)) break;
+        std::vector<char> payload(len);
+        if (len > 0) {
+            if (!in.read(payload.data(), len)) break;
+        }
+        out.push_back({op, docId, std::move(payload)});
+    }
+    return out;
+}
+
+BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
+    if (!dataDir_.empty()) {
+        namespace fs = std::filesystem;
+        fs::path dataPath = fs::absolute(fs::path(dataDir_));
+        dataDir_ = dataPath.string();
+        fs::create_directories(dataDir_);
+        std::cerr << "BlackBox: dataDir=" << dataDir_ << "\n";
+        bool loaded = loadSnapshot();
+        if (!loaded) {
+            std::cerr << "BlackBox: loadSnapshot failed, trying WAL only\n";
+            loadWalOnly();
+        } else {
+            std::cerr << "BlackBox: loadSnapshot succeeded\n";
+        }
+        // open WALs for existing indexes
+        for (auto& kv : indexes_) {
+            if (kv.second.wal.path.empty()) {
+                kv.second.wal.path = (std::filesystem::path(dataDir_) / (kv.first + ".wal")).string();
+            }
+            if (!kv.second.wal.stream.is_open()) {
+                kv.second.wal.open();
+            }
+            if (kv.second.wal.stream.is_open()) {
+                replayWal(kv.second);
+                std::cerr << "BlackBox: replayed WAL for index " << kv.first << "\n";
+            } else {
+                std::cerr << "WalWriter: failed to open " << kv.second.wal.path << "\n";
+            }
+        }
+        std::cerr << "BlackBox: init complete; indexes=" << indexes_.size() << "\n";
+    }
+}
+
+BlackBox::~BlackBox() {
+    writeManifest();
+}
 
 bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     if (name.empty()) return false;
@@ -452,6 +690,13 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
             }
         }
     }
+    // init WAL
+    if (!dataDir_.empty()) {
+        indexes_[name].wal.path = (std::filesystem::path(dataDir_) / (name + ".wal")).string();
+        indexes_[name].wal.reset();
+        indexes_[name].wal.open();
+        writeManifest();
+    }
     return true;
 }
 
@@ -465,6 +710,24 @@ const BlackBox::IndexSchema* BlackBox::getSchema(const std::string& name) const 
     return &it->second.schema;
 }
 
+const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, double>>* BlackBox::getNumericValues(const std::string& name) const {
+    auto it = indexes_.find(name);
+    if (it == indexes_.end()) return nullptr;
+    return &it->second.numericValues;
+}
+
+const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, bool>>* BlackBox::getBoolValues(const std::string& name) const {
+    auto it = indexes_.find(name);
+    if (it == indexes_.end()) return nullptr;
+    return &it->second.boolValues;
+}
+
+const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<BlackBox::DocId>>>* BlackBox::getStringLists(const std::string& name) const {
+    auto it = indexes_.find(name);
+    if (it == indexes_.end()) return nullptr;
+    return &it->second.stringLists;
+}
+
 BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::string& jsonStr) {
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
@@ -474,31 +737,11 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
     if (!validateDocument(idx, j)) {
         throw std::runtime_error("document does not conform to schema");
     }
-
-    // Handle vector extraction
-    if (!idx.schema.vectorField.empty() && idx.schema.vectorDim > 0) {
-        auto vf = idx.schema.vectorField;
-        if (j.contains(vf)) {
-            const auto& arr = j[vf];
-            std::vector<float> vec;
-            if (arr.is_array()) {
-                for (size_t i = 0; i < idx.schema.vectorDim && i < arr.size(); ++i) {
-                    vec.push_back(static_cast<float>(arr[i].get<double>()));
-                }
-                if (vec.size() == idx.schema.vectorDim) {
-                    idx.vectors[idx.nextId] = vec;
-                }
-            }
-        }
-    }
-
-    DocId id = idx.nextId++;
-    idx.documents[id] = j;
-    idx.docLengths[id] = 0;
-    indexStructured(idx, id, j);
+    DocId id = applyUpsert(idx, 0, j, true);
     refreshAverages(idx);
-
-    if (!dataDir_.empty()) saveSnapshot();
+    writeManifest();
+    saveSnapshot(); // ensure durable .skd
+    flushIfNeeded(index, idx);
     return id;
 }
 
@@ -515,24 +758,14 @@ bool BlackBox::deleteDocument(const std::string& index, DocId id) {
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return false;
     IndexState& idx = it->second;
-    auto d = idx.documents.find(id);
-    if (d == idx.documents.end()) return false;
-    indexStructured(idx, id, json::object()); // reset length
-    removeJson(idx, id, d->second);
-    idx.documents.erase(d);
-    idx.docLengths.erase(id);
-    idx.vectors.erase(id);
-    for (auto& kv : idx.boolValues) kv.second.erase(id);
-    for (auto& kv : idx.numericValues) kv.second.erase(id);
-    for (auto& kv : idx.stringLists) {
-        for (auto& bucket : kv.second) {
-            auto& vec = bucket.second;
-            vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
-        }
+    bool ok = applyDelete(idx, id, true);
+    if (ok) {
+        refreshAverages(idx);
+        writeManifest();
+        saveSnapshot(); // ensure durable .skd
+        flushIfNeeded(index, idx);
     }
-    refreshAverages(idx);
-    if (!dataDir_.empty()) saveSnapshot();
-    return true;
+    return ok;
 }
 
 bool BlackBox::updateDocument(const std::string& index, DocId id, const std::string& jsonStr, bool partial) {
@@ -556,32 +789,11 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
         throw std::runtime_error("document does not conform to schema");
     }
 
-    // remove old postings/vectors
-    removeJson(idx, id, existing->second);
-    idx.docLengths.erase(id);
-    idx.vectors.erase(id);
-
-    // apply vector
-    if (!idx.schema.vectorField.empty() && idx.schema.vectorDim > 0) {
-        auto vf = idx.schema.vectorField;
-        if (merged.contains(vf)) {
-            const auto& arr = merged[vf];
-            std::vector<float> vec;
-            if (arr.is_array()) {
-                for (size_t i = 0; i < idx.schema.vectorDim && i < arr.size(); ++i) {
-                    vec.push_back(static_cast<float>(arr[i].get<double>()));
-                }
-                if (vec.size() == idx.schema.vectorDim) {
-                    idx.vectors[id] = vec;
-                }
-            }
-        }
-    }
-
-    idx.documents[id] = merged;
-    indexStructured(idx, id, merged);
+    applyUpsert(idx, id, merged, true);
     refreshAverages(idx);
-    if (!dataDir_.empty()) saveSnapshot();
+    writeManifest();
+    saveSnapshot(); // ensure durable .skd
+    flushIfNeeded(index, idx);
     return true;
 }
 std::size_t BlackBox::documentCount(const std::string& index) const {
@@ -596,7 +808,7 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
     const IndexState& idx = it->second;
     auto terms = tokenize(query);
     if (terms.empty()) return {};
-    algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen};
+    algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen, &idx.skipPointers};
     if (mode == "lexical") return algo::searchLexical(ctx, terms);
     if (mode == "fuzzy") return algo::searchFuzzy(ctx, terms, maxEditDistance, maxResults);
     if (mode == "semantic" || mode == "vector" || mode == "tfidf") {
@@ -615,7 +827,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
     const IndexState& idx = it->second;
     auto terms = tokenize(query);
     if (terms.empty()) return {};
-    algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen};
+    algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen, &idx.skipPointers};
     auto bm = algo::searchBm25(ctx, terms, maxResults * 2);
     auto sem = algo::searchSemantic(ctx, terms, maxResults * 2);
     auto lex = algo::searchLexical(ctx, terms);
@@ -642,8 +854,9 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
 std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults) const {
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
-    const IndexState& idx = it->second;
+    IndexState& idx = const_cast<IndexState&>(it->second);
     if (idx.schema.vectorDim == 0 || queryVec.size() != idx.schema.vectorDim) return {};
+    if (idx.annDirty) rebuildAnn(idx);
 
     auto dot = [](const std::vector<float>& a, const std::vector<float>& b) {
         double s = 0.0;
@@ -659,12 +872,41 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
     if (qn == 0) return {};
 
     std::vector<SearchHit> hits;
-    for (const auto& kv : idx.vectors) {
-        const auto& vec = kv.second;
-        if (vec.size() != idx.schema.vectorDim) continue;
+    auto scoreDoc = [&](uint32_t docId, const std::vector<float>& vec) {
+        if (vec.size() != idx.schema.vectorDim) return;
         double score = dot(queryVec, vec) / (qn * norm(vec) + 1e-9);
-        hits.push_back({kv.first, score});
+        hits.push_back({docId, score});
+    };
+
+    // ANN: probe closest centroids then brute within buckets
+    if (!idx.annCentroids.empty() && !idx.annBuckets.empty()) {
+        double best1 = -1e9, best2 = -1e9;
+        size_t c1 = 0, c2 = 0;
+        for (size_t c = 0; c < idx.annCentroids.size(); ++c) {
+            double s = dot(idx.annCentroids[c], queryVec);
+            if (s > best1) { best2 = best1; c2 = c1; best1 = s; c1 = c; }
+            else if (s > best2) { best2 = s; c2 = c; }
+        }
+        std::unordered_set<uint32_t> visited;
+        auto probe = [&](size_t bucketIdx) {
+            if (bucketIdx >= idx.annBuckets.size()) return;
+            for (auto docId : idx.annBuckets[bucketIdx]) {
+                if (!visited.insert(docId).second) continue;
+                auto itv = idx.vectors.find(docId);
+                if (itv == idx.vectors.end()) continue;
+                scoreDoc(docId, itv->second);
+            }
+        };
+        probe(c1);
+        if (idx.annBuckets.size() > 1) probe(c2);
+        // fallback to ensure some results
+        if (hits.empty()) {
+            for (const auto& kv : idx.vectors) scoreDoc(kv.first, kv.second);
+        }
+    } else {
+        for (const auto& kv : idx.vectors) scoreDoc(kv.first, kv.second);
     }
+
     std::sort(hits.begin(), hits.end(), [](const SearchHit& a, const SearchHit& b) {
         if (a.score == b.score) return a.id < b.id;
         return a.score > b.score;
@@ -807,6 +1049,94 @@ void BlackBox::removePosting(IndexState& idx, const std::string& term, DocId id)
     if (vec.empty()) idx.invertedIndex.erase(it);
 }
 
+void BlackBox::rebuildSkipPointers(IndexState& idx) {
+    constexpr size_t kSkipStride = 8;
+    idx.skipPointers.clear();
+    idx.skipPointers.reserve(idx.invertedIndex.size());
+    for (const auto& kv : idx.invertedIndex) {
+        const auto& plist = kv.second;
+        std::vector<algo::SkipEntry> skips;
+        if (!plist.empty()) {
+            for (size_t i = 0; i < plist.size(); i += kSkipStride) {
+                skips.push_back({static_cast<uint32_t>(i), plist[i].id});
+            }
+        }
+        idx.skipPointers.emplace(kv.first, std::move(skips));
+    }
+}
+
+void BlackBox::rebuildAnn(IndexState& idx) const {
+    const uint32_t dim = idx.schema.vectorDim;
+    if (dim == 0) { idx.annCentroids.clear(); idx.annBuckets.clear(); idx.annDirty = false; return; }
+    if (idx.vectors.empty()) { idx.annCentroids.clear(); idx.annBuckets.clear(); idx.annDirty = false; return; }
+
+    const size_t k = std::max<size_t>(1, std::min<size_t>(idx.annClusters, idx.vectors.size()));
+
+    auto normalize = [](std::vector<float> v) {
+        double n = 0.0;
+        for (float x : v) n += static_cast<double>(x) * static_cast<double>(x);
+        n = std::sqrt(n);
+        if (n == 0) return v;
+        for (auto& x : v) x = static_cast<float>(x / n);
+        return v;
+    };
+    auto cosine = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double s = 0.0;
+        size_t m = std::min(a.size(), b.size());
+        for (size_t i = 0; i < m; ++i) s += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        return s;
+    };
+
+    // Seed centroids using first k vectors
+    idx.annCentroids.clear();
+    idx.annCentroids.reserve(k);
+    size_t seeded = 0;
+    for (const auto& kv : idx.vectors) {
+        if (kv.second.size() != dim) continue;
+        idx.annCentroids.push_back(normalize(kv.second));
+        if (++seeded >= k) break;
+    }
+    if (idx.annCentroids.empty()) { idx.annDirty = false; return; }
+
+    // Lloyd-style refinement (small iterations)
+    constexpr int iters = 2;
+    for (int iter = 0; iter < iters; ++iter) {
+        std::vector<std::vector<float>> newC(idx.annCentroids.size(), std::vector<float>(dim, 0.0f));
+        std::vector<uint32_t> counts(idx.annCentroids.size(), 0);
+        for (const auto& kv : idx.vectors) {
+            if (kv.second.size() != dim) continue;
+            auto v = normalize(kv.second);
+            double best = -1e9;
+            size_t bestIdx = 0;
+            for (size_t c = 0; c < idx.annCentroids.size(); ++c) {
+                double score = cosine(v, idx.annCentroids[c]);
+                if (score > best) { best = score; bestIdx = c; }
+            }
+            ++counts[bestIdx];
+            for (size_t d = 0; d < dim; ++d) newC[bestIdx][d] += v[d];
+        }
+        for (size_t c = 0; c < idx.annCentroids.size(); ++c) {
+            if (counts[c] == 0) continue;
+            for (size_t d = 0; d < dim; ++d) newC[c][d] = static_cast<float>(newC[c][d] / counts[c]);
+            idx.annCentroids[c] = normalize(newC[c]);
+        }
+    }
+
+    idx.annBuckets.assign(idx.annCentroids.size(), {});
+    for (const auto& kv : idx.vectors) {
+        if (kv.second.size() != dim) continue;
+        auto v = normalize(kv.second);
+        double best = -1e9;
+        size_t bestIdx = 0;
+        for (size_t c = 0; c < idx.annCentroids.size(); ++c) {
+            double score = cosine(v, idx.annCentroids[c]);
+            if (score > best) { best = score; bestIdx = c; }
+        }
+        idx.annBuckets[bestIdx].push_back(kv.first);
+    }
+    idx.annDirty = false;
+}
+
 bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc) const {
     for (const auto& ft : idx.schema.fieldTypes) {
         const auto& key = ft.first;
@@ -838,6 +1168,186 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
         }
     }
     return true;
+}
+
+BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann::json& doc, bool logWal) {
+    DocId assignId = id == 0 ? idx.nextId++ : id;
+
+    // remove old if updating
+    auto existing = idx.documents.find(assignId);
+    if (existing != idx.documents.end()) {
+        removeJson(idx, assignId, existing->second);
+        idx.docLengths.erase(assignId);
+        idx.vectors.erase(assignId);
+        for (auto& kv : idx.boolValues) kv.second.erase(assignId);
+        for (auto& kv : idx.numericValues) kv.second.erase(assignId);
+        for (auto& kv : idx.stringLists) {
+            for (auto& bucket : kv.second) {
+                auto& vec = bucket.second;
+                vec.erase(std::remove(vec.begin(), vec.end(), assignId), vec.end());
+            }
+        }
+    }
+
+    // vector extraction
+    if (!idx.schema.vectorField.empty() && idx.schema.vectorDim > 0) {
+        auto vf = idx.schema.vectorField;
+        if (doc.contains(vf)) {
+            const auto& arr = doc[vf];
+            std::vector<float> vec;
+            if (arr.is_array()) {
+                for (size_t i = 0; i < idx.schema.vectorDim && i < arr.size(); ++i) {
+                    vec.push_back(static_cast<float>(arr[i].get<double>()));
+                }
+                if (vec.size() == idx.schema.vectorDim) {
+                    idx.vectors[assignId] = vec;
+                }
+            }
+        }
+    }
+
+    idx.documents[assignId] = doc;
+    idx.docLengths[assignId] = 0;
+    indexStructured(idx, assignId, doc);
+
+    if (logWal) {
+        if (!idx.wal.stream.is_open() && !idx.wal.path.empty()) {
+            idx.wal.open();
+        }
+        if (idx.wal.stream.is_open()) {
+            std::vector<uint8_t> cbor = json::to_cbor(doc);
+            WalRecord rec;
+            rec.op = WalOp::Upsert;
+            rec.docId = assignId;
+            rec.payload.assign(reinterpret_cast<char*>(cbor.data()), reinterpret_cast<char*>(cbor.data()) + cbor.size());
+            if (!idx.wal.append(rec)) {
+                std::cerr << "WAL append failed for " << idx.wal.path << "\n";
+            }
+        }
+        else {
+            std::cerr << "WAL not open for path " << idx.wal.path << "\n";
+        }
+    }
+    rebuildSkipPointers(idx);
+    idx.annDirty = true;
+    return assignId;
+}
+
+bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
+    auto it = idx.documents.find(id);
+    if (it == idx.documents.end()) return false;
+    removeJson(idx, id, it->second);
+    idx.documents.erase(it);
+    idx.docLengths.erase(id);
+    idx.vectors.erase(id);
+    for (auto& kv : idx.boolValues) kv.second.erase(id);
+    for (auto& kv : idx.numericValues) kv.second.erase(id);
+    for (auto& kv : idx.stringLists) {
+        for (auto& bucket : kv.second) {
+            auto& vec = bucket.second;
+            vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
+        }
+    }
+    if (logWal) {
+        if (!idx.wal.stream.is_open() && !idx.wal.path.empty()) {
+            idx.wal.open();
+        }
+        if (idx.wal.stream.is_open()) {
+            WalRecord rec;
+            rec.op = WalOp::Delete;
+            rec.docId = id;
+            if (!idx.wal.append(rec)) {
+                std::cerr << "WAL append failed for " << idx.wal.path << "\n";
+            }
+        }
+        else {
+            std::cerr << "WAL not open for path " << idx.wal.path << "\n";
+        }
+    }
+    rebuildSkipPointers(idx);
+    idx.annDirty = true;
+    return true;
+}
+
+void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
+    constexpr size_t kFlushOps = 5000;
+    if (idx.documents.size() % kFlushOps != 0) return;
+    // build a new segment for the index and write manifest
+    namespace fs = std::filesystem;
+    if (dataDir_.empty()) return;
+
+    // build segment chunk from current state
+    SnapshotChunk chunk;
+    chunk.vectorDim = idx.schema.vectorDim;
+    chunk.docs.insert(chunk.docs.end(), idx.documents.begin(), idx.documents.end());
+    chunk.docLens = idx.docLengths;
+    chunk.index = idx.invertedIndex;
+    chunk.vectors = idx.vectors;
+    chunk.docValues = json{
+        {"numeric", idx.numericValues},
+        {"bool", idx.boolValues},
+        {"strings", idx.stringLists}
+    };
+
+    double avg = idx.docLengths.empty() ? 0.0 : [&]() {
+        uint64_t total = 0;
+        for (const auto& kv : idx.docLengths) total += kv.second;
+        return static_cast<double>(total) / static_cast<double>(idx.docLengths.size());
+    }();
+
+    fs::path segFile = fs::path(dataDir_) / (index + "_seg" + std::to_string(idx.segments.size()) + ".skd");
+    if (writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg)) {
+        SegmentMetadata meta;
+        if (!idx.documents.empty()) {
+            auto minmax = std::minmax_element(idx.documents.begin(), idx.documents.end(),
+                [](const auto& a, const auto& b){ return a.first < b.first; });
+            meta.minId = minmax.first->first;
+            meta.maxId = minmax.second->first;
+        }
+        meta.file = segFile.filename().string();
+        meta.walPos = idx.wal.offset;
+        idx.segments.push_back(meta);
+        // reset WAL
+        idx.wal.reset();
+        idx.wal.open();
+        writeManifest();
+    }
+}
+
+void BlackBox::writeManifest() const {
+    namespace fs = std::filesystem;
+    if (dataDir_.empty()) return;
+    fs::path manifestPath = fs::path(dataDir_) / "index.manifest";
+    json manifest = {{"version", 1}, {"indexes", json::array()}};
+    for (const auto& entry : indexes_) {
+        json segs = json::array();
+        for (const auto& seg : entry.second.segments) {
+            segs.push_back({{"file", seg.file}, {"min_id", seg.minId}, {"max_id", seg.maxId}, {"wal_pos", seg.walPos}});
+        }
+        manifest["indexes"].push_back({
+            {"name", entry.first},
+            {"segments", segs},
+            {"schema", entry.second.schema.schema}
+        });
+    }
+    std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
+    out << manifest.dump(2);
+}
+
+void BlackBox::replayWal(IndexState& idx) {
+    if (!idx.wal.stream.is_open()) return;
+    auto records = readWalRecords(idx.wal.path);
+    for (const auto& rec : records) {
+        if (rec.op == WalOp::Upsert) {
+            auto j = json::from_cbor(rec.payload, nullptr, false);
+            if (j.is_discarded()) continue;
+            if (!validateDocument(idx, j)) continue;
+            idx.nextId = std::max<DocId>(idx.nextId, rec.docId + 1);
+            applyUpsert(idx, rec.docId, j, false);
+        } else if (rec.op == WalOp::Delete) {
+            applyDelete(idx, rec.docId, false);
+        }
+    }
 }
 
 bool BlackBox::saveSnapshot(const std::string& path) const {
@@ -909,7 +1419,14 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
             if (!writeSnapshotFile(shardFile.string(), chunk, tmp.nextId, avg)) {
                 return false;
             }
-            segs.push_back({{"file", shardFile.filename().string()}});
+            uint32_t segMin = ids[start];
+            uint32_t segMax = ids[end - 1];
+            segs.push_back({
+                {"file", shardFile.filename().string()},
+                {"min_id", segMin},
+                {"max_id", segMax},
+                {"wal_pos", 0}
+            });
         }
         manifest["indexes"].push_back({
             {"name", name},
@@ -925,17 +1442,27 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
 bool BlackBox::loadSnapshot(const std::string& path) {
     namespace fs = std::filesystem;
     fs::path manifestPath = path.empty() ? fs::path(dataDir_) / "index.manifest" : fs::path(path);
-    if (!fs::exists(manifestPath)) return false;
+    if (!fs::exists(manifestPath)) {
+        std::cerr << "BlackBox: manifest not found at " << manifestPath << "\n";
+        return false;
+    }
     std::ifstream in(manifestPath);
-    if (!in) return false;
+    if (!in) {
+        std::cerr << "BlackBox: failed to open manifest " << manifestPath << "\n";
+        return false;
+    }
     json manifest = json::parse(in, nullptr, false);
-    if (manifest.is_discarded()) return false;
+    if (manifest.is_discarded()) {
+        std::cerr << "BlackBox: manifest parse error\n";
+        return false;
+    }
     auto arr = manifest.value("indexes", json::array());
     if (!arr.is_array()) return false;
 
     indexes_.clear();
 
     for (const auto& idxJson : arr) {
+        if (!idxJson.is_object()) continue;
         std::string name = idxJson.value("name", "");
         if (name.empty()) continue;
         json segments = idxJson.value("segments", json::array());
@@ -970,7 +1497,20 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         }
 
         for (const auto& seg : segments) {
-            std::string file = seg.value("file", "");
+            std::string file;
+            uint32_t minId = 0;
+            uint32_t maxId = 0;
+            uint64_t walPos = 0;
+            if (seg.is_string()) {
+                file = seg.get<std::string>();
+            } else if (seg.is_object()) {
+                file = seg.value("file", "");
+                minId = seg.value("min_id", 0u);
+                maxId = seg.value("max_id", 0u);
+                walPos = seg.value("wal_pos", 0ull);
+            } else {
+                continue;
+            }
             if (file.empty()) continue;
             fs::path shardPath = manifestPath.parent_path() / file;
             SnapshotChunk chunk;
@@ -993,6 +1533,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                 auto num = chunk.docValues["numeric"];
                 if (num.is_object()) {
                     for (auto itn = num.begin(); itn != num.end(); ++itn) {
+                        if (!itn->is_object()) continue;
                         for (auto itv = itn->begin(); itv != itn->end(); ++itv) {
                             uint32_t id = std::stoul(itv.key());
                             state.numericValues[itn.key()][id] = itv.value().get<double>();
@@ -1004,6 +1545,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                 auto bl = chunk.docValues["bool"];
                 if (bl.is_object()) {
                     for (auto itb = bl.begin(); itb != bl.end(); ++itb) {
+                        if (!itb->is_object()) continue;
                         for (auto itv = itb->begin(); itv != itb->end(); ++itv) {
                             uint32_t id = std::stoul(itv.key());
                             state.boolValues[itb.key()][id] = itv.value().get<bool>();
@@ -1015,6 +1557,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                 auto st = chunk.docValues["strings"];
                 if (st.is_object()) {
                     for (auto its = st.begin(); its != st.end(); ++its) {
+                        if (!its->is_object()) continue;
                         for (auto itb = its->begin(); itb != its->end(); ++itb) {
                             if (!itb.value().is_array()) continue;
                             std::vector<DocId> idsArr;
@@ -1024,6 +1567,23 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                     }
                 }
             }
+            // Record segments metadata from manifest (fall back to deriving id range if absent)
+            if ((minId == 0 || maxId == 0) && !chunk.docs.empty()) {
+                uint32_t derivedMin = std::numeric_limits<uint32_t>::max();
+                uint32_t derivedMax = 0;
+                for (const auto& kv : chunk.docs) {
+                    derivedMin = std::min(derivedMin, kv.first);
+                    derivedMax = std::max(derivedMax, kv.first);
+                }
+                if (minId == 0) minId = derivedMin;
+                if (maxId == 0) maxId = derivedMax;
+            }
+            SegmentMetadata meta;
+            meta.file = file;
+            meta.minId = minId;
+            meta.maxId = maxId;
+            meta.walPos = walPos;
+            state.segments.push_back(meta);
         }
 
         // Ensure postings are sorted/unique
@@ -1032,11 +1592,39 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             std::sort(vec.begin(), vec.end(), [](const algo::Posting& a, const algo::Posting& b) { return a.id < b.id; });
             vec.erase(std::unique(vec.begin(), vec.end(), [](const algo::Posting& a, const algo::Posting& b){return a.id==b.id;}), vec.end());
         }
+        rebuildSkipPointers(state);
 
         refreshAverages(state);
+        // init WAL
+        if (!dataDir_.empty()) {
+            state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
+            state.wal.open();
+            replayWal(state);
+        }
         indexes_[name] = std::move(state);
+        std::cerr << "BlackBox: loaded index " << name << " segments=" << segments.size() << "\n";
     }
     return true;
+}
+
+void BlackBox::loadWalOnly() {
+    namespace fs = std::filesystem;
+    if (dataDir_.empty()) return;
+    std::cerr << "BlackBox: scanning WAL-only in " << dataDir_ << "\n";
+    for (const auto& entry : fs::directory_iterator(dataDir_)) {
+        if (!entry.is_regular_file()) continue;
+        auto path = entry.path();
+        if (path.extension() != ".wal") continue;
+        std::string name = path.stem().string();
+        if (indexes_.count(name)) continue;
+        IndexState state;
+        state.wal.path = path.string();
+        state.wal.open();
+        replayWal(state);
+        indexes_[name] = std::move(state);
+        std::cerr << "BlackBox: built index " << name << " from WAL\n";
+    }
+    writeManifest();
 }
 
 } // namespace minielastic

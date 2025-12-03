@@ -17,11 +17,17 @@ struct SearchHit {
     double score;
 };
 
+struct SkipEntry {
+    uint32_t pos;    // index inside posting list
+    uint32_t docId;  // docId at that position
+};
+
 struct SearchContext {
     const std::unordered_map<uint32_t, nlohmann::json>& docs;
     const std::unordered_map<std::string, std::vector<Posting>>& index;
     const std::unordered_map<uint32_t, uint32_t>& docLengths;
     double avgDocLen;
+    const std::unordered_map<std::string, std::vector<SkipEntry>>* skips = nullptr;
 };
 
 std::vector<SearchHit> searchLexical(const SearchContext& ctx, const std::vector<std::string>& terms);

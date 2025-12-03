@@ -315,74 +315,111 @@ void BlackBoxHttpServer::setupRoutes() {
 
         // Optional filters: tag, label, flag
         auto tagFilter = req.get_param_value("tag");
-    auto labelFilter = req.get_param_value("label");
-    auto flagParam = req.get_param_value("flag");
-    bool flagHasFilter = !flagParam.empty();
-    bool flagValue = flagParam == "true" || flagParam == "1";
+        auto labelFilter = req.get_param_value("label");
+        auto flagParam = req.get_param_value("flag");
+        bool flagHasFilter = !flagParam.empty();
+        bool flagValue = flagParam == "true" || flagParam == "1";
         // schema-driven filters: filter_<field>=value, filter_<field>_min/_max for numbers, filter_<field>_bool
         const auto* schema = db_.getSchema(index);
+        const auto* numVals = db_.getNumericValues(index);
+        const auto* boolVals = db_.getBoolValues(index);
+        const auto* strLists = db_.getStringLists(index);
 
-    // Apply filters before pagination
-    std::vector<minielastic::BlackBox::SearchHit> filtered;
-    filtered.reserve(results.size());
-    for (const auto& hit : results) {
-            // If schema doc-values can satisfy filters without doc fetch, prefer that; else fetch doc.
+        auto inStringList = [&](const std::string& field, const std::string& value, uint32_t docId)->bool {
+            if (!strLists) return false;
+            auto itField = strLists->find(field);
+            if (itField == strLists->end()) return false;
+            auto itBucket = itField->second.find(value);
+            if (itBucket == itField->second.end()) return false;
+            const auto& vec = itBucket->second;
+            return std::find(vec.begin(), vec.end(), docId) != vec.end();
+        };
+
+        auto boolMatch = [&](const std::string& field, bool expected, uint32_t docId)->bool {
+            if (!boolVals) return false;
+            auto itField = boolVals->find(field);
+            if (itField == boolVals->end()) return false;
+            auto itVal = itField->second.find(docId);
+            return itVal != itField->second.end() && itVal->second == expected;
+        };
+
+        // Apply filters before pagination
+        std::vector<minielastic::BlackBox::SearchHit> filtered;
+        filtered.reserve(results.size());
+        for (const auto& hit : results) {
+            bool passed = true;
+            // Fast path: doc-values for tag/label/flag require doc fetch; we'll do it lazily
             json doc;
-            try { doc = db_.getDocument(index, hit.id); } catch (...) { continue; }
+            auto ensureDoc = [&](bool needed) {
+                if (!needed) return true;
+                if (doc.is_null()) {
+                    try { doc = db_.getDocument(index, hit.id); }
+                    catch (...) { return false; }
+                }
+                return true;
+            };
+
             if (!tagFilter.empty()) {
-                bool okTag = false;
-                if (doc.contains("tags") && doc["tags"].is_array()) {
+                bool okTag = inStringList("tags", tagFilter, hit.id);
+                if (!okTag) {
+                    if (!ensureDoc(true)) continue;
+                    if (!(doc.contains("tags") && doc["tags"].is_array())) continue;
                     for (const auto& t : doc["tags"]) {
-                        if (t.is_string() && t.get<std::string>() == tagFilter) {
-                            okTag = true;
-                            break;
-                        }
+                        if (t.is_string() && t.get<std::string>() == tagFilter) { okTag = true; break; }
                     }
                 }
                 if (!okTag) continue;
             }
             if (!labelFilter.empty()) {
-                bool okLabel = false;
-                if (doc.contains("labels") && doc["labels"].is_array()) {
+                bool okLabel = inStringList("labels", labelFilter, hit.id);
+                if (!okLabel) {
+                    if (!ensureDoc(true)) continue;
+                    if (!(doc.contains("labels") && doc["labels"].is_array())) continue;
                     for (const auto& t : doc["labels"]) {
-                        if (t.is_string() && t.get<std::string>() == labelFilter) {
-                            okLabel = true;
-                            break;
-                        }
+                        if (t.is_string() && t.get<std::string>() == labelFilter) { okLabel = true; break; }
                     }
                 }
                 if (!okLabel) continue;
             }
             if (flagHasFilter) {
-                if (!doc.contains("flag") || !doc["flag"].is_boolean() || doc["flag"].get<bool>() != flagValue) {
-                    continue;
+                bool okFlag = boolMatch("flag", flagValue, hit.id);
+                if (!okFlag) {
+                    if (!ensureDoc(true)) continue;
+                    if (!doc.contains("flag") || !doc["flag"].is_boolean() || doc["flag"].get<bool>() != flagValue) continue;
                 }
             }
+
             if (schema) {
-                bool passed = true;
                 for (const auto& ft : schema->fieldTypes) {
                     const auto& field = ft.first;
                     auto type = ft.second;
                     // Equals filter
                     auto eqParam = req.get_param_value("filter_" + field);
                     if (!eqParam.empty()) {
-                        if (!doc.contains(field)) { passed = false; break; }
-                        const auto& val = doc[field];
-                        if (type == minielastic::BlackBox::FieldType::Text) {
-                            if (!val.is_string() || val.get<std::string>() != eqParam) { passed = false; break; }
-                        } else if (type == minielastic::BlackBox::FieldType::ArrayString) {
-                            if (!val.is_array()) { passed = false; break; }
+                        if (type == minielastic::BlackBox::FieldType::Bool && boolVals) {
+                            bool target = eqParam == "true" || eqParam == "1";
+                            auto itField = boolVals->find(field);
+                            if (itField == boolVals->end() || itField->second.find(hit.id) == itField->second.end() || itField->second.at(hit.id) != target) { passed = false; break; }
+                        } else if (type == minielastic::BlackBox::FieldType::Number && numVals) {
+                            double target = std::stod(eqParam);
+                            auto itField = numVals->find(field);
+                            if (itField == numVals->end()) { passed = false; break; }
+                            auto itVal = itField->second.find(hit.id);
+                            if (itVal == itField->second.end() || itVal->second != target) { passed = false; break; }
+                        } else if (type == minielastic::BlackBox::FieldType::ArrayString && strLists) {
+                            auto itField = strLists->find(field);
                             bool found = false;
-                            for (const auto& e : val) {
-                                if (e.is_string() && e.get<std::string>() == eqParam) { found = true; break; }
+                            if (itField != strLists->end()) {
+                                auto itBucket = itField->second.find(eqParam);
+                                if (itBucket != itField->second.end()) {
+                                    const auto& vec = itBucket->second;
+                                    found = std::find(vec.begin(), vec.end(), hit.id) != vec.end();
+                                }
                             }
                             if (!found) { passed = false; break; }
-                        } else if (type == minielastic::BlackBox::FieldType::Bool) {
-                            bool target = eqParam == "true" || eqParam == "1";
-                            if (!val.is_boolean() || val.get<bool>() != target) { passed = false; break; }
-                        } else if (type == minielastic::BlackBox::FieldType::Number) {
-                            double target = std::stod(eqParam);
-                            if (!val.is_number() || val.get<double>() != target) { passed = false; break; }
+                        } else {
+                            if (!ensureDoc(true)) { passed = false; break; }
+                            if (!doc.contains(field) || !doc[field].is_string() || doc[field].get<std::string>() != eqParam) { passed = false; break; }
                         }
                     }
                     // Range filter for numbers
@@ -390,8 +427,18 @@ void BlackBoxHttpServer::setupRoutes() {
                         auto minParam = req.get_param_value("filter_" + field + "_min");
                         auto maxParam = req.get_param_value("filter_" + field + "_max");
                         if (!minParam.empty() || !maxParam.empty()) {
-                            if (!doc.contains(field) || !doc[field].is_number()) { passed = false; break; }
-                            double v = doc[field].get<double>();
+                            double v = 0.0;
+                            if (numVals) {
+                                auto itField = numVals->find(field);
+                                if (itField == numVals->end()) { passed = false; break; }
+                                auto itVal = itField->second.find(hit.id);
+                                if (itVal == itField->second.end()) { passed = false; break; }
+                                v = itVal->second;
+                            } else {
+                                if (!ensureDoc(true)) { passed = false; break; }
+                                if (!doc.contains(field) || !doc[field].is_number()) { passed = false; break; }
+                                v = doc[field].get<double>();
+                            }
                             if (!minParam.empty()) {
                                 double mn = std::stod(minParam);
                                 if (v < mn) { passed = false; break; }

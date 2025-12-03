@@ -3,31 +3,123 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include <limits>
+#include <numeric>
 
 namespace minielastic::algo {
+
+namespace {
+constexpr size_t kSkipStride = 8;
+
+// Advance position inside a postings list using skip pointers (if available) to at least target docId.
+inline void advanceWithSkip(const std::vector<Posting>& plist,
+                            const std::vector<SkipEntry>* skips,
+                            size_t& pos,
+                            uint32_t target) {
+    if (pos >= plist.size()) return;
+    if (!skips || skips->empty()) {
+        while (pos < plist.size() && plist[pos].id < target) ++pos;
+        return;
+    }
+    // Jump by stride blocks while docId < target
+    size_t block = pos / kSkipStride;
+    while (block < skips->size() && plist[pos].id < target) {
+        const auto& s = (*skips)[block];
+        if (s.docId < target && s.pos > pos) {
+            pos = s.pos;
+            block = pos / kSkipStride;
+        } else {
+            break;
+        }
+    }
+    while (pos < plist.size() && plist[pos].id < target) ++pos;
+}
+
+// Intersect all posting lists (AND semantics) using skip pointers; returns doc IDs present in all lists.
+std::vector<uint32_t> intersectAll(const SearchContext& ctx, const std::vector<std::string>& terms) {
+    if (terms.empty()) return {};
+    // gather posting pointers
+    std::vector<const std::vector<Posting>*> lists;
+    std::vector<const std::vector<SkipEntry>*> skips;
+    lists.reserve(terms.size());
+    skips.reserve(terms.size());
+    for (const auto& t : terms) {
+        auto it = ctx.index.find(t);
+        if (it == ctx.index.end() || it->second.empty()) return {};
+        lists.push_back(&it->second);
+        if (ctx.skips) {
+            auto skIt = ctx.skips->find(t);
+            skips.push_back(skIt != ctx.skips->end() ? &skIt->second : nullptr);
+        } else {
+            skips.push_back(nullptr);
+        }
+    }
+    // sort by list size to reduce work
+    std::vector<size_t> order(lists.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return lists[a]->size() < lists[b]->size();
+    });
+
+    // positions per list
+    std::vector<size_t> pos(lists.size(), 0);
+    std::vector<uint32_t> out;
+    // initialize target as smallest list first element
+    uint32_t target = (*lists[order[0]])[0].id;
+
+    while (true) {
+        bool anyEnd = false;
+        uint32_t maxDoc = target;
+        // align all lists to target (or beyond)
+        for (size_t k = 0; k < order.size(); ++k) {
+            size_t idx = order[k];
+            advanceWithSkip(*lists[idx], skips[idx], pos[idx], target);
+            if (pos[idx] >= lists[idx]->size()) { anyEnd = true; break; }
+            uint32_t cur = (*lists[idx])[pos[idx]].id;
+            if (cur > maxDoc) maxDoc = cur;
+        }
+        if (anyEnd) break;
+        bool allEqual = true;
+        for (size_t k = 0; k < order.size(); ++k) {
+            size_t idx = order[k];
+            if ((*lists[idx])[pos[idx]].id != maxDoc) {
+                allEqual = false;
+                break;
+            }
+        }
+        if (allEqual) {
+            out.push_back(maxDoc);
+            // move all forward
+            for (size_t k = 0; k < order.size(); ++k) {
+                ++pos[order[k]];
+            }
+            if (pos[order[0]] >= lists[order[0]]->size()) break;
+            target = (*lists[order[0]])[pos[order[0]]].id;
+        } else {
+            target = maxDoc;
+        }
+    }
+    return out;
+}
+
+} // namespace
 
 std::vector<SearchHit> searchLexical(const SearchContext& ctx, const std::vector<std::string>& terms) {
     if (terms.empty()) return {};
 
-    std::unordered_map<uint32_t, uint32_t> termHits;
-    std::unordered_map<uint32_t, double> scores;
-
-    for (const auto& term : terms) {
-        auto it = ctx.index.find(term);
-        if (it == ctx.index.end()) {
-            return {}; // AND semantics: missing term aborts
-        }
-        for (const auto& p : it->second) {
-            termHits[p.id] += 1;
-            scores[p.id] += p.tf;
-        }
-    }
-
+    auto ids = intersectAll(ctx, terms);
     std::vector<SearchHit> hits;
-    for (const auto& kv : termHits) {
-        if (kv.second == terms.size()) {
-            hits.push_back({kv.first, scores[kv.first]});
+    hits.reserve(ids.size());
+    for (auto id : ids) {
+        double score = 0.0;
+        for (const auto& term : terms) {
+            auto it = ctx.index.find(term);
+            if (it == ctx.index.end()) continue;
+            const auto& plist = it->second;
+            auto itPos = std::lower_bound(plist.begin(), plist.end(), id, [](const Posting& p, uint32_t v){ return p.id < v; });
+            if (itPos != plist.end() && itPos->id == id) score += itPos->tf;
         }
+        hits.push_back({id, score});
     }
 
     std::sort(hits.begin(), hits.end(), [](const SearchHit& a, const SearchHit& b) {
@@ -45,35 +137,31 @@ std::vector<SearchHit> searchBm25(const SearchContext& ctx, const std::vector<st
     const double N = static_cast<double>(ctx.docs.size());
 
     std::unordered_map<uint32_t, double> scores;
-    std::unordered_map<uint32_t, uint32_t> termHits;
+
+    auto ids = intersectAll(ctx, terms);
+    if (ids.empty()) return {};
 
     for (const auto& term : terms) {
         auto it = ctx.index.find(term);
-        if (it == ctx.index.end()) {
-            return {}; // AND semantics
-        }
+        if (it == ctx.index.end()) return {};
         const auto& plist = it->second;
         const double df = static_cast<double>(plist.size());
         const double idf = std::log((N - df + 0.5) / (df + 0.5) + 1.0);
-
-        for (const auto& p : plist) {
-            const double tf = static_cast<double>(p.tf);
-            auto dlIt = ctx.docLengths.find(p.id);
+        for (auto id : ids) {
+            auto itPos = std::lower_bound(plist.begin(), plist.end(), id, [](const Posting& p, uint32_t v){ return p.id < v; });
+            if (itPos == plist.end() || itPos->id != id) continue;
+            const double tf = static_cast<double>(itPos->tf);
+            auto dlIt = ctx.docLengths.find(id);
             const double dl = dlIt != ctx.docLengths.end() ? static_cast<double>(dlIt->second) : 1.0;
             const double denom = tf + k1 * (1.0 - b + b * (dl / avgLen));
             const double score = idf * (tf * (k1 + 1.0)) / denom;
-            scores[p.id] += score;
-            termHits[p.id] += 1;
+            scores[id] += score;
         }
     }
 
     std::vector<SearchHit> hits;
     hits.reserve(scores.size());
-    for (const auto& kv : scores) {
-        if (termHits[kv.first] == terms.size()) {
-            hits.push_back({kv.first, kv.second});
-        }
-    }
+    for (const auto& kv : scores) hits.push_back({kv.first, kv.second});
     std::sort(hits.begin(), hits.end(), [](const SearchHit& a, const SearchHit& b) {
         if (a.score == b.score) return a.id < b.id;
         return a.score > b.score;

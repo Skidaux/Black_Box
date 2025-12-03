@@ -2,14 +2,63 @@
 #pragma once
 
 #include <cstdint>
+#include <fstream>
+#include <ostream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <nlohmann/json.hpp>
 #include "minielastic/Analyzer.hpp"
 #include "minielastic/algorithms/SearchAlgorithms.hpp"
 
+namespace minielastic {
+
+template <typename T>
+inline void writeLE(std::ostream& out, T value) {
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        char byte = static_cast<char>((static_cast<uint64_t>(value) >> (8 * i)) & 0xFFu);
+        out.write(&byte, 1);
+    }
+}
+
+template <typename T>
+inline void readLE(std::istream& in, T& value) {
+    value = 0;
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        char byte = 0;
+        if (!in.read(&byte, 1)) return;
+        value |= static_cast<uint64_t>(static_cast<unsigned char>(byte)) << (8 * i);
+    }
+}
+
+    enum class WalOp : uint8_t { Upsert = 1, Delete = 2 };
+
+    struct WalRecord {
+        WalOp op;
+        uint32_t docId;
+        std::vector<char> payload; // CBOR data
+    };
+
+    struct WalWriter {
+        std::string path;
+        std::ofstream stream;
+        uint64_t offset = 0;
+
+        WalWriter() = default;
+        explicit WalWriter(std::string p) : path(std::move(p)) {}
+
+        bool open();
+        void close();
+        bool append(const WalRecord& rec);
+        void reset();
+    };
+
+    std::vector<WalRecord> readWalRecords(const std::string& path);
+
+} // namespace minielastic
 namespace minielastic {
 
 class BlackBox {
@@ -33,6 +82,9 @@ public:
     bool createIndex(const std::string& name, const IndexSchema& schema);
     bool indexExists(const std::string& name) const;
     const IndexSchema* getSchema(const std::string& name) const;
+    const std::unordered_map<std::string, std::unordered_map<DocId, double>>* getNumericValues(const std::string& name) const;
+    const std::unordered_map<std::string, std::unordered_map<DocId, bool>>* getBoolValues(const std::string& name) const;
+    const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<DocId>>>* getStringLists(const std::string& name) const;
 
     // Index a document from a JSON string and return its ID in the given index.
     DocId indexDocument(const std::string& index, const std::string& jsonStr);
@@ -63,6 +115,13 @@ public:
 
 private:
     // Per-index state
+    struct SegmentMetadata {
+        std::string file;
+        uint32_t minId = 0;
+        uint32_t maxId = 0;
+        uint64_t walPos = 0;
+    };
+
     struct IndexState {
         DocId nextId = 1;
         std::unordered_map<DocId, nlohmann::json> documents;
@@ -75,6 +134,14 @@ private:
         std::unordered_map<std::string, std::unordered_map<DocId, double>> numericValues;
         std::unordered_map<std::string, std::unordered_map<DocId, bool>> boolValues;
         std::unordered_map<std::string, std::unordered_map<std::string, std::vector<DocId>>> stringLists; // for array<string> fields
+        std::unordered_map<std::string, std::vector<algo::SkipEntry>> skipPointers; // block-level skips
+        // ANN coarse quantizer (lightweight IVF-like)
+        bool annDirty = true;
+        uint32_t annClusters = 8;
+        std::vector<std::vector<float>> annCentroids;
+        std::vector<std::vector<DocId>> annBuckets;
+        std::vector<SegmentMetadata> segments;
+        WalWriter wal;
     };
 
     std::string dataDir_;
@@ -97,10 +164,18 @@ private:
     // Posting helpers
     void addPosting(IndexState& idx, const std::string& term, DocId id, uint32_t tf);
     void removePosting(IndexState& idx, const std::string& term, DocId id);
+    void rebuildSkipPointers(IndexState& idx);
+    void rebuildAnn(IndexState& idx) const;
 
     bool validateDocument(const IndexState& idx, const nlohmann::json& doc) const;
 
     // Snapshot helpers are implemented in the cpp.
+    DocId applyUpsert(IndexState& idx, DocId id, const nlohmann::json& doc, bool logWal);
+    bool applyDelete(IndexState& idx, DocId id, bool logWal);
+    void flushIfNeeded(const std::string& index, IndexState& idx);
+    void writeManifest() const;
+    void replayWal(IndexState& idx);
+    void loadWalOnly();
 };
 
 } // namespace minielastic
