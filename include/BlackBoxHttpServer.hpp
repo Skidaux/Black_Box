@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <chrono>
 #include "httplib.h"
 #include "BlackBox.hpp"
 #include <nlohmann/json.hpp>
@@ -18,4 +19,5 @@ private:
     httplib::Server server_;
     minielastic::BlackBox db_;
     std::string dataDir_;
+    std::chrono::steady_clock::time_point startTime_;
 };

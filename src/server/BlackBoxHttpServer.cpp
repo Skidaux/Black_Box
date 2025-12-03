@@ -1,13 +1,14 @@
 #include "BlackBoxHttpServer.hpp"
 
 #include <filesystem>
+#include <chrono>
 #include <iostream>
 #include <sstream>
 
 using json = nlohmann::json;
 
 BlackBoxHttpServer::BlackBoxHttpServer(std::string host, int port, std::string dataDir)
-    : host_(std::move(host)), port_(port), db_(dataDir), dataDir_(std::move(dataDir)) {
+    : host_(std::move(host)), port_(port), db_(dataDir), dataDir_(std::move(dataDir)), startTime_(std::chrono::steady_clock::now()) {
     setupRoutes();
 }
 
@@ -65,6 +66,52 @@ void BlackBoxHttpServer::setupRoutes() {
         addCors(res);
     });
 
+    // --- METRICS/STATS ---
+    server_.Get("/v1/metrics", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
+        auto now = std::chrono::steady_clock::now();
+        double uptimeSec = std::chrono::duration<double>(now - startTime_).count();
+        json data;
+        data["uptime_seconds"] = uptimeSec;
+        data["config"] = db_.config();
+        auto stats = db_.stats();
+        json jstats = json::array();
+        std::size_t totalDocs = 0;
+        std::size_t totalSegments = 0;
+        std::size_t totalVectors = 0;
+        uint64_t totalWal = 0;
+        for (const auto& s : stats) {
+            totalDocs += s.documents;
+            totalSegments += s.segments;
+            totalVectors += s.vectors;
+            totalWal += s.walBytes;
+            jstats.push_back({
+                {"name", s.name},
+                {"documents", s.documents},
+                {"segments", s.segments},
+                {"vectors", s.vectors},
+                {"ann_clusters", s.annClusters},
+                {"wal_bytes", s.walBytes},
+                {"pending_ops", s.pendingOps},
+                {"avg_doc_len", s.avgDocLen}
+            });
+        }
+        data["totals"] = {
+            {"documents", totalDocs},
+            {"segments", totalSegments},
+            {"vectors", totalVectors},
+            {"wal_bytes", totalWal}
+        };
+        data["indexes"] = jstats;
+        res.set_content(ok(data).dump(), "application/json");
+        addCors(res);
+    });
+
+    // --- CONFIG ---
+    server_.Get("/v1/config", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
+        res.set_content(ok(db_.config()).dump(), "application/json");
+        addCors(res);
+    });
+
     // --- CREATE INDEX ---
     server_.Post("/v1/indexes", [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res) {
         if (!isJsonContent(req)) {
@@ -95,6 +142,21 @@ void BlackBoxHttpServer::setupRoutes() {
             res.status = 400;
             res.set_content(err(400, std::string("Invalid JSON: ") + e.what()).dump(), "application/json");
         }
+        addCors(res);
+    });
+
+    // --- LIST INDEXES ---
+    server_.Get("/v1/indexes", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
+        json arr = json::array();
+        for (const auto& st : db_.stats()) {
+            arr.push_back({
+                {"name", st.name},
+                {"documents", st.documents},
+                {"segments", st.segments},
+                {"vectors", st.vectors}
+            });
+        }
+        res.set_content(ok(arr).dump(), "application/json");
         addCors(res);
     });
 

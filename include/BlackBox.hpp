@@ -114,6 +114,21 @@ public:
     bool saveSnapshot(const std::string& path = "") const;
     bool loadSnapshot(const std::string& path = "");
 
+    struct IndexStats {
+        std::string name;
+        std::size_t documents = 0;
+        std::size_t segments = 0;
+        std::size_t vectors = 0;
+        std::size_t annClusters = 0;
+        uint64_t walBytes = 0;
+        std::size_t pendingOps = 0;
+        double avgDocLen = 0.0;
+    };
+
+    std::vector<IndexStats> stats() const;
+    nlohmann::json config() const;
+    std::string dataDir() const { return dataDir_; }
+
 private:
     // Per-index state
     struct SegmentMetadata {
@@ -149,6 +164,7 @@ private:
     std::string dataDir_;
     mutable std::recursive_mutex mutex_;
     size_t flushEveryDocs_ = 5000;
+    size_t mergeSegmentsAt_ = 10;
     bool compressSnapshots_ = true;
     uint32_t defaultAnnClusters_ = 8;
     std::unordered_map<std::string, IndexState> indexes_;
@@ -179,6 +195,7 @@ private:
     DocId applyUpsert(IndexState& idx, DocId id, const nlohmann::json& doc, bool logWal);
     bool applyDelete(IndexState& idx, DocId id, bool logWal);
     void flushIfNeeded(const std::string& index, IndexState& idx);
+    void maybeMergeSegments(const std::string& index, IndexState& idx);
     void writeManifest() const;
     void replayWal(IndexState& idx);
     void loadWalOnly();

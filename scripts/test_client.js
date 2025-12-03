@@ -11,6 +11,12 @@ const axios = require("axios").create({
 });
 
 const hrMs = () => Number(process.hrtime.bigint()) / 1e6;
+const randChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const randomText = (words, len) => {
+  let out = [];
+  for (let i = 0; i < len; ++i) out.push(randChoice(words));
+  return out.join(" ");
+};
 
 async function timeStep(label, fn) {
   const start = hrMs();
@@ -90,6 +96,47 @@ async function main() {
     });
     console.log("patch doc2:", patchStep.result.status, patchStep.result.data);
 
+    // 4) Bulk ingest to simulate scale (defaults to 500 docs, adjustable via env BULK_COUNT)
+    const bulkCount = parseInt(process.env.BULK_COUNT || "500", 10);
+    const vocab = ["fast", "slow", "quick", "brown", "fox", "dog", "cat", "red", "blue", "green", "run", "jump", "sleep", "quiet", "loud", "sky", "river", "mountain", "forest", "code", "data"];
+    const bulkDocs = Array.from({ length: bulkCount }).map((_, i) => {
+      const body = randomText(vocab, 12 + Math.floor(Math.random() * 10));
+      const title = `BulkDoc${i + 1}`;
+      return {
+        title,
+        body,
+        tags: [randChoice(["animal", "tech", "nature", "news"]), randChoice(["fast", "slow", "fresh"])],
+        labels: [randChoice(["short", "medium", "long"])],
+        flag: Math.random() > 0.5,
+        priority: Math.floor(Math.random() * 10),
+        vec: [Math.random(), Math.random(), Math.random()],
+      };
+    });
+    const bulkStart = hrMs();
+    const concurrency = 20;
+    let idx = 0;
+    const bulkResults = [];
+    async function worker() {
+      while (idx < bulkDocs.length) {
+        const doc = bulkDocs[idx++];
+        const resp = await axios.post(`/v1/${indexName}/doc`, doc, { headers: { "Content-Type": "application/json" } });
+        bulkResults.push(resp.status);
+      }
+    }
+    await Promise.all(Array.from({ length: concurrency }, worker));
+    const bulkMs = hrMs() - bulkStart;
+    const avgBulkMs = bulkMs / bulkCount;
+    benchmark.timings.push({
+      step: "bulk_index",
+      ms: bulkMs,
+      status: "aggregate",
+      docs: bulkCount,
+      avgMsPerDoc: avgBulkMs,
+      success: bulkResults.filter((s) => s === 201).length,
+    });
+    benchmark.docsIndexed += bulkCount;
+    console.log(`bulk index: ${bulkCount} docs in ${bulkMs.toFixed(2)} ms (~${avgBulkMs.toFixed(3)} ms/doc)`);
+
     // 4) Searches (bm25, lexical, fuzzy, semantic, hybrid, filtered, vector)
     const queries = [
       { name: "bm25", params: { q: "quick fox", mode: "bm25" } },
@@ -102,6 +149,8 @@ async function main() {
       { name: "bm25_priority_range", params: { q: "fox", mode: "bm25", filter_priority_min: 3 } },
       // vector search: include q placeholder to satisfy server validation
       { name: "vector", params: { q: "vector", mode: "vector", vec: "1,0,0" } },
+      // stress query over bulk vocab
+      { name: "bm25_bulk", params: { q: "fast data", mode: "bm25", size: 5 } },
     ];
 
     for (const q of queries) {

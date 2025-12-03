@@ -643,13 +643,16 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envAnn = std::getenv("BLACKBOX_ANN_CLUSTERS")) {
         try { defaultAnnClusters_ = static_cast<uint32_t>(std::max<uint64_t>(1, std::stoull(envAnn))); } catch (...) {}
     }
+    if (const char* envMerge = std::getenv("BLACKBOX_MERGE_SEGMENTS")) {
+        try { mergeSegmentsAt_ = std::max<size_t>(1, static_cast<size_t>(std::stoull(envMerge))); } catch (...) {}
+    }
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
         fs::path dataPath = fs::absolute(fs::path(dataDir_));
         dataDir_ = dataPath.string();
         fs::create_directories(dataDir_);
-        std::cerr << "BlackBox: dataDir=" << dataDir_ << " flushEveryDocs=" << flushEveryDocs_ << " compress=" << (compressSnapshots_ ? "on" : "off") << " annClusters=" << defaultAnnClusters_ << "\n";
+        std::cerr << "BlackBox: dataDir=" << dataDir_ << " flushEveryDocs=" << flushEveryDocs_ << " mergeSegmentsAt=" << mergeSegmentsAt_ << " compress=" << (compressSnapshots_ ? "on" : "off") << " annClusters=" << defaultAnnClusters_ << "\n";
         bool loaded = loadSnapshot();
         if (!loaded) {
             std::cerr << "BlackBox: loadSnapshot failed, trying WAL only\n";
@@ -956,6 +959,38 @@ void BlackBox::refreshAverages(IndexState& idx) {
 
 std::vector<std::string> BlackBox::tokenize(const std::string& text) const {
     return Analyzer::tokenize(text);
+}
+
+std::vector<BlackBox::IndexStats> BlackBox::stats() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::vector<IndexStats> out;
+    out.reserve(indexes_.size());
+    for (const auto& kv : indexes_) {
+        const auto& st = kv.second;
+        IndexStats s;
+        s.name = kv.first;
+        s.documents = st.documents.size();
+        s.segments = st.segments.size();
+        s.vectors = st.vectors.size();
+        s.annClusters = st.annClusters;
+        s.walBytes = st.wal.offset;
+        s.pendingOps = st.opsSinceFlush;
+        s.avgDocLen = st.avgDocLen;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+nlohmann::json BlackBox::config() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    json j{
+        {"data_dir", dataDir_},
+        {"flush_every_docs", flushEveryDocs_},
+        {"merge_segments_at", mergeSegmentsAt_},
+        {"compress_snapshots", compressSnapshots_},
+        {"default_ann_clusters", defaultAnnClusters_}
+    };
+    return j;
 }
 
 void BlackBox::indexJson(IndexState& idx, DocId id, const json& j) {
@@ -1343,7 +1378,57 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         idx.wal.open();
         idx.opsSinceFlush = 0;
         writeManifest();
+        maybeMergeSegments(index, idx);
     }
+}
+
+void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
+    if (mergeSegmentsAt_ == 0) return;
+    if (idx.segments.size() < mergeSegmentsAt_) return;
+    namespace fs = std::filesystem;
+    SnapshotChunk chunk;
+    chunk.vectorDim = idx.schema.vectorDim;
+    chunk.docs.insert(chunk.docs.end(), idx.documents.begin(), idx.documents.end());
+    chunk.docLens = idx.docLengths;
+    chunk.index = idx.invertedIndex;
+    chunk.vectors = idx.vectors;
+    chunk.docValues = json{
+        {"numeric", idx.numericValues},
+        {"bool", idx.boolValues},
+        {"strings", idx.stringLists}
+    };
+    double avg = idx.docLengths.empty() ? 0.0 : [&]() {
+        uint64_t total = 0;
+        for (const auto& kv : idx.docLengths) total += kv.second;
+        return static_cast<double>(total) / static_cast<double>(idx.docLengths.size());
+    }();
+
+    fs::path segFile = fs::path(dataDir_) / (index + "_merge" + std::to_string(idx.segments.size()) + ".skd");
+    if (!writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
+        std::cerr << "BlackBox: mergeSegments failed to write " << segFile << "\n";
+        return;
+    }
+    // delete old segment files
+    for (const auto& seg : idx.segments) {
+        fs::path p = fs::path(dataDir_) / seg.file;
+        std::error_code ec;
+        fs::remove(p, ec);
+    }
+    idx.segments.clear();
+    SegmentMetadata meta;
+    if (!idx.documents.empty()) {
+        auto minmax = std::minmax_element(idx.documents.begin(), idx.documents.end(),
+            [](const auto& a, const auto& b){ return a.first < b.first; });
+        meta.minId = minmax.first->first;
+        meta.maxId = minmax.second->first;
+    }
+    meta.file = segFile.filename().string();
+    meta.walPos = 0;
+    idx.segments.push_back(meta);
+    idx.wal.reset();
+    idx.wal.open();
+    idx.opsSinceFlush = 0;
+    writeManifest();
 }
 
 void BlackBox::writeManifest() const {
