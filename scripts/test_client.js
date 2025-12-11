@@ -18,6 +18,15 @@ const randomText = (words, len) => {
   return out.join(" ");
 };
 
+const faviconPath = path.join(__dirname, "favicon.ico");
+let faviconBase64 = null;
+try {
+  const buf = fs.readFileSync(faviconPath);
+  faviconBase64 = buf.toString("base64");
+} catch (err) {
+  console.warn("Warning: failed to read favicon.ico:", err.message);
+}
+
 async function timeStep(label, fn) {
   const start = hrMs();
   const res = await fn();
@@ -69,7 +78,7 @@ async function main() {
     timings: [],
     queries: [],
     notes:
-      "Exercises multi-index usage, custom IDs, relations, and relation-aware queries.",
+      "Exercises multi-index usage, custom IDs, relations, binary images, custom aggregations, and relation-aware queries.",
   };
   benchmark.docsIndexed[primaryIndex] = 0;
   benchmark.docsIndexed[relatedIndex] = 0;
@@ -96,6 +105,7 @@ async function main() {
         title: "text",
         body: "text",
         sku: "text",
+        favicon: { type: "image", max_kb: 64 },
       },
       doc_id: {
         field: "sku",
@@ -134,6 +144,15 @@ async function main() {
       { sku: "sku-1", title: "Parent A", body: "root node" },
       { sku: "sku-2", title: "Parent B", body: "root node B" },
     ];
+    if (faviconBase64) {
+      for (const parent of parents) {
+        parent.favicon = {
+          format: "ico",
+          encoding: "base64",
+          content: faviconBase64,
+        };
+      }
+    }
     for (const doc of parents) {
       const res = await indexDoc(relatedIndex, doc);
       if (res.status !== 201) throw new Error("Failed to index parent");
@@ -382,6 +401,52 @@ async function main() {
       status: deleteParent.result.status,
     });
     console.log("delete parent:", deleteParent.result.status, deleteParent.result.data);
+
+    // 9) Custom aggregation API (pages + related docs)
+    const customApiName = "websearch";
+    const customSpec = {
+      base_index: primaryIndex,
+      select: ["title", "body", "priority"],
+      relations: [
+        {
+          name: "site",
+          field: "parent",
+          target_index: relatedIndex,
+          select: ["title", "body", "favicon"],
+          include_image: true,
+          image_field: "favicon",
+        },
+      ],
+    };
+    const customCreate = await timeStep("custom_api_create", async () =>
+      axios.put(`/v1/custom/${customApiName}`, customSpec, {
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+    benchmark.timings.push({
+      step: customCreate.label,
+      ms: customCreate.ms,
+      status: customCreate.result.status,
+    });
+    console.log("custom api create:", customCreate.result.status, customCreate.result.data);
+
+    const customQuery = await timeStep("custom_api_query", async () =>
+      axios.post(`/v1/custom/${customApiName}`, {
+        q: "fox",
+        mode: "bm25",
+        size: 3,
+      })
+    );
+    benchmark.timings.push({
+      step: customQuery.label,
+      ms: customQuery.ms,
+      status: customQuery.result.status,
+    });
+    console.log(
+      "custom api query:",
+      customQuery.result.status,
+      JSON.stringify(customQuery.result.data, null, 2)
+    );
 
     // 8) Persist benchmark JSON
     const outPath = path.join(__dirname, "benchmark_results.json");

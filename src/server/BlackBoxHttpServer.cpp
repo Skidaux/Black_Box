@@ -152,6 +152,84 @@ void BlackBoxHttpServer::setupRoutes() {
         addCors(res);
     });
 
+    // --- CUSTOM AGGREGATIONS ---
+    server_.Get("/v1/custom", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
+        auto list = db_.listCustomApis();
+        res.set_content(ok(list).dump(), "application/json");
+        addCors(res);
+    });
+
+    server_.Get(R"(/v1/custom/([^/]+))", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+        auto spec = db_.getCustomApi(req.matches[1]);
+        if (!spec) {
+            res.status = 404;
+            res.set_content(err(404, "Custom API not found").dump(), "application/json");
+        } else {
+            res.set_content(ok(*spec).dump(), "application/json");
+        }
+        addCors(res);
+    });
+
+    server_.Put(R"(/v1/custom/([^/]+))", [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res) {
+        if (!isJsonContent(req)) {
+            res.status = 415;
+            res.set_content(err(415, "Content-Type must be application/json").dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        try {
+            auto spec = json::parse(req.body);
+            if (!db_.createOrUpdateCustomApi(req.matches[1], spec)) {
+                res.status = 400;
+                res.set_content(err(400, "Invalid custom API spec").dump(), "application/json");
+            } else {
+                res.set_content(ok(json{{"name", req.matches[1]}}).dump(), "application/json");
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(err(400, std::string("Invalid JSON: ") + e.what()).dump(), "application/json");
+        }
+        addCors(res);
+    });
+
+    server_.Delete(R"(/v1/custom/([^/]+))", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+        if (!db_.removeCustomApi(req.matches[1])) {
+            res.status = 404;
+            res.set_content(err(404, "Custom API not found").dump(), "application/json");
+        } else {
+            res.set_content(ok(json{{"deleted", true}}).dump(), "application/json");
+        }
+        addCors(res);
+    });
+
+    server_.Post(R"(/v1/custom/([^/]+))", [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res) {
+        json params = json::object();
+        if (!req.body.empty()) {
+            if (!isJsonContent(req)) {
+                res.status = 415;
+                res.set_content(err(415, "Content-Type must be application/json").dump(), "application/json");
+                addCors(res);
+                return;
+            }
+            try {
+                params = json::parse(req.body);
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(err(400, std::string("Invalid JSON: ") + e.what()).dump(), "application/json");
+                addCors(res);
+                return;
+            }
+        }
+        try {
+            auto result = db_.runCustomApi(req.matches[1], params);
+            res.set_content(ok(result).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(err(400, e.what()).dump(), "application/json");
+        }
+        addCors(res);
+    });
+
     // --- LIST INDEXES ---
     server_.Get("/v1/indexes", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
         json arr = json::array();

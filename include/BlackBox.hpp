@@ -17,6 +17,8 @@
 
 namespace minielastic {
 
+using json = nlohmann::json;
+
 template <typename T>
 inline void writeLE(std::ostream& out, T value) {
     for (size_t i = 0; i < sizeof(T); ++i) {
@@ -67,13 +69,14 @@ public:
     using DocId = uint32_t;
     using SearchHit = algo::SearchHit;
 
-    enum class FieldType { Text, ArrayString, Bool, Number, Vector, Unknown };
+    enum class FieldType { Text, ArrayString, Bool, Number, Vector, Image, Unknown };
 
     struct IndexSchema {
         nlohmann::json schema;
         uint32_t vectorDim = 0; // optional vector dimension for vector field
         std::unordered_map<std::string, FieldType> fieldTypes;
         std::string vectorField;
+        std::unordered_map<std::string, size_t> imageMaxKB;
         struct DocIdConfig {
             std::string field;
             FieldType type = FieldType::Unknown;
@@ -117,6 +120,7 @@ public:
     nlohmann::json getDocument(const std::string& index, DocId id) const;
     std::optional<DocId> lookupDocId(const std::string& index, const std::string& providedId) const;
     std::optional<std::string> externalIdForDoc(const std::string& index, DocId id) const;
+    std::optional<std::string> getImageBase64(const std::string& index, DocId id, const std::string& field) const;
 
     // Delete a document; returns true if removed.
     bool deleteDocument(const std::string& index, DocId id);
@@ -142,8 +146,19 @@ public:
     std::vector<IndexStats> stats() const;
     nlohmann::json config() const;
     std::string dataDir() const { return dataDir_; }
+    bool createOrUpdateCustomApi(const std::string& name, const nlohmann::json& spec);
+    bool removeCustomApi(const std::string& name);
+    std::optional<nlohmann::json> getCustomApi(const std::string& name) const;
+    nlohmann::json listCustomApis() const;
+    nlohmann::json runCustomApi(const std::string& name, const nlohmann::json& params) const;
 
 private:
+    struct ImageBlob { std::string format; std::string data; };
+    struct ProcessedDoc {
+        nlohmann::json doc;
+        std::unordered_map<std::string, ImageBlob> images;
+    };
+
     // Per-index state
     struct SegmentMetadata {
         std::string file;
@@ -164,6 +179,7 @@ private:
         std::unordered_map<std::string, std::unordered_map<DocId, double>> numericValues;
         std::unordered_map<std::string, std::unordered_map<DocId, bool>> boolValues;
         std::unordered_map<std::string, std::unordered_map<std::string, std::vector<DocId>>> stringLists; // for array<string> fields
+        std::unordered_map<std::string, std::unordered_map<DocId, ImageBlob>> imageValues;
         std::unordered_map<std::string, DocId> externalToDocId;
         std::unordered_map<DocId, std::string> docIdToExternal;
         std::unordered_map<std::string, std::vector<algo::SkipEntry>> skipPointers; // block-level skips
@@ -185,6 +201,8 @@ private:
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
     std::unordered_map<std::string, IndexState> indexes_;
+    std::unordered_map<std::string, nlohmann::json> customApis_;
+    std::string customApiPath_;
 
     void refreshAverages(IndexState& idx);
 
@@ -209,7 +227,7 @@ private:
     bool validateDocument(const IndexState& idx, const nlohmann::json& doc) const;
 
     // Snapshot helpers are implemented in the cpp.
-    DocId applyUpsert(IndexState& idx, DocId id, const nlohmann::json& doc, bool logWal);
+    DocId applyUpsert(IndexState& idx, DocId id, const ProcessedDoc& processed, bool logWal);
     bool applyDelete(IndexState& idx, DocId id, bool logWal);
     void flushIfNeeded(const std::string& index, IndexState& idx);
     void maybeMergeSegments(const std::string& index, IndexState& idx);
@@ -220,6 +238,14 @@ private:
     std::optional<std::string> extractCustomId(const IndexState& idx, const nlohmann::json& doc) const;
     std::optional<std::string> canonicalizeCustomIdInput(const IndexState& idx, const std::string& raw) const;
     std::optional<DocId> findDocIdUnlocked(const IndexState& idx, const std::string& providedId) const;
+    ProcessedDoc preprocessIncomingDocument(IndexState& idx, const nlohmann::json& doc) const;
+    ProcessedDoc preprocessWalDocument(IndexState& idx, nlohmann::json& walDoc) const;
+    void attachImagesToWal(json& walDoc, const ProcessedDoc& processed) const;
+    void loadCustomApis();
+    void saveCustomApis() const;
+    bool validateCustomApi(const std::string& name, const nlohmann::json& spec) const;
+    nlohmann::json executeCustomApiInternal(const std::string& name, const nlohmann::json& spec, const nlohmann::json& params) const;
+    nlohmann::json buildCustomRelationTree(const std::string& baseIndex, const nlohmann::json& doc, DocId docId, const nlohmann::json& relationSpec) const;
 };
 
 } // namespace minielastic

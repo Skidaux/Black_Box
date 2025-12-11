@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-12-11T20:58:31.555Z",
+  "timestamp": "2025-12-11T23:11:49.714Z",
   "baseURL": "http://127.0.0.1:8080",
   "indexes": [
     "demo",
@@ -12,55 +12,65 @@
   "timings": [
     {
       "step": "create_primary",
-      "ms": 12.766980999615043,
+      "ms": 11.436226001009345,
       "status": 201
     },
     {
       "step": "create_related",
-      "ms": 45.162300999742,
+      "ms": 42.50867900066078,
       "status": 201
     },
     {
       "step": "index_documents_total",
-      "ms": 126.37516499962658,
+      "ms": 129.31009299866855,
       "status": "aggregate",
       "perDoc": [
         {
           "doc": "Doc1",
-          "ms": 42.701301000081,
+          "ms": 43.676678000018,
           "status": 201
         },
         {
           "doc": "Doc2",
-          "ms": 41.860223999712616,
+          "ms": 43.7432610001415,
           "status": 201
         },
         {
           "doc": "Doc3",
-          "ms": 41.81363999983296,
+          "ms": 41.89015399850905,
           "status": 201
         }
       ]
     },
     {
       "step": "patch_parent",
-      "ms": 41.89819100033492,
+      "ms": 43.52621599845588,
       "status": 200
     },
     {
       "step": "bulk_related",
-      "ms": 8295.886976999696,
+      "ms": 8294.336004000157,
       "status": "aggregate",
       "docs": 200
     },
     {
       "step": "fetch_parent_sku",
-      "ms": 41.86826200038195,
+      "ms": 42.260704999789596,
       "status": 200
     },
     {
       "step": "delete_parent_sku",
-      "ms": 42.72837599972263,
+      "ms": 42.852996999397874,
+      "status": 200
+    },
+    {
+      "step": "custom_api_create",
+      "ms": 41.67074600048363,
+      "status": 200
+    },
+    {
+      "step": "custom_api_query",
+      "ms": 42.14140100032091,
       "status": 200
     }
   ],
@@ -72,7 +82,7 @@
         "q": "quick fox",
         "mode": "bm25"
       },
-      "ms": 41.77036699978635,
+      "ms": 42.751919999718666,
       "status": 200,
       "hits": 1,
       "total": 1
@@ -86,7 +96,7 @@
         "from": 1,
         "size": 2
       },
-      "ms": 41.81845699995756,
+      "ms": 42.13963600061834,
       "status": 200,
       "hits": 0,
       "total": 1
@@ -103,7 +113,7 @@
         "filter_priority_min": 1,
         "filter_priority_max": 6
       },
-      "ms": 41.86320499982685,
+      "ms": 42.42064799927175,
       "status": 200,
       "hits": 1,
       "total": 1
@@ -116,7 +126,7 @@
         "mode": "lexical",
         "filter_labels": "short"
       },
-      "ms": 42.26208500005305,
+      "ms": 41.779931999742985,
       "status": 200,
       "hits": 0,
       "total": 0
@@ -129,7 +139,7 @@
         "mode": "fuzzy",
         "distance": 2
       },
-      "ms": 42.37340599996969,
+      "ms": 41.91791199892759,
       "status": 200,
       "hits": 1,
       "total": 1
@@ -144,7 +154,7 @@
         "w_semantic": 1.5,
         "w_lexical": 0.3
       },
-      "ms": 41.844006000086665,
+      "ms": 41.808849999681115,
       "status": 200,
       "hits": 2,
       "total": 2
@@ -156,7 +166,7 @@
         "q": "quick brown fox",
         "mode": "semantic"
       },
-      "ms": 42.02771099982783,
+      "ms": 41.83460900001228,
       "status": 200,
       "hits": 2,
       "total": 2
@@ -169,7 +179,7 @@
         "mode": "bm25",
         "include_relations": "inline"
       },
-      "ms": 42.982576000038534,
+      "ms": 43.03875599987805,
       "status": 200,
       "hits": 2,
       "total": 2
@@ -183,7 +193,7 @@
         "include_relations": "hierarchy",
         "max_relation_depth": 2
       },
-      "ms": 41.73399099987,
+      "ms": 41.96219700016081,
       "status": 200,
       "hits": 2,
       "total": 2
@@ -196,7 +206,7 @@
         "mode": "bm25",
         "include_relations": "inline"
       },
-      "ms": 42.001094999723136,
+      "ms": 41.619145998731256,
       "status": 200,
       "hits": 0,
       "total": 0
@@ -209,7 +219,7 @@
         "mode": "bm25",
         "size": 5
       },
-      "ms": 42.75641799997538,
+      "ms": 41.81629900075495,
       "status": 200,
       "hits": 2,
       "total": 2
@@ -222,7 +232,7 @@
         "mode": "bm25",
         "filter_sku": "sku-1"
       },
-      "ms": 43.22253999998793,
+      "ms": 41.99370200000703,
       "status": 200,
       "hits": 1,
       "total": 1
@@ -235,11 +245,11 @@
         "mode": "vector",
         "vec": "1,0,0"
       },
-      "ms": 41.63147999998182,
+      "ms": 42.33650999888778,
       "status": 200,
       "hits": 2,
       "total": 2
     }
   ],
-  "notes": "Exercises multi-index usage, custom IDs, relations, and relation-aware queries."
+  "notes": "Exercises multi-index usage, custom IDs, relations, binary images, custom aggregations, and relation-aware queries."
 }

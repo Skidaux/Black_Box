@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <sstream>
+#include <iomanip>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -47,6 +48,11 @@ struct SnapshotChunk {
     std::unordered_map<uint32_t, std::vector<float>> vectors;
     uint32_t vectorDim = 0;
     json docValues; // numeric, bool, string lists
+    struct SnapshotImage {
+        std::string format;
+        std::string data;
+    };
+    std::unordered_map<std::string, std::unordered_map<uint32_t, SnapshotImage>> images;
 };
 
 template <typename T>
@@ -69,6 +75,55 @@ bool walReadLE(std::istream& in, T& value) {
 }
 
 enum class SectionEncoding : uint16_t { Raw = 0, Zstd = 1 };
+
+static const char kB64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64Encode(const std::string& input) {
+    std::string out;
+    out.reserve(((input.size() + 2) / 3) * 4);
+    uint32_t val = 0;
+    int valb = -6;
+    for (unsigned char c : input) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(kB64Alphabet[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(kB64Alphabet[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+static std::string base64Decode(const std::string& input) {
+    std::vector<int> T(256, -1);
+    for (int i = 0; i < 64; ++i) T[kB64Alphabet[i]] = i;
+    std::string out;
+    out.reserve(input.size() * 3 / 4);
+    uint32_t val = 0;
+    int valb = -8;
+    for (unsigned char c : input) {
+        if (T[c] == -1) {
+            if (c == '=') break;
+            continue;
+        }
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+static std::string crcHex(const std::string& input) {
+    uint32_t crc = minielastic::crc32(std::string_view(input));
+    std::ostringstream oss;
+    oss << std::hex << std::setw(8) << std::setfill('0') << crc;
+    return oss.str();
+}
 
 #ifdef BLACKBOX_USE_ZSTD
 #include <zstd.h>
@@ -234,6 +289,32 @@ static bool writeSnapshotFile(const std::string& path,
     // Section 9: doc-values (JSON)
     Section dvSec = makeSection(9, chunk.docValues.dump(), compressSections);
 
+    std::string imagePayload;
+    if (!chunk.images.empty()) {
+        std::vector<std::string> fields;
+        fields.reserve(chunk.images.size());
+        for (const auto& kv : chunk.images) fields.push_back(kv.first);
+        std::sort(fields.begin(), fields.end());
+        for (const auto& field : fields) {
+            const auto& map = chunk.images.at(field);
+            if (field.size() > std::numeric_limits<uint16_t>::max()) continue;
+            writeLE(imagePayload, static_cast<uint16_t>(field.size()));
+            imagePayload.append(field);
+            writeLE(imagePayload, static_cast<uint32_t>(map.size()));
+            std::vector<std::pair<uint32_t, SnapshotChunk::SnapshotImage>> entries(map.begin(), map.end());
+            std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b){ return a.first < b.first; });
+            for (const auto& entry : entries) {
+                writeLE(imagePayload, entry.first);
+                const auto& img = entry.second;
+                writeLE(imagePayload, static_cast<uint16_t>(img.format.size()));
+                imagePayload.append(img.format);
+                writeLE(imagePayload, static_cast<uint32_t>(img.data.size()));
+                imagePayload.append(img.data);
+            }
+        }
+    }
+    Section imageSec = makeSection(10, std::move(imagePayload), compressSections);
+
     std::vector<Section> sections;
     sections.push_back(std::move(metaSec));
     sections.push_back(std::move(docTableSec));
@@ -243,6 +324,7 @@ static bool writeSnapshotFile(const std::string& path,
     sections.push_back(std::move(postingsSec));
     sections.push_back(std::move(vecSec));
     sections.push_back(std::move(dvSec));
+    if (!imageSec.payload.empty()) sections.push_back(std::move(imageSec));
 
     constexpr uint16_t kVersion = 1;
     constexpr size_t kHeaderPad = 64;
@@ -446,6 +528,7 @@ static bool readSnapshotFile(const std::string& path,
     const auto postingsSec = getSection(7);
     const auto vecSec = getSection(8);
     const auto dvSec = getSection(9);
+    const auto imageSec = getSection(10);
 
     std::string termDictDecoded;
     std::string postingsDecoded;
@@ -542,6 +625,42 @@ static bool readSnapshotFile(const std::string& path,
             auto dv = json::parse(dvView, nullptr, false);
             if (!dv.is_discarded()) {
                 outChunk.docValues = dv;
+            }
+        }
+    }
+
+    if (imageSec && validateCrc(10, imageSec->first)) {
+        std::string imgDecoded;
+        std::string_view imgView;
+        if (imageSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+            imgDecoded.assign(imageSec->first.begin(), imageSec->first.end());
+        } else {
+            if (!maybeDecompress(imageSec->first, imageSec->second, imgDecoded)) return false;
+        }
+        imgView = std::string_view(imgDecoded);
+        size_t cursorImages = 0;
+        while (cursorImages < imgView.size()) {
+            uint16_t fieldLen = 0;
+            if (!readLE(imgView, cursorImages, fieldLen)) break;
+            if (cursorImages + fieldLen > imgView.size()) break;
+            std::string field(imgView.substr(cursorImages, fieldLen));
+            cursorImages += fieldLen;
+            uint32_t count = 0;
+            if (!readLE(imgView, cursorImages, count)) break;
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t docId = 0;
+                if (!readLE(imgView, cursorImages, docId)) break;
+                uint16_t fmtLen = 0;
+                if (!readLE(imgView, cursorImages, fmtLen)) break;
+                if (cursorImages + fmtLen > imgView.size()) break;
+                std::string format(imgView.substr(cursorImages, fmtLen));
+                cursorImages += fmtLen;
+                uint32_t dataLen = 0;
+                if (!readLE(imgView, cursorImages, dataLen)) break;
+                if (cursorImages + dataLen > imgView.size()) break;
+                std::string blob(imgView.substr(cursorImages, dataLen));
+                cursorImages += dataLen;
+                outChunk.images[field][docId] = SnapshotChunk::SnapshotImage{format, std::move(blob)};
             }
         }
     }
@@ -656,6 +775,7 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
         fs::path dataPath = fs::absolute(fs::path(dataDir_));
         dataDir_ = dataPath.string();
         fs::create_directories(dataDir_);
+        customApiPath_ = (fs::path(dataDir_) / "custom_apis.json").string();
         std::cerr << "BlackBox: dataDir=" << dataDir_ << " flushEveryDocs=" << flushEveryDocs_ << " mergeSegmentsAt=" << mergeSegmentsAt_ << " compress=" << (compressSnapshots_ ? "on" : "off") << " annClusters=" << defaultAnnClusters_ << "\n";
         bool loaded = loadSnapshot();
         if (!loaded) {
@@ -680,6 +800,7 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
             }
         }
         std::cerr << "BlackBox: init complete; indexes=" << indexes_.size() << "\n";
+        loadCustomApis();
     }
 }
 
@@ -757,7 +878,8 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
             throw std::runtime_error("document id already exists");
         }
     }
-    DocId id = applyUpsert(idx, 0, j, true);
+    auto processed = preprocessIncomingDocument(idx, j);
+    DocId id = applyUpsert(idx, 0, processed, true);
     refreshAverages(idx);
     writeManifest();
     if (autoSnapshot_) saveSnapshot();
@@ -789,6 +911,17 @@ std::optional<std::string> BlackBox::externalIdForDoc(const std::string& index, 
     auto mapIt = it->second.docIdToExternal.find(id);
     if (mapIt == it->second.docIdToExternal.end()) return std::nullopt;
     return mapIt->second;
+}
+
+std::optional<std::string> BlackBox::getImageBase64(const std::string& index, DocId id, const std::string& field) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    auto it = indexes_.find(index);
+    if (it == indexes_.end()) return std::nullopt;
+    auto fieldIt = it->second.imageValues.find(field);
+    if (fieldIt == it->second.imageValues.end()) return std::nullopt;
+    auto blobIt = fieldIt->second.find(id);
+    if (blobIt == fieldIt->second.end()) return std::nullopt;
+    return base64Encode(blobIt->second.data);
 }
 
 bool BlackBox::deleteDocument(const std::string& index, DocId id) {
@@ -828,7 +961,8 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
         throw std::runtime_error("document does not conform to schema");
     }
 
-    applyUpsert(idx, id, merged, true);
+    auto processed = preprocessIncomingDocument(idx, merged);
+    applyUpsert(idx, id, processed, true);
     refreshAverages(idx);
     writeManifest();
     if (autoSnapshot_) saveSnapshot();
@@ -1054,6 +1188,8 @@ void BlackBox::indexStructured(IndexState& idx, DocId id, const json& doc) {
         } else if (type == FieldType::Vector) {
             // handled separately during ingest
             continue;
+        } else if (type == FieldType::Image) {
+            continue;
         } else if (type == FieldType::Bool && val.is_boolean()) {
             idx.boolValues[key][id] = val.get<bool>();
         } else if (type == FieldType::Number && val.is_number()) {
@@ -1083,6 +1219,8 @@ void BlackBox::removeJson(IndexState& idx, DocId id, const json& j) {
                     for (const auto& t : terms) removePosting(idx, t, id);
                 }
             }
+        } else if (type == FieldType::Image) {
+            continue;
         }
     }
 }
@@ -1239,6 +1377,10 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
             if (!val.is_array()) return false;
             if (val.size() < idx.schema.vectorDim) return false;
             break;
+        case FieldType::Image:
+            if (!val.is_object()) return false;
+            if (!val.contains("content") || !val["content"].is_string()) return false;
+            break;
         default:
             break;
         }
@@ -1269,8 +1411,72 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
     return true;
 }
 
-BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann::json& doc, bool logWal) {
+BlackBox::ProcessedDoc BlackBox::preprocessIncomingDocument(IndexState& idx, const nlohmann::json& doc) const {
+    ProcessedDoc processed;
+    processed.doc = doc;
+    for (const auto& ft : idx.schema.fieldTypes) {
+        if (ft.second != FieldType::Image) continue;
+        const auto& field = ft.first;
+        if (!processed.doc.contains(field) || processed.doc[field].is_null()) continue;
+        const auto& node = processed.doc[field];
+        if (!node.is_object()) continue;
+        auto content = node.value("content", "");
+        std::string format = node.value("format", "bin");
+        auto encoding = node.value("encoding", "base64");
+        std::string raw;
+        if (encoding == "base64") {
+            raw = base64Decode(content);
+        } else {
+            raw = content;
+        }
+        size_t maxKB = idx.schema.imageMaxKB.count(field) ? idx.schema.imageMaxKB.at(field) : 256;
+        if (raw.size() > maxKB * 1024ULL) {
+            throw std::runtime_error("image field exceeds max size for " + field);
+        }
+        processed.images[field] = ImageBlob{format, std::move(raw)};
+        json meta = {
+            {"format", format},
+            {"bytes", processed.images[field].data.size()},
+            {"hash", crcHex(processed.images[field].data)}
+        };
+        processed.doc[field] = meta;
+    }
+    return processed;
+}
+
+BlackBox::ProcessedDoc BlackBox::preprocessWalDocument(IndexState& idx, nlohmann::json& walDoc) const {
+    ProcessedDoc processed;
+    processed.doc = walDoc;
+    if (processed.doc.contains("_binary") && processed.doc["_binary"].is_object()) {
+        auto bin = processed.doc["_binary"];
+        for (auto it = bin.begin(); it != bin.end(); ++it) {
+            if (!it.value().is_object()) continue;
+            auto field = it.key();
+            auto data = it.value().value("data", "");
+            auto format = it.value().value("format", "bin");
+            std::string raw = base64Decode(data);
+            processed.images[field] = ImageBlob{format, std::move(raw)};
+        }
+        processed.doc.erase("_binary");
+    }
+    return processed;
+}
+
+void BlackBox::attachImagesToWal(json& walDoc, const ProcessedDoc& processed) const {
+    if (processed.images.empty()) return;
+    json bin = json::object();
+    for (const auto& kv : processed.images) {
+        bin[kv.first] = {
+            {"format", kv.second.format},
+            {"data", base64Encode(kv.second.data)}
+        };
+    }
+    walDoc["_binary"] = std::move(bin);
+}
+
+BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const ProcessedDoc& processed, bool logWal) {
     DocId assignId = id == 0 ? idx.nextId++ : id;
+    const nlohmann::json& doc = processed.doc;
     std::optional<std::string> newExternal;
     if (idx.schema.docId) {
         newExternal = extractCustomId(idx, doc);
@@ -1299,6 +1505,9 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann:
                 auto& vec = bucket.second;
                 vec.erase(std::remove(vec.begin(), vec.end(), assignId), vec.end());
             }
+        }
+        for (auto& imgField : idx.imageValues) {
+            imgField.second.erase(assignId);
         }
     }
 
@@ -1330,6 +1539,14 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann:
         idx.externalToDocId.erase(*previousExternal);
         idx.docIdToExternal.erase(assignId);
     }
+    for (auto& imgField : idx.imageValues) {
+        if (!processed.images.count(imgField.first)) {
+            imgField.second.erase(assignId);
+        }
+    }
+    for (const auto& img : processed.images) {
+        idx.imageValues[img.first][assignId] = img.second;
+    }
     idx.docLengths[assignId] = 0;
     indexStructured(idx, assignId, doc);
 
@@ -1338,7 +1555,9 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann:
             idx.wal.open();
         }
         if (idx.wal.stream.is_open()) {
-            std::vector<uint8_t> cbor = json::to_cbor(doc);
+            json walDoc = doc;
+            attachImagesToWal(walDoc, processed);
+            std::vector<uint8_t> cbor = json::to_cbor(walDoc);
             WalRecord rec;
             rec.op = WalOp::Upsert;
             rec.docId = assignId;
@@ -1376,6 +1595,9 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
             auto& vec = bucket.second;
             vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
         }
+    }
+    for (auto& imgField : idx.imageValues) {
+        imgField.second.erase(id);
     }
     if (logWal) {
         if (!idx.wal.stream.is_open() && !idx.wal.path.empty()) {
@@ -1418,6 +1640,11 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         {"bool", idx.boolValues},
         {"strings", idx.stringLists}
     };
+    for (const auto& field : idx.imageValues) {
+        for (const auto& entry : field.second) {
+            chunk.images[field.first][entry.first] = SnapshotChunk::SnapshotImage{entry.second.format, entry.second.data};
+        }
+    }
 
     double avg = idx.docLengths.empty() ? 0.0 : [&]() {
         uint64_t total = 0;
@@ -1461,6 +1688,11 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         {"bool", idx.boolValues},
         {"strings", idx.stringLists}
     };
+    for (const auto& field : idx.imageValues) {
+        for (const auto& entry : field.second) {
+            chunk.images[field.first][entry.first] = SnapshotChunk::SnapshotImage{entry.second.format, entry.second.data};
+        }
+    }
     double avg = idx.docLengths.empty() ? 0.0 : [&]() {
         uint64_t total = 0;
         for (const auto& kv : idx.docLengths) total += kv.second;
@@ -1523,9 +1755,9 @@ void BlackBox::replayWal(IndexState& idx) {
         if (rec.op == WalOp::Upsert) {
             auto j = json::from_cbor(rec.payload, true, false);
             if (j.is_discarded()) continue;
-            if (!validateDocument(idx, j)) continue;
+            auto processed = preprocessWalDocument(idx, j);
             idx.nextId = std::max<DocId>(idx.nextId, rec.docId + 1);
-            applyUpsert(idx, rec.docId, j, false);
+            applyUpsert(idx, rec.docId, processed, false);
         } else if (rec.op == WalOp::Delete) {
             applyDelete(idx, rec.docId, false);
         }
@@ -1592,6 +1824,12 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
                 {"bool", tmp.boolValues},
                 {"strings", tmp.stringLists}
             };
+            for (const auto& field : idx.imageValues) {
+                for (const auto& imgEntry : field.second) {
+                    if (tmp.documents.find(imgEntry.first) == tmp.documents.end()) continue;
+                    chunk.images[field.first][imgEntry.first] = SnapshotChunk::SnapshotImage{imgEntry.second.format, imgEntry.second.data};
+                }
+            }
             double avg = tmp.docLengths.empty() ? 0.0 : [&]() {
                 uint64_t total = 0;
                 for (const auto& kv : tmp.docLengths) total += kv.second;
@@ -1742,6 +1980,13 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                             for (const auto& val : itb.value()) idsArr.push_back(val.get<uint32_t>());
                             state.stringLists[its.key()][itb.key()] = std::move(idsArr);
                         }
+                    }
+                }
+            }
+            if (!chunk.images.empty()) {
+                for (const auto& field : chunk.images) {
+                    for (const auto& img : field.second) {
+                        state.imageValues[field.first][img.first] = ImageBlob{img.second.format, img.second.data};
                     }
                 }
             }
@@ -1902,6 +2147,228 @@ std::optional<BlackBox::DocId> BlackBox::findDocIdUnlocked(const IndexState& idx
     } catch (...) {
         return std::nullopt;
     }
+}
+
+bool BlackBox::createOrUpdateCustomApi(const std::string& name, const json& spec) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    if (name.empty()) return false;
+    if (!validateCustomApi(name, spec)) return false;
+    customApis_[name] = spec;
+    saveCustomApis();
+    return true;
+}
+
+bool BlackBox::removeCustomApi(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    if (!customApis_.erase(name)) return false;
+    saveCustomApis();
+    return true;
+}
+
+std::optional<json> BlackBox::getCustomApi(const std::string& name) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    auto it = customApis_.find(name);
+    if (it == customApis_.end()) return std::nullopt;
+    return it->second;
+}
+
+json BlackBox::listCustomApis() const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    json arr = json::array();
+    for (const auto& kv : customApis_) {
+        json entry = {{"name", kv.first}};
+        if (kv.second.contains("base_index")) entry["base_index"] = kv.second["base_index"];
+        arr.push_back(entry);
+    }
+    return arr;
+}
+
+json BlackBox::runCustomApi(const std::string& name, const json& params) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    auto it = customApis_.find(name);
+    if (it == customApis_.end()) throw std::runtime_error("custom api not found");
+    return executeCustomApiInternal(name, it->second, params);
+}
+
+void BlackBox::loadCustomApis() {
+    customApis_.clear();
+    if (dataDir_.empty()) return;
+    namespace fs = std::filesystem;
+    customApiPath_ = (fs::path(dataDir_) / "custom_apis.json").string();
+    std::ifstream in(customApiPath_);
+    if (!in) return;
+    json parsed = json::parse(in, nullptr, false);
+    if (parsed.is_discarded()) return;
+    auto obj = parsed.value("apis", json::object());
+    if (!obj.is_object()) return;
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        customApis_[it.key()] = it.value();
+    }
+}
+
+void BlackBox::saveCustomApis() const {
+    if (customApiPath_.empty()) return;
+    json payload = json::object();
+    payload["apis"] = json::object();
+    for (const auto& kv : customApis_) {
+        payload["apis"][kv.first] = kv.second;
+    }
+    std::ofstream out(customApiPath_, std::ios::binary | std::ios::trunc);
+    if (out) {
+        out << payload.dump(2);
+    }
+}
+
+bool BlackBox::validateCustomApi(const std::string& name, const json& spec) const {
+    if (!spec.is_object()) return false;
+    std::string baseIndex = spec.value("base_index", "");
+    if (baseIndex.empty()) return false;
+    if (!indexes_.count(baseIndex)) return false;
+    if (spec.contains("select") && !spec["select"].is_array()) return false;
+    if (spec.contains("relations") && !spec["relations"].is_array()) return false;
+    (void)name;
+    return true;
+}
+
+json BlackBox::executeCustomApiInternal(const std::string& name, const json& spec, const json& params) const {
+    std::string baseIndex = spec.value("base_index", "");
+    if (baseIndex.empty()) throw std::runtime_error("custom api missing base_index");
+    size_t from = params.value("from", 0);
+    size_t size = params.value("size", 10);
+    std::string mode = params.value("mode", "bm25");
+    std::string query = params.value("q", "");
+    int distance = params.value("distance", 1);
+    size_t need = from + size;
+    std::vector<SearchHit> results;
+    if (mode == "vector") {
+        auto vecStr = params.value("vec", "");
+        if (vecStr.empty()) throw std::runtime_error("missing vector parameter");
+        std::vector<float> vec;
+        std::stringstream ss(vecStr);
+        std::string part;
+        while (std::getline(ss, part, ',')) {
+            try { vec.push_back(static_cast<float>(std::stof(part))); } catch (...) {}
+        }
+        results = searchVector(baseIndex, vec, need);
+    } else if (mode == "hybrid") {
+        double wBm25 = params.value("w_bm25", 1.0);
+        double wSem = params.value("w_semantic", 1.0);
+        double wLex = params.value("w_lexical", 0.5);
+        results = searchHybrid(baseIndex, query, wBm25, wSem, wLex, need);
+    } else {
+        results = search(baseIndex, query, mode, need, distance);
+    }
+    size_t total = results.size();
+    size_t start = std::min(from, total);
+    size_t end = std::min(start + size, total);
+    json select = spec.value("select", json::array());
+    json relationSpec = spec.value("relations", json::array());
+    json rows = json::array();
+    for (size_t i = start; i < end; ++i) {
+        auto hitId = results[i].id;
+        json doc;
+        try { doc = getDocument(baseIndex, hitId); } catch (...) { continue; }
+        json projected = json::object();
+        if (select.is_array() && !select.empty()) {
+            for (const auto& field : select) {
+                if (!field.is_string()) continue;
+                if (doc.contains(field)) projected[field.get<std::string>()] = doc[field];
+            }
+        } else {
+            projected = doc;
+        }
+        json item = {
+            {"id", hitId},
+            {"score", results[i].score},
+            {"doc", projected}
+        };
+        if (auto ext = externalIdForDoc(baseIndex, hitId)) item["doc_id"] = *ext;
+        if (relationSpec.is_array()) {
+            json relObj = json::object();
+            for (const auto& rel : relationSpec) {
+                if (!rel.is_object()) continue;
+                auto relName = rel.value("name", "");
+                if (relName.empty()) continue;
+                auto relData = buildCustomRelationTree(baseIndex, doc, hitId, rel);
+                if (!relData.is_null()) relObj[relName] = relData;
+            }
+            if (!relObj.empty()) item["relations"] = relObj;
+        }
+        rows.push_back(item);
+    }
+    json response = {
+        {"name", name},
+        {"base_index", baseIndex},
+        {"mode", mode},
+        {"from", from},
+        {"size", size},
+        {"total", total},
+        {"hits", rows}
+    };
+    return response;
+}
+
+json BlackBox::buildCustomRelationTree(const std::string& baseIndex, const json& doc, DocId baseId, const json& relationSpec) const {
+    (void)baseId;
+    std::string field = relationSpec.value("field", "");
+    if (field.empty()) return json();
+    if (!doc.contains(field) || doc[field].is_null()) return json();
+    auto node = doc[field];
+    std::string targetIndex = relationSpec.value("target_index", baseIndex);
+    std::string relationIdStr;
+    if (node.is_object()) {
+        relationIdStr = node.value("id", "");
+        targetIndex = node.value("index", targetIndex);
+    } else if (node.is_string()) {
+        relationIdStr = node.get<std::string>();
+    } else if (node.is_number_integer()) {
+        relationIdStr = std::to_string(node.get<int64_t>());
+    } else {
+        return json();
+    }
+    if (relationIdStr.empty()) return json();
+    auto relationDocId = lookupDocId(targetIndex, relationIdStr);
+    if (!relationDocId) return json();
+    json relDoc;
+    try { relDoc = getDocument(targetIndex, *relationDocId); }
+    catch (...) { return json(); }
+    json select = relationSpec.value("select", json::array());
+    json projected = json::object();
+    if (select.is_array() && !select.empty()) {
+        for (const auto& fieldName : select) {
+            if (!fieldName.is_string()) continue;
+            auto key = fieldName.get<std::string>();
+            if (relDoc.contains(key)) projected[key] = relDoc[key];
+        }
+    } else {
+        projected = relDoc;
+    }
+    json out = {
+        {"index", targetIndex},
+        {"id", *relationDocId},
+        {"doc", projected}
+    };
+    if (auto ext = externalIdForDoc(targetIndex, *relationDocId)) out["doc_id"] = *ext;
+    if (relationSpec.value("include_image", false)) {
+        std::string imageField = relationSpec.value("image_field", "");
+        if (!imageField.empty()) {
+            if (auto img = getImageBase64(targetIndex, *relationDocId, imageField)) {
+                out["image"] = *img;
+            }
+        }
+    }
+    if (relationSpec.contains("relations") && relationSpec["relations"].is_array()) {
+        json nestedObj = json::object();
+        for (const auto& nested : relationSpec["relations"]) {
+            if (!nested.is_object()) continue;
+            auto nestedName = nested.value("name", "");
+            if (nestedName.empty()) continue;
+            auto nestedRes = buildCustomRelationTree(targetIndex, relDoc, *relationDocId, nested);
+            if (!nestedRes.is_null()) nestedObj[nestedName] = nestedRes;
+        }
+        if (!nestedObj.empty()) out["relations"] = nestedObj;
+    }
+    return out;
 }
 
 } // namespace minielastic
