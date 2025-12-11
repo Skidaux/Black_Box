@@ -166,6 +166,7 @@ private:
     size_t flushEveryDocs_ = 5000;
     size_t mergeSegmentsAt_ = 10;
     bool compressSnapshots_ = true;
+    bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
     std::unordered_map<std::string, IndexState> indexes_;
 

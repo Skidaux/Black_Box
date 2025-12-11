@@ -424,10 +424,10 @@ static bool readSnapshotFile(const std::string& path,
         std::string_view payload(docBlobView.data() + offset, len);
         if (minielastic::crc32(payload) != checksum) continue;
 
-        auto j = json::from_cbor(payload, nullptr, false);
+        auto j = json::from_cbor(payload, true, false);
         if (j.is_discarded()) continue;
 
-        outChunk.docs.push_back({id, j});
+        outChunk.docs.emplace_back(id, j);
         nextId = std::max<uint32_t>(nextId, id + 1);
     }
 
@@ -640,6 +640,10 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
         std::string v(envComp);
         compressSnapshots_ = !(v == "0" || v == "false" || v == "off");
     }
+    if (const char* envAuto = std::getenv("BLACKBOX_AUTO_SNAPSHOT")) {
+        std::string v(envAuto);
+        autoSnapshot_ = !(v == "0" || v == "false" || v == "off");
+    }
     if (const char* envAnn = std::getenv("BLACKBOX_ANN_CLUSTERS")) {
         try { defaultAnnClusters_ = static_cast<uint32_t>(std::max<uint64_t>(1, std::stoull(envAnn))); } catch (...) {}
     }
@@ -765,7 +769,7 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
     DocId id = applyUpsert(idx, 0, j, true);
     refreshAverages(idx);
     writeManifest();
-    saveSnapshot(); // ensure durable .skd
+    if (autoSnapshot_) saveSnapshot();
     flushIfNeeded(index, idx);
     return id;
 }
@@ -789,7 +793,7 @@ bool BlackBox::deleteDocument(const std::string& index, DocId id) {
     if (ok) {
         refreshAverages(idx);
         writeManifest();
-        saveSnapshot(); // ensure durable .skd
+        if (autoSnapshot_) saveSnapshot();
         flushIfNeeded(index, idx);
     }
     return ok;
@@ -820,7 +824,7 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
     applyUpsert(idx, id, merged, true);
     refreshAverages(idx);
     writeManifest();
-    saveSnapshot(); // ensure durable .skd
+    if (autoSnapshot_) saveSnapshot();
     flushIfNeeded(index, idx);
     return true;
 }
@@ -988,6 +992,7 @@ nlohmann::json BlackBox::config() const {
         {"flush_every_docs", flushEveryDocs_},
         {"merge_segments_at", mergeSegmentsAt_},
         {"compress_snapshots", compressSnapshots_},
+        {"auto_snapshot", autoSnapshot_},
         {"default_ann_clusters", defaultAnnClusters_}
     };
     return j;
@@ -1457,7 +1462,7 @@ void BlackBox::replayWal(IndexState& idx) {
     auto records = readWalRecords(idx.wal.path);
     for (const auto& rec : records) {
         if (rec.op == WalOp::Upsert) {
-            auto j = json::from_cbor(rec.payload, nullptr, false);
+            auto j = json::from_cbor(rec.payload, true, false);
             if (j.is_discarded()) continue;
             if (!validateDocument(idx, j)) continue;
             idx.nextId = std::max<DocId>(idx.nextId, rec.docId + 1);
