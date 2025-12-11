@@ -59,6 +59,37 @@ int main() {
     auto bm25b = db2.search(indexName, "quick fox");
     expect(!bm25b.empty() && bm25b[0].id == id, "bm25 after load should find doc");
 
+    // Custom doc IDs + relations
+    const std::string relIndex = "custom_index";
+    BlackBox::IndexSchema relSchema;
+    relSchema.schema = {
+        {"fields", {
+            {"title", "text"},
+            {"body", "text"},
+            {"sku", "text"}
+        }},
+        {"doc_id", {
+            {"field", "sku"},
+            {"type", "string"}
+        }},
+        {"relation", {
+            {"field", "parent"},
+            {"target_index", ""}
+        }}
+    };
+    expect(db.createIndex(relIndex, relSchema), "failed to create relation index");
+    auto parentId = db.indexDocument(relIndex, R"({"sku":"sku-1","title":"Parent","body":"root"})");
+    auto childId = db.indexDocument(relIndex, R"({"sku":"sku-2","title":"Child","body":"leaf","parent":{"id":"sku-1"}})");
+    expect(childId != parentId, "child should be distinct doc id");
+    auto parentLookup = db.lookupDocId(relIndex, "sku-1");
+    expect(parentLookup.has_value() && *parentLookup == parentId, "lookup should return parent id");
+    auto childLookup = db.lookupDocId(relIndex, "sku-2");
+    expect(childLookup.has_value() && *childLookup == childId, "lookup should return child id");
+    auto parentDoc = db.getDocument(relIndex, *parentLookup);
+    expect(parentDoc["sku"].get<std::string>() == "sku-1", "stored parent doc mismatch");
+    expect(db.deleteDocument(relIndex, *childLookup), "delete child");
+    expect(!db.lookupDocId(relIndex, "sku-2").has_value(), "child lookup should be cleared");
+
     std::cout << "All tests passed." << std::endl;
     return 0;
 }

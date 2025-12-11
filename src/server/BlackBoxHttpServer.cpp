@@ -4,6 +4,10 @@
 #include <chrono>
 #include <iostream>
 #include <sstream>
+#include <functional>
+#include <unordered_set>
+#include <unordered_map>
+#include <optional>
 
 using json = nlohmann::json;
 
@@ -51,6 +55,9 @@ void BlackBoxHttpServer::setupRoutes() {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    };
+    auto resolveDocId = [this](const std::string& index, const std::string& raw) -> std::optional<minielastic::BlackBox::DocId> {
+        return db_.lookupDocId(index, raw);
     };
 
     // Handle preflight OPTIONS requests for ANY route
@@ -208,6 +215,9 @@ void BlackBoxHttpServer::setupRoutes() {
             auto j = json::parse(req.body);
             auto id = db_.indexDocument(index, j.dump());
             json response = {{ "id", id }};
+            if (auto ext = db_.externalIdForDoc(index, id)) {
+                response["doc_id"] = *ext;
+            }
             res.status = 201;
             res.set_content(ok(response).dump(), "application/json");
         }
@@ -219,16 +229,24 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- GET DOCUMENT ---
-    server_.Get(R"(/v1/([^/]+)/doc/(\d+))", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Get(R"(/v1/([^/]+)/doc/([^/]+))", [this, ok, err, addCors, resolveDocId](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];
+        auto docIdOpt = resolveDocId(index, req.matches[2]);
+        if (!docIdOpt) {
+            res.status = 404;
+            res.set_content(err(404, "Document not found").dump(), "application/json");
+            addCors(res);
+            return;
+        }
         try {
-            auto id = static_cast<minielastic::BlackBox::DocId>(std::stoul(req.matches[2]));
-            auto doc = db_.getDocument(index, id);
-
+            auto doc = db_.getDocument(index, *docIdOpt);
             json data = {
-                {"id", id},
+                {"id", *docIdOpt},
                 {"doc", doc}
             };
+            if (auto ext = db_.externalIdForDoc(index, *docIdOpt)) {
+                data["doc_id"] = *ext;
+            }
             res.set_content(ok(data).dump(), "application/json");
         }
         catch (...) {
@@ -239,7 +257,7 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- UPDATE DOCUMENT (PUT = replace, PATCH = partial) ---
-    auto updateDoc = [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res, bool partial) {
+    auto updateDoc = [this, ok, err, isJsonContent, addCors, resolveDocId](const httplib::Request& req, httplib::Response& res, bool partial) {
         std::string index = req.matches[1];
         if (!isJsonContent(req)) {
             res.status = 415;
@@ -247,20 +265,23 @@ void BlackBoxHttpServer::setupRoutes() {
             addCors(res);
             return;
         }
-        minielastic::BlackBox::DocId id{};
-        try { id = static_cast<minielastic::BlackBox::DocId>(std::stoul(req.matches[2])); }
-        catch (...) {
-            res.status = 400;
-            res.set_content(err(400, "Invalid document id").dump(), "application/json");
+        auto docIdOpt = resolveDocId(index, req.matches[2]);
+        if (!docIdOpt) {
+            res.status = 404;
+            res.set_content(err(404, "Document not found").dump(), "application/json");
             addCors(res);
             return;
         }
         try {
-            if (!db_.updateDocument(index, id, req.body, partial)) {
+            if (!db_.updateDocument(index, *docIdOpt, req.body, partial)) {
                 res.status = 404;
                 res.set_content(err(404, "Document not found").dump(), "application/json");
             } else {
-                res.set_content(ok(json{{"id", id}}).dump(), "application/json");
+                json payload = {{"id", *docIdOpt}};
+                if (auto ext = db_.externalIdForDoc(index, *docIdOpt)) {
+                    payload["doc_id"] = *ext;
+                }
+                res.set_content(ok(payload).dump(), "application/json");
             }
         } catch (const std::exception& e) {
             res.status = 400;
@@ -271,25 +292,26 @@ void BlackBoxHttpServer::setupRoutes() {
         }
         addCors(res);
     };
-    server_.Put(R"(/v1/([^/]+)/doc/(\d+))", [updateDoc](const httplib::Request& req, httplib::Response& res){ updateDoc(req, res, false); });
-    server_.Patch(R"(/v1/([^/]+)/doc/(\d+))", [updateDoc](const httplib::Request& req, httplib::Response& res){ updateDoc(req, res, true); });
+    server_.Put(R"(/v1/([^/]+)/doc/([^/]+))", [updateDoc](const httplib::Request& req, httplib::Response& res){ updateDoc(req, res, false); });
+    server_.Patch(R"(/v1/([^/]+)/doc/([^/]+))", [updateDoc](const httplib::Request& req, httplib::Response& res){ updateDoc(req, res, true); });
 
     // --- DELETE DOCUMENT ---
-    server_.Delete(R"(/v1/([^/]+)/doc/(\d+))", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Delete(R"(/v1/([^/]+)/doc/([^/]+))", [this, ok, err, addCors, resolveDocId](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];
-        minielastic::BlackBox::DocId id{};
-        try {
-            id = static_cast<minielastic::BlackBox::DocId>(std::stoul(req.matches[2]));
-        }
-        catch (...) {
-            res.status = 400;
-            res.set_content(err(400, "Invalid document id").dump(), "application/json");
+        auto docIdOpt = resolveDocId(index, req.matches[2]);
+        if (!docIdOpt) {
+            res.status = 404;
+            res.set_content(err(404, "Document not found").dump(), "application/json");
             addCors(res);
             return;
         }
 
-        if (db_.deleteDocument(index, id)) {
-            json data = { {"id", id}, {"deleted", true} };
+        auto existingExternal = db_.externalIdForDoc(index, *docIdOpt);
+        if (db_.deleteDocument(index, *docIdOpt)) {
+            json data = { {"id", *docIdOpt}, {"deleted", true} };
+            if (existingExternal) {
+                data["doc_id"] = *existingExternal;
+            }
             res.set_content(ok(data).dump(), "application/json");
         }
         else {
@@ -521,14 +543,143 @@ void BlackBoxHttpServer::setupRoutes() {
         size_t start = std::min<size_t>(from, total);
         size_t end   = std::min<size_t>(start + size, total);
 
-        json hits = json::array();
+        auto relationModeParam = req.get_param_value("include_relations");
+        std::string relationMode = relationModeParam.empty() ? "none" : relationModeParam;
+        int relationDepth = parseBounded(req.get_param_value("max_relation_depth"), 1, 0, 5);
+
+        struct RelationRef {
+            std::string index;
+            std::string id;
+        };
+
+        auto parseRelationFor = [this](const std::string& idxName, const json& document) -> std::optional<RelationRef> {
+            const auto* relSchema = db_.getSchema(idxName);
+            if (!relSchema || !relSchema->relation) return std::nullopt;
+            const auto& cfg = *relSchema->relation;
+            if (!document.contains(cfg.field) || document[cfg.field].is_null()) return std::nullopt;
+            const auto& val = document[cfg.field];
+            std::string targetIndex = cfg.targetIndex.empty() ? idxName : cfg.targetIndex;
+            std::string relId;
+            if (val.is_string()) {
+                relId = val.get<std::string>();
+            } else if (val.is_number_integer()) {
+                relId = std::to_string(val.get<int64_t>());
+            } else if (val.is_object()) {
+                targetIndex = val.value("index", targetIndex);
+                if (val.contains("id")) {
+                    const auto& idNode = val["id"];
+                    if (idNode.is_string()) relId = idNode.get<std::string>();
+                    else if (idNode.is_number_integer()) relId = std::to_string(idNode.get<int64_t>());
+                }
+            }
+            if (relId.empty()) return std::nullopt;
+            return RelationRef{targetIndex, relId};
+        };
+
+        std::function<std::optional<json>(const RelationRef&, int, std::unordered_set<std::string>&)> resolveRelationDoc;
+        resolveRelationDoc = [this, &parseRelationFor, &resolveRelationDoc, index](const RelationRef& ref, int depth, std::unordered_set<std::string>& visited) -> std::optional<json> {
+            if (depth <= 0) return std::nullopt;
+            std::string idxName = ref.index.empty() ? index : ref.index;
+            auto idOpt = db_.lookupDocId(idxName, ref.id);
+            if (!idOpt) return std::nullopt;
+            std::string token = idxName + "::" + ref.id;
+            if (!visited.insert(token).second) return std::nullopt;
+            json doc;
+            try {
+                doc = db_.getDocument(idxName, *idOpt);
+            } catch (...) {
+                visited.erase(token);
+                return std::nullopt;
+            }
+            json wrapper = {
+                {"index", idxName},
+                {"id", ref.id},
+                {"doc", doc}
+            };
+            if (auto external = db_.externalIdForDoc(idxName, *idOpt)) {
+                wrapper["doc_id"] = *external;
+            }
+            if (depth > 1) {
+                if (auto nested = parseRelationFor(idxName, doc)) {
+                    auto nestedDoc = resolveRelationDoc(*nested, depth - 1, visited);
+                    if (nestedDoc) wrapper["relation"] = *nestedDoc;
+                }
+            }
+            visited.erase(token);
+            return wrapper;
+        };
+
+        struct MaterializedHit {
+            minielastic::BlackBox::SearchHit hit;
+            json doc;
+            std::optional<RelationRef> relation;
+        };
+        std::vector<MaterializedHit> pageHits;
+        pageHits.reserve(end - start);
         for (size_t i = start; i < end; ++i) {
-            auto id = filtered[i].id;
-            hits.push_back({
-                {"id", id},
-                {"score", filtered[i].score},
-                {"doc", db_.getDocument(index, id)}
-            });
+            try {
+                json doc = db_.getDocument(index, filtered[i].id);
+                auto relation = parseRelationFor(index, doc);
+                pageHits.push_back({filtered[i], doc, relation});
+            } catch (...) {
+                continue;
+            }
+        }
+
+        json hits = json::array();
+        json relationGroups = json::array();
+        std::unordered_map<std::string, size_t> relationGroupIndex;
+
+        auto relationKey = [&](const std::optional<RelationRef>& ref) {
+            if (!ref) return std::string("__none__");
+            std::string idxName = ref->index.empty() ? index : ref->index;
+            return idxName + "::" + ref->id;
+        };
+
+        for (const auto& mh : pageHits) {
+            json hit = {
+                {"id", mh.hit.id},
+                {"score", mh.hit.score},
+                {"doc", mh.doc}
+            };
+            if (auto ext = db_.externalIdForDoc(index, mh.hit.id)) {
+                hit["doc_id"] = *ext;
+            }
+            if ((relationMode == "inline" || relationMode == "hierarchy") && mh.relation) {
+                std::unordered_set<std::string> visited;
+                auto resolved = resolveRelationDoc(*mh.relation, relationDepth, visited);
+                if (resolved) hit["relation"] = *resolved;
+                json refJson = {
+                    {"index", mh.relation->index.empty() ? index : mh.relation->index},
+                    {"id", mh.relation->id}
+                };
+                hit["relation_ref"] = refJson;
+            }
+            hits.push_back(hit);
+
+            if (relationMode == "hierarchy") {
+                auto key = relationKey(mh.relation);
+                size_t idxGroup = 0;
+                if (relationGroupIndex.find(key) == relationGroupIndex.end()) {
+                    json group;
+                    if (mh.relation) {
+                        std::unordered_set<std::string> visited;
+                        auto resolved = resolveRelationDoc(*mh.relation, relationDepth, visited);
+                        if (resolved) group["relation"] = *resolved;
+                        group["relation_ref"] = {
+                            {"index", mh.relation->index.empty() ? index : mh.relation->index},
+                            {"id", mh.relation->id}
+                        };
+                    } else {
+                        group["relation_ref"] = nullptr;
+                    }
+                    group["children"] = json::array();
+                    relationGroups.push_back(group);
+                    relationGroupIndex[key] = relationGroups.size() - 1;
+                }
+                idxGroup = relationGroupIndex[key];
+                relationGroups[idxGroup]["children"].push_back(hit);
+            }
         }
 
         json response = {
@@ -537,8 +688,12 @@ void BlackBoxHttpServer::setupRoutes() {
             {"size", size},
             {"total", total},
             {"mode", mode},
-            {"hits", hits}
+            {"hits", hits},
+            {"relation_mode", relationMode}
         };
+        if (!relationGroups.empty()) {
+            response["relation_groups"] = relationGroups;
+        }
 
         res.set_content(ok(response).dump(), "application/json");
         addCors(res);

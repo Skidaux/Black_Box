@@ -694,25 +694,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     indexes_[name] = IndexState{};
     indexes_[name].schema = schema;
     indexes_[name].annClusters = defaultAnnClusters_;
-    // Parse field types
-    if (schema.schema.contains("fields") && schema.schema["fields"].is_object()) {
-        for (auto it = schema.schema["fields"].begin(); it != schema.schema["fields"].end(); ++it) {
-            if (it.value().is_string()) {
-                auto t = it.value().get<std::string>();
-                if (t == "text") indexes_[name].schema.fieldTypes[it.key()] = FieldType::Text;
-                else if (t == "array") indexes_[name].schema.fieldTypes[it.key()] = FieldType::ArrayString;
-                else if (t == "bool") indexes_[name].schema.fieldTypes[it.key()] = FieldType::Bool;
-                else if (t == "number") indexes_[name].schema.fieldTypes[it.key()] = FieldType::Number;
-            } else if (it.value().is_object()) {
-                auto type = it.value().value("type", "");
-                if (type == "vector") {
-                    indexes_[name].schema.vectorField = it.key();
-                    indexes_[name].schema.vectorDim = it.value().value("dim", 0);
-                    indexes_[name].schema.fieldTypes[it.key()] = FieldType::Vector;
-                }
-            }
-        }
-    }
+    configureSchema(indexes_[name]);
     // init WAL
     if (!dataDir_.empty()) {
         indexes_[name].wal.path = (std::filesystem::path(dataDir_) / (name + ".wal")).string();
@@ -766,6 +748,15 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
     if (!validateDocument(idx, j)) {
         throw std::runtime_error("document does not conform to schema");
     }
+    if (idx.schema.docId) {
+        auto ext = extractCustomId(idx, j);
+        if (!ext || ext->empty()) {
+            throw std::runtime_error("document missing custom id field");
+        }
+        if (idx.externalToDocId.count(*ext)) {
+            throw std::runtime_error("document id already exists");
+        }
+    }
     DocId id = applyUpsert(idx, 0, j, true);
     refreshAverages(idx);
     writeManifest();
@@ -782,6 +773,22 @@ nlohmann::json BlackBox::getDocument(const std::string& index, DocId id) const {
     auto d = docs.find(id);
     if (d == docs.end()) throw std::runtime_error("Document ID not found");
     return d->second;
+}
+
+std::optional<BlackBox::DocId> BlackBox::lookupDocId(const std::string& index, const std::string& providedId) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    auto it = indexes_.find(index);
+    if (it == indexes_.end()) return std::nullopt;
+    return findDocIdUnlocked(it->second, providedId);
+}
+
+std::optional<std::string> BlackBox::externalIdForDoc(const std::string& index, DocId id) const {
+    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    auto it = indexes_.find(index);
+    if (it == indexes_.end()) return std::nullopt;
+    auto mapIt = it->second.docIdToExternal.find(id);
+    if (mapIt == it->second.docIdToExternal.end()) return std::nullopt;
+    return mapIt->second;
 }
 
 bool BlackBox::deleteDocument(const std::string& index, DocId id) {
@@ -1236,11 +1243,48 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
             break;
         }
     }
+    try {
+        if (idx.schema.docId) {
+            auto id = extractCustomId(idx, doc);
+            if (!id || id->empty()) return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    if (idx.schema.relation) {
+        const auto& cfg = *idx.schema.relation;
+        if (doc.contains(cfg.field) && !doc[cfg.field].is_null()) {
+            const auto& rel = doc[cfg.field];
+            if (!(rel.is_object() || rel.is_string() || rel.is_number_integer())) {
+                return false;
+            }
+            if (rel.is_object()) {
+                if (!rel.contains("id")) return false;
+                const auto& rv = rel["id"];
+                if (!(rv.is_string() || rv.is_number_integer())) return false;
+                if (rel.contains("index") && !rel["index"].is_string()) return false;
+            }
+        }
+    }
     return true;
 }
 
 BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann::json& doc, bool logWal) {
     DocId assignId = id == 0 ? idx.nextId++ : id;
+    std::optional<std::string> newExternal;
+    if (idx.schema.docId) {
+        newExternal = extractCustomId(idx, doc);
+        if (!newExternal || newExternal->empty()) {
+            throw std::runtime_error("document missing custom id");
+        }
+        auto dup = idx.externalToDocId.find(*newExternal);
+        if (dup != idx.externalToDocId.end() && dup->second != assignId) {
+            throw std::runtime_error("document id already exists");
+        }
+    }
+    std::optional<std::string> previousExternal;
+    auto prevIt = idx.docIdToExternal.find(assignId);
+    if (prevIt != idx.docIdToExternal.end()) previousExternal = prevIt->second;
 
     // remove old if updating
     auto existing = idx.documents.find(assignId);
@@ -1276,6 +1320,16 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const nlohmann:
     }
 
     idx.documents[assignId] = doc;
+    if (newExternal) {
+        if (previousExternal && *previousExternal != *newExternal) {
+            idx.externalToDocId.erase(*previousExternal);
+        }
+        idx.externalToDocId[*newExternal] = assignId;
+        idx.docIdToExternal[assignId] = *newExternal;
+    } else if (previousExternal) {
+        idx.externalToDocId.erase(*previousExternal);
+        idx.docIdToExternal.erase(assignId);
+    }
     idx.docLengths[assignId] = 0;
     indexStructured(idx, assignId, doc);
 
@@ -1308,6 +1362,11 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
     if (it == idx.documents.end()) return false;
     removeJson(idx, id, it->second);
     idx.documents.erase(it);
+    auto extIt = idx.docIdToExternal.find(id);
+    if (extIt != idx.docIdToExternal.end()) {
+        idx.externalToDocId.erase(extIt->second);
+        idx.docIdToExternal.erase(extIt);
+    }
     idx.docLengths.erase(id);
     idx.vectors.erase(id);
     for (auto& kv : idx.boolValues) kv.second.erase(id);
@@ -1602,26 +1661,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         IndexState state;
         state.annClusters = idxJson.value("ann_clusters", defaultAnnClusters_);
         state.schema.schema = idxJson.value("schema", json::object());
-        state.schema.fieldTypes.clear();
-        if (state.schema.schema.contains("fields") && state.schema.schema["fields"].is_object()) {
-            auto fields = state.schema.schema["fields"];
-            for (auto it = fields.begin(); it != fields.end(); ++it) {
-                if (it.value().is_string()) {
-                    auto t = it.value().get<std::string>();
-                    if (t == "text") state.schema.fieldTypes[it.key()] = FieldType::Text;
-                    else if (t == "array") state.schema.fieldTypes[it.key()] = FieldType::ArrayString;
-                    else if (t == "bool") state.schema.fieldTypes[it.key()] = FieldType::Bool;
-                    else if (t == "number") state.schema.fieldTypes[it.key()] = FieldType::Number;
-                } else if (it.value().is_object()) {
-                    auto type = it.value().value("type", "");
-                    if (type == "vector") {
-                        state.schema.vectorField = it.key();
-                        state.schema.vectorDim = it.value().value("dim", 0);
-                        state.schema.fieldTypes[it.key()] = FieldType::Vector;
-                    }
-                }
-            }
-        }
+        configureSchema(state);
 
         for (const auto& seg : segments) {
             std::string file;
@@ -1647,7 +1687,18 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             state.nextId = std::max(state.nextId, nextIdTmp);
             state.avgDocLen = avgTmp;
             state.schema.vectorDim = chunk.vectorDim;
-            for (const auto& kv : chunk.docs) state.documents[kv.first] = kv.second;
+            for (const auto& kv : chunk.docs) {
+                state.documents[kv.first] = kv.second;
+                if (state.schema.docId) {
+                    try {
+                        auto ext = extractCustomId(state, kv.second);
+                        if (ext) {
+                            state.externalToDocId[*ext] = kv.first;
+                            state.docIdToExternal[kv.first] = *ext;
+                        }
+                    } catch (...) {}
+                }
+            }
             for (const auto& kv : chunk.docLens) state.docLengths[kv.first] = kv.second;
             for (const auto& kv : chunk.index) {
                 auto& dest = state.invertedIndex[kv.first];
@@ -1754,6 +1805,103 @@ void BlackBox::loadWalOnly() {
         std::cerr << "BlackBox: built index " << name << " from WAL\n";
     }
     writeManifest();
+}
+
+void BlackBox::configureSchema(IndexState& state) {
+    state.schema.fieldTypes.clear();
+    state.schema.vectorField.clear();
+    state.schema.vectorDim = 0;
+    state.schema.docId.reset();
+    state.schema.relation.reset();
+    if (state.schema.schema.contains("fields") && state.schema.schema["fields"].is_object()) {
+        for (auto it = state.schema.schema["fields"].begin(); it != state.schema.schema["fields"].end(); ++it) {
+            if (it.value().is_string()) {
+                auto t = it.value().get<std::string>();
+                if (t == "text") state.schema.fieldTypes[it.key()] = FieldType::Text;
+                else if (t == "array") state.schema.fieldTypes[it.key()] = FieldType::ArrayString;
+                else if (t == "bool") state.schema.fieldTypes[it.key()] = FieldType::Bool;
+                else if (t == "number") state.schema.fieldTypes[it.key()] = FieldType::Number;
+            } else if (it.value().is_object()) {
+                auto type = it.value().value("type", "");
+                if (type == "vector") {
+                    state.schema.vectorField = it.key();
+                    state.schema.vectorDim = it.value().value("dim", 0);
+                    state.schema.fieldTypes[it.key()] = FieldType::Vector;
+                }
+            }
+        }
+    }
+    if (state.schema.schema.contains("doc_id") && state.schema.schema["doc_id"].is_object()) {
+        auto cfgJson = state.schema.schema["doc_id"];
+        IndexSchema::DocIdConfig cfg;
+        cfg.field = cfgJson.value("field", "");
+        auto typeStr = cfgJson.value("type", "string");
+        if (typeStr == "number") cfg.type = FieldType::Number;
+        else cfg.type = FieldType::Text;
+        cfg.enforceUnique = cfgJson.value("enforce_unique", true);
+        if (!cfg.field.empty()) state.schema.docId = cfg;
+    }
+    if (state.schema.schema.contains("relation") && state.schema.schema["relation"].is_object()) {
+        auto relJson = state.schema.schema["relation"];
+        IndexSchema::RelationConfig rel;
+        rel.field = relJson.value("field", "");
+        rel.targetIndex = relJson.value("target_index", "");
+        rel.allowCrossIndex = relJson.value("allow_cross_index", true);
+        if (!rel.field.empty()) state.schema.relation = rel;
+    }
+}
+
+std::optional<std::string> BlackBox::extractCustomId(const IndexState& idx, const nlohmann::json& doc) const {
+    if (!idx.schema.docId) return std::nullopt;
+    const auto& cfg = *idx.schema.docId;
+    if (!doc.contains(cfg.field)) {
+        throw std::runtime_error("missing custom id field");
+    }
+    const auto& node = doc[cfg.field];
+    std::string value;
+    if (cfg.type == FieldType::Number) {
+        if (!node.is_number_integer()) {
+            throw std::runtime_error("custom id field must be an integer");
+        }
+        value = std::to_string(node.get<int64_t>());
+    } else {
+        if (!node.is_string()) {
+            throw std::runtime_error("custom id field must be a string");
+        }
+        value = node.get<std::string>();
+    }
+    if (value.empty()) {
+        throw std::runtime_error("custom id value cannot be empty");
+    }
+    return value;
+}
+
+std::optional<std::string> BlackBox::canonicalizeCustomIdInput(const IndexState& idx, const std::string& raw) const {
+    if (!idx.schema.docId) return std::nullopt;
+    const auto& cfg = *idx.schema.docId;
+    if (cfg.type == FieldType::Number) {
+        try {
+            return std::to_string(static_cast<long long>(std::stoll(raw)));
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+    return raw;
+}
+
+std::optional<BlackBox::DocId> BlackBox::findDocIdUnlocked(const IndexState& idx, const std::string& providedId) const {
+    if (idx.schema.docId) {
+        auto key = canonicalizeCustomIdInput(idx, providedId);
+        if (!key) return std::nullopt;
+        auto it = idx.externalToDocId.find(*key);
+        if (it == idx.externalToDocId.end()) return std::nullopt;
+        return it->second;
+    }
+    try {
+        return static_cast<DocId>(std::stoul(providedId));
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 } // namespace minielastic

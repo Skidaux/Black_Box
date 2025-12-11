@@ -30,11 +30,15 @@ Base URL: `http://127.0.0.1:8080`
   - `POST /v1/snapshot/load` (optional `?path=...`) — load a manifest/snapshots.
 
 ## Documents
-- `POST /v1/{index}/doc` — index a document (Content-Type: application/json). Returns `id`.
-- `GET /v1/{index}/doc/{id}` — fetch a document.
-- `PUT /v1/{index}/doc/{id}` — replace a document.
+- `POST /v1/{index}/doc` — index a document (Content-Type: application/json). Returns `id` and, when configured, `doc_id` (custom identifier derived from schema).
+- `GET /v1/{index}/doc/{id}` — fetch a document by auto-increment ID or custom ID.
+- `PUT /v1/{index}/doc/{id}` — replace a document (accepts either ID form).
 - `PATCH /v1/{index}/doc/{id}` — partial update (merge fields).
 - `DELETE /v1/{index}/doc/{id}` — delete a document.
+
+Schema extensions:
+- `doc_id`: `{ "field": "sku", "type": "string", "enforce_unique": true }` — designates the field that becomes the public document ID.
+- `relation`: `{ "field": "parent", "target_index": "orders", "allow_cross_index": true }` — stores a relation reference (object `{ "id": "...", "index": "..." }` or shorthand string/number).
 
 ## Search
 - `GET /v1/{index}/search`
@@ -42,6 +46,9 @@ Base URL: `http://127.0.0.1:8080`
   - Fuzzy: `distance` (max edit distance).
   - Hybrid: `w_bm25`, `w_semantic`, `w_lexical` weights.
   - Vector: `mode=vector`, `vec=comma,separated,floats` (provide `q` placeholder if required by clients).
+  - Relations: `include_relations=inline|hierarchy|none` (default `none`) and `max_relation_depth` (default `1`).  
+    - `inline` embeds the linked document under each hit.  
+    - `hierarchy` groups hits beneath their shared relation reference and adds `relation_groups` to the response.
   - Filters:
     - `tag`, `label`, `flag` (bool) shortcuts.
     - Per-field doc-value filters: `filter_<field>=value` (array/string/bool/number), `filter_<field>_min`, `filter_<field>_max` for numeric ranges.
@@ -57,7 +64,17 @@ Response shape (example):
     "size": 10,
     "total": 2,
     "hits": [
-      { "id": 1, "score": 1.23, "doc": { "title": "...", "body": "...", "...": "..." } }
+      {
+        "id": 1,
+        "doc_id": "sku-1",
+        "score": 1.23,
+        "doc": { "title": "...", "body": "...", "...": "..." },
+        "relation": { "index": "demo", "id": "sku-parent", "doc": { ... } }
+      }
+    ],
+    "relation_mode": "inline",
+    "relation_groups": [
+      { "relation_ref": { "index": "demo", "id": "sku-parent" }, "children": [ ... ] }
     ]
   }
 }

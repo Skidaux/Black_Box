@@ -74,6 +74,18 @@ public:
         uint32_t vectorDim = 0; // optional vector dimension for vector field
         std::unordered_map<std::string, FieldType> fieldTypes;
         std::string vectorField;
+        struct DocIdConfig {
+            std::string field;
+            FieldType type = FieldType::Unknown;
+            bool enforceUnique = true;
+        };
+        struct RelationConfig {
+            std::string field;
+            std::string targetIndex;
+            bool allowCrossIndex = true;
+        };
+        std::optional<DocIdConfig> docId;
+        std::optional<RelationConfig> relation;
     };
 
     explicit BlackBox(const std::string& dataDir = "");
@@ -103,6 +115,8 @@ public:
 
     // Retrieve a single document.
     nlohmann::json getDocument(const std::string& index, DocId id) const;
+    std::optional<DocId> lookupDocId(const std::string& index, const std::string& providedId) const;
+    std::optional<std::string> externalIdForDoc(const std::string& index, DocId id) const;
 
     // Delete a document; returns true if removed.
     bool deleteDocument(const std::string& index, DocId id);
@@ -150,6 +164,8 @@ private:
         std::unordered_map<std::string, std::unordered_map<DocId, double>> numericValues;
         std::unordered_map<std::string, std::unordered_map<DocId, bool>> boolValues;
         std::unordered_map<std::string, std::unordered_map<std::string, std::vector<DocId>>> stringLists; // for array<string> fields
+        std::unordered_map<std::string, DocId> externalToDocId;
+        std::unordered_map<DocId, std::string> docIdToExternal;
         std::unordered_map<std::string, std::vector<algo::SkipEntry>> skipPointers; // block-level skips
         // ANN coarse quantizer (lightweight IVF-like)
         bool annDirty = true;
@@ -200,6 +216,10 @@ private:
     void writeManifest() const;
     void replayWal(IndexState& idx);
     void loadWalOnly();
+    void configureSchema(IndexState& state);
+    std::optional<std::string> extractCustomId(const IndexState& idx, const nlohmann::json& doc) const;
+    std::optional<std::string> canonicalizeCustomIdInput(const IndexState& idx, const std::string& raw) const;
+    std::optional<DocId> findDocIdUnlocked(const IndexState& idx, const std::string& providedId) const;
 };
 
 } // namespace minielastic

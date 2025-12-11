@@ -28,6 +28,10 @@
 - Tokenizer: lowercase alnum tokens; configurable stopwords/stemming later.
 - Index strings recursively across objects/arrays; optional field-name indexing for scoped queries later.
 - Postings: term → sorted doc IDs; AND queries use intersections; later add OR/phrase and simple ranking.
+- Schemas can now declare `doc_id` (e.g. `{"field":"sku","type":"string"}`) to make a field the authoritative document identifier.  
+  - IDs remain unique within the index and can be fetched/updated/deleted using either auto-increment IDs or the custom IDs.
+- Optional `relation` config (e.g. `{"field":"parent","target_index":"orders"}`) allows documents to reference other docs in the same or external indexes.  
+  - Search requests may ask for inline relation embedding (`include_relations=inline`) or grouped hierarchical responses (`include_relations=hierarchy`) with an adjustable `max_relation_depth`.
 
 ## Near-Term Implementation Steps
 - Keep current in-memory index but wrap API with `/v1` and envelopes.

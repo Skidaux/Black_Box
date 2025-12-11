@@ -25,49 +25,123 @@ async function timeStep(label, fn) {
   return { label, ms: end - start, result: res };
 }
 
+async function ensureIndex(name, schema) {
+  const res = await axios.post("/v1/indexes", { name, schema });
+  if (res.status !== 201 && res.status !== 400) {
+    throw new Error(`Failed to create index ${name}: ${res.status}`);
+  }
+  return res;
+}
+
+async function indexDoc(index, doc) {
+  return axios.post(`/v1/${index}/doc`, doc, {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+async function fetchDoc(index, id) {
+  return axios.get(`/v1/${index}/doc/${id}`);
+}
+
+async function patchDoc(index, id, body) {
+  return axios.patch(`/v1/${index}/doc/${id}`, body, {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+async function deleteDoc(index, id) {
+  return axios.delete(`/v1/${index}/doc/${id}`);
+}
+
+async function runSearch(index, params) {
+  const qs = new URLSearchParams(params).toString();
+  return axios.get(`/v1/${index}/search?${qs}`);
+}
+
 async function main() {
-  const indexName = "demo";
+  const primaryIndex = "demo";
+  const relatedIndex = "related_demo";
   const benchmark = {
     timestamp: new Date().toISOString(),
     baseURL: axios.defaults.baseURL,
-    index: indexName,
-    docsIndexed: 0,
+    indexes: [primaryIndex, relatedIndex],
+    docsIndexed: {},
     timings: [],
     queries: [],
     notes:
-      "Measures create/index/update/search latencies. Vector search uses ANN+fallback.",
+      "Exercises multi-index usage, custom IDs, relations, and relation-aware queries.",
   };
+  benchmark.docsIndexed[primaryIndex] = 0;
+  benchmark.docsIndexed[relatedIndex] = 0;
 
   try {
-    // 1) Create index with schema (text, arrays, bool, number, vector)
-    const createStep = await timeStep("create_index", async () =>
-      axios.post("/v1/indexes", {
-        name: indexName,
-        schema: {
-          fields: {
-            title: "text",
-            body: "text",
-            tags: "array",
-            labels: "array",
-            flag: "bool",
-            priority: "number",
-            vec: { type: "vector", dim: 3 },
-          },
-        },
-      })
+    // 1) Create indexes
+    const primarySchema = {
+      fields: {
+        title: "text",
+        body: "text",
+        tags: "array",
+        labels: "array",
+        flag: "bool",
+        priority: "number",
+        vec: { type: "vector", dim: 3 },
+      },
+      relation: {
+        field: "parent",
+        target_index: relatedIndex,
+      },
+    };
+    const relatedSchema = {
+      fields: {
+        title: "text",
+        body: "text",
+        sku: "text",
+      },
+      doc_id: {
+        field: "sku",
+        type: "string",
+      },
+    };
+    const createPrimary = await timeStep("create_primary", () =>
+      ensureIndex(primaryIndex, primarySchema)
     );
     benchmark.timings.push({
-      step: createStep.label,
-      ms: createStep.ms,
-      status: createStep.result.status,
+      step: createPrimary.label,
+      ms: createPrimary.ms,
+      status: createPrimary.result.status,
     });
     console.log(
-      "create index:",
-      createStep.result.status,
-      createStep.result.data
+      "create primary index:",
+      createPrimary.result.status,
+      createPrimary.result.data
+    );
+    const createRelated = await timeStep("create_related", () =>
+      ensureIndex(relatedIndex, relatedSchema)
+    );
+    benchmark.timings.push({
+      step: createRelated.label,
+      ms: createRelated.ms,
+      status: createRelated.result.status,
+    });
+    console.log(
+      "create related index:",
+      createRelated.result.status,
+      createRelated.result.data
     );
 
-    // 2) Index sample documents
+    // 2) Seed related documents with custom IDs
+    const parents = [
+      { sku: "sku-1", title: "Parent A", body: "root node" },
+      { sku: "sku-2", title: "Parent B", body: "root node B" },
+    ];
+    for (const doc of parents) {
+      const res = await indexDoc(relatedIndex, doc);
+      if (res.status !== 201) throw new Error("Failed to index parent");
+      benchmark.docsIndexed[relatedIndex] += 1;
+      console.log("index parent:", res.data);
+    }
+
+    // 3) Index documents in primary index referencing parents
     const docs = [
       {
         title: "Doc1",
@@ -77,6 +151,7 @@ async function main() {
         flag: true,
         priority: 5,
         vec: [1, 0, 0],
+        parent: { id: "sku-1", index: relatedIndex },
       },
       {
         title: "Doc2",
@@ -86,6 +161,7 @@ async function main() {
         flag: false,
         priority: 3,
         vec: [0.9, 0.1, 0],
+        parent: { id: "sku-1", index: relatedIndex },
       },
       {
         title: "Doc3",
@@ -95,21 +171,22 @@ async function main() {
         flag: true,
         priority: 1,
         vec: [0, 1, 0],
+        parent: { id: "sku-2", index: relatedIndex },
       },
     ];
-
     const docTimings = [];
     for (const doc of docs) {
       const step = await timeStep(`index_${doc.title}`, async () =>
-        axios.post(`/v1/${indexName}/doc`, doc, {
-          headers: { "Content-Type": "application/json" },
-        })
+        indexDoc(primaryIndex, doc)
       );
       docTimings.push({
         doc: doc.title,
         ms: step.ms,
         status: step.result.status,
       });
+      if (step.result.status === 201) {
+        benchmark.docsIndexed[primaryIndex] += 1;
+      }
       console.log("index doc:", step.result.status, step.result.data);
     }
     benchmark.timings.push({
@@ -118,25 +195,20 @@ async function main() {
       status: "aggregate",
       perDoc: docTimings,
     });
-    benchmark.docsIndexed = docs.length;
 
-    // 3) Partial update
-    const patchStep = await timeStep("patch_doc2", async () =>
-      axios.patch(
-        `/v1/${indexName}/doc/2`,
-        { flag: true, priority: 4 },
-        { headers: { "Content-Type": "application/json" } }
-      )
+    // 4) Partial update using string ID on related index
+    const patchStep = await timeStep("patch_parent", async () =>
+      patchDoc(relatedIndex, "sku-2", { body: "updated root" })
     );
     benchmark.timings.push({
       step: patchStep.label,
       ms: patchStep.ms,
       status: patchStep.result.status,
     });
-    console.log("patch doc2:", patchStep.result.status, patchStep.result.data);
+    console.log("patch parent:", patchStep.result.status, patchStep.result.data);
 
-    // 4) Bulk ingest to simulate scale (defaults to 500 docs, adjustable via env BULK_COUNT)
-    const bulkCount = parseInt(process.env.BULK_COUNT || "500", 10);
+    // 5) Bulk ingest extra docs in secondary index to test multi-index load
+    const bulkCount = parseInt(process.env.BULK_COUNT || "200", 10);
     const vocab = [
       "fast",
       "slow",
@@ -161,106 +233,157 @@ async function main() {
       "data",
     ];
     const bulkDocs = Array.from({ length: bulkCount }).map((_, i) => {
-      const body = randomText(vocab, 12 + Math.floor(Math.random() * 10));
-      const title = `BulkDoc${i + 1}`;
+      const body = randomText(vocab, 8 + Math.floor(Math.random() * 10));
+      const title = `RelatedBulk${i + 1}`;
       return {
+        sku: `bulk-${i + 1}`,
         title,
         body,
-        tags: [
-          randChoice(["animal", "tech", "nature", "news"]),
-          randChoice(["fast", "slow", "fresh"]),
-        ],
-        labels: [randChoice(["short", "medium", "long"])],
-        flag: Math.random() > 0.5,
-        priority: Math.floor(Math.random() * 10),
-        vec: [Math.random(), Math.random(), Math.random()],
       };
     });
     const bulkStart = hrMs();
-    const concurrency = 20;
-    let idx = 0;
-    const bulkResults = [];
-    async function worker() {
-      while (idx < bulkDocs.length) {
-        const doc = bulkDocs[idx++];
-        const resp = await axios.post(`/v1/${indexName}/doc`, doc, {
-          headers: { "Content-Type": "application/json" },
-        });
-        bulkResults.push(resp.status);
+    for (const doc of bulkDocs) {
+      const res = await indexDoc(relatedIndex, doc);
+      if (res.status === 201) {
+        benchmark.docsIndexed[relatedIndex] += 1;
       }
     }
-    await Promise.all(Array.from({ length: concurrency }, worker));
     const bulkMs = hrMs() - bulkStart;
-    const avgBulkMs = bulkMs / bulkCount;
     benchmark.timings.push({
-      step: "bulk_index",
+      step: "bulk_related",
       ms: bulkMs,
       status: "aggregate",
       docs: bulkCount,
-      avgMsPerDoc: avgBulkMs,
-      success: bulkResults.filter((s) => s === 201).length,
     });
-    benchmark.docsIndexed += bulkCount;
     console.log(
-      `bulk index: ${bulkCount} docs in ${bulkMs.toFixed(
-        2
-      )} ms (~${avgBulkMs.toFixed(3)} ms/doc)`
+      `bulk index (related): ${bulkCount} docs in ${bulkMs.toFixed(2)} ms`
     );
 
-    // 4) Searches (bm25, lexical, fuzzy, semantic, hybrid, filtered, vector)
+    // 6) Searches (baseline + relation embeddings)
     const queries = [
       { name: "bm25", params: { q: "quick fox", mode: "bm25" } },
-      { name: "lexical", params: { q: "quick fox", mode: "lexical" } },
-      { name: "fuzzy", params: { q: "quik fox", mode: "fuzzy", distance: 2 } },
-      { name: "semantic", params: { q: "quick brown fox", mode: "semantic" } },
       {
-        name: "hybrid",
+        name: "bm25_paged",
+        params: { q: "quick brown fox", mode: "bm25", from: 1, size: 2 },
+      },
+      {
+        name: "bm25_filters",
+        params: {
+          q: "fox",
+          mode: "bm25",
+          tag: "animal",
+          label: "short",
+          flag: "true",
+          filter_priority_min: 1,
+          filter_priority_max: 6,
+        },
+      },
+      {
+        name: "lexical_array_filter",
+        params: {
+          q: "quiet",
+          mode: "lexical",
+          filter_labels: "short",
+        },
+      },
+      {
+        name: "fuzzy",
+        params: { q: "quik fox", mode: "fuzzy", distance: 2 },
+      },
+      {
+        name: "hybrid_weighted",
         params: {
           q: "quick fox",
           mode: "hybrid",
-          w_bm25: 1,
-          w_semantic: 1,
-          w_lexical: 0.5,
+          w_bm25: 0.7,
+          w_semantic: 1.5,
+          w_lexical: 0.3,
         },
       },
-      { name: "bm25_tag", params: { q: "fox", mode: "bm25", tag: "animal" } },
+      { name: "semantic", params: { q: "quick brown fox", mode: "semantic" } },
       {
-        name: "bm25_label_flag",
-        params: { q: "fox", mode: "bm25", label: "short", flag: "true" },
+        name: "bm25_relation_inline",
+        params: { q: "fox", mode: "bm25", include_relations: "inline" },
       },
       {
-        name: "bm25_priority_range",
-        params: { q: "fox", mode: "bm25", filter_priority_min: 3 },
+        name: "bm25_relation_hierarchy",
+        params: {
+          q: "fox",
+          mode: "bm25",
+          include_relations: "hierarchy",
+          max_relation_depth: 2,
+        },
       },
-      // vector search: include q placeholder to satisfy server validation
-      { name: "vector", params: { q: "vector", mode: "vector", vec: "1,0,0" } },
-      // stress query over bulk vocab
-      { name: "bm25_bulk", params: { q: "fast data", mode: "bm25", size: 5 } },
+      {
+        name: "bm25_relation_cross_index",
+        params: {
+          q: "root",
+          mode: "bm25",
+          include_relations: "inline",
+        },
+      },
+      {
+        name: "bm25_related_index",
+        index: relatedIndex,
+        params: { q: "root", mode: "bm25", size: 5 },
+      },
+      {
+        name: "related_custom_id_eq",
+        index: relatedIndex,
+        params: { q: "Parent", mode: "bm25", filter_sku: "sku-1" },
+      },
+      {
+        name: "vector",
+        params: { q: "vector", mode: "vector", vec: "1,0,0" },
+      },
     ];
 
     for (const q of queries) {
-      const qs = new URLSearchParams(q.params).toString();
+      const idx = q.index || primaryIndex;
       const step = await timeStep(`search_${q.name}`, async () =>
-        axios.get(`/v1/${indexName}/search?${qs}`)
+        runSearch(idx, q.params)
       );
-      const data = step.result.data || {};
-      const hits = data.data && data.data.hits ? data.data.hits.length : 0;
+      const payload = step.result.data || {};
+      const hits =
+        payload.data && payload.data.hits ? payload.data.hits.length : 0;
       benchmark.queries.push({
+        targetIndex: idx,
         name: q.name,
         params: q.params,
         ms: step.ms,
         status: step.result.status,
         hits,
-        total: data.data ? data.data.total : undefined,
+        total: payload.data ? payload.data.total : undefined,
       });
       console.log(
-        `search (${q.name}):`,
+        `search (${q.name}@${idx}):`,
         step.result.status,
-        JSON.stringify(data, null, 2)
+        JSON.stringify(payload, null, 2)
       );
     }
 
-    // 5) Persist benchmark JSON
+    // 7) Fetch + delete using custom IDs
+    const fetchParent = await timeStep("fetch_parent_sku", async () =>
+      fetchDoc(relatedIndex, "sku-1")
+    );
+    benchmark.timings.push({
+      step: fetchParent.label,
+      ms: fetchParent.ms,
+      status: fetchParent.result.status,
+    });
+    console.log("fetch parent:", fetchParent.result.status, fetchParent.result.data);
+
+    const deleteParent = await timeStep("delete_parent_sku", async () =>
+      deleteDoc(relatedIndex, "sku-2")
+    );
+    benchmark.timings.push({
+      step: deleteParent.label,
+      ms: deleteParent.ms,
+      status: deleteParent.result.status,
+    });
+    console.log("delete parent:", deleteParent.result.status, deleteParent.result.data);
+
+    // 8) Persist benchmark JSON
     const outPath = path.join(__dirname, "benchmark_results.json");
     fs.writeFileSync(outPath, JSON.stringify(benchmark, null, 2), "utf8");
     console.log(`Benchmark results written to ${outPath}`);
