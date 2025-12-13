@@ -14,6 +14,8 @@
 
 Checkout `docs/documentation.md` for the API usage docs/examples
 
+---
+
 ## Building from Source
 
 BlackBox uses CMake and C++17. The `CMakeLists.txt` creates the main `BlackBox` binary including `BlackBoxTests`.
