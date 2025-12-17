@@ -17,8 +17,17 @@ BlackBoxHttpServer::BlackBoxHttpServer(std::string host, int port, std::string d
 }
 
 void BlackBoxHttpServer::run() {
+    // Configure thread pool size for request handling (default 4 or env override)
+    int threads = 4;
+    if (const char* env = std::getenv("BLACKBOX_SERVER_THREADS")) {
+        try { threads = std::max(1, std::stoi(env)); } catch (...) {}
+    }
+    server_.new_task_queue = [threads]() {
+        return new httplib::ThreadPool(static_cast<size_t>(threads));
+    };
+
     std::cout << "BlackBox HTTP server listening on "
-              << host_ << ":" << port_ << std::endl;
+              << host_ << ":" << port_ << " with " << threads << " threads" << std::endl;
     server_.listen(host_.c_str(), port_);
 }
 

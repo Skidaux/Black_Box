@@ -194,13 +194,13 @@ private:
     };
 
     std::string dataDir_;
-    mutable std::recursive_mutex mutex_;
+    mutable std::recursive_mutex mutex_; // protects indexes_ map and custom APIs
     size_t flushEveryDocs_ = 5000;
     size_t mergeSegmentsAt_ = 10;
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
-    std::unordered_map<std::string, IndexState> indexes_;
+    mutable std::unordered_map<std::string, IndexState> indexes_;
     std::unordered_map<std::string, nlohmann::json> customApis_;
     std::string customApiPath_;
 

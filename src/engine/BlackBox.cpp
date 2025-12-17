@@ -848,6 +848,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     indexes_[name] = IndexState{};
     indexes_[name].schema = schema;
     indexes_[name].annClusters = defaultAnnClusters_;
+    indexes_[name].annClusters = defaultAnnClusters_;
     configureSchema(indexes_[name]);
     // init WAL
     if (!dataDir_.empty()) {
@@ -1064,7 +1065,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
     std::lock_guard<std::recursive_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
-    IndexState& idx = const_cast<IndexState&>(it->second);
+    IndexState& idx = it->second;
     if (idx.schema.vectorDim == 0 || queryVec.size() != idx.schema.vectorDim) return {};
     if (idx.annDirty) rebuildAnn(idx);
 
