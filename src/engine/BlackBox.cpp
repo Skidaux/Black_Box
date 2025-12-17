@@ -48,6 +48,8 @@ struct SnapshotChunk {
     std::unordered_map<uint32_t, std::vector<float>> vectors;
     uint32_t vectorDim = 0;
     json docValues; // numeric, bool, string lists
+    std::vector<std::vector<float>> annCentroids;
+    std::vector<std::vector<uint32_t>> annBuckets;
     struct SnapshotImage {
         std::string format;
         std::string data;
@@ -289,6 +291,12 @@ static bool writeSnapshotFile(const std::string& path,
     // Section 9: doc-values (JSON)
     Section dvSec = makeSection(9, chunk.docValues.dump(), compressSections);
 
+    // Section 11: ANN (centroids + bucket docIds) stored as JSON
+    Section annSec = makeSection(11, json{
+        {"centroids", chunk.annCentroids},
+        {"buckets", chunk.annBuckets}
+    }.dump(), compressSections);
+
     std::string imagePayload;
     if (!chunk.images.empty()) {
         std::vector<std::string> fields;
@@ -324,6 +332,7 @@ static bool writeSnapshotFile(const std::string& path,
     sections.push_back(std::move(postingsSec));
     sections.push_back(std::move(vecSec));
     sections.push_back(std::move(dvSec));
+    sections.push_back(std::move(annSec));
     if (!imageSec.payload.empty()) sections.push_back(std::move(imageSec));
 
     constexpr uint16_t kVersion = 1;
@@ -528,6 +537,7 @@ static bool readSnapshotFile(const std::string& path,
     const auto postingsSec = getSection(7);
     const auto vecSec = getSection(8);
     const auto dvSec = getSection(9);
+    const auto annSec = getSection(11);
     const auto imageSec = getSection(10);
 
     std::string termDictDecoded;
@@ -625,6 +635,29 @@ static bool readSnapshotFile(const std::string& path,
             auto dv = json::parse(dvView, nullptr, false);
             if (!dv.is_discarded()) {
                 outChunk.docValues = dv;
+            }
+        }
+    }
+
+    // ANN
+    if (annSec && validateCrc(11, annSec->first)) {
+        std::string annDecoded;
+        std::string_view annView;
+        if (annSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+            annDecoded.assign(annSec->first.begin(), annSec->first.end());
+        } else {
+            if (!maybeDecompress(annSec->first, annSec->second, annDecoded)) return false;
+        }
+        annView = std::string_view(annDecoded);
+        if (!annView.empty()) {
+            auto annj = json::parse(annView, nullptr, false);
+            if (!annj.is_discarded()) {
+                if (annj.contains("centroids") && annj["centroids"].is_array()) {
+                    outChunk.annCentroids = annj["centroids"].get<std::vector<std::vector<float>>>();
+                }
+                if (annj.contains("buckets") && annj["buckets"].is_array()) {
+                    outChunk.annBuckets = annj["buckets"].get<std::vector<std::vector<uint32_t>>>();
+                }
             }
         }
     }
@@ -1640,6 +1673,8 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         {"bool", idx.boolValues},
         {"strings", idx.stringLists}
     };
+    chunk.annCentroids = idx.annCentroids;
+    chunk.annBuckets = idx.annBuckets;
     for (const auto& field : idx.imageValues) {
         for (const auto& entry : field.second) {
             chunk.images[field.first][entry.first] = SnapshotChunk::SnapshotImage{entry.second.format, entry.second.data};
@@ -1688,6 +1723,8 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         {"bool", idx.boolValues},
         {"strings", idx.stringLists}
     };
+    chunk.annCentroids = idx.annCentroids;
+    chunk.annBuckets = idx.annBuckets;
     for (const auto& field : idx.imageValues) {
         for (const auto& entry : field.second) {
             chunk.images[field.first][entry.first] = SnapshotChunk::SnapshotImage{entry.second.format, entry.second.data};
@@ -1824,6 +1861,8 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
                 {"bool", tmp.boolValues},
                 {"strings", tmp.stringLists}
             };
+            chunk.annCentroids = tmp.annCentroids;
+            chunk.annBuckets = tmp.annBuckets;
             for (const auto& field : idx.imageValues) {
                 for (const auto& imgEntry : field.second) {
                     if (tmp.documents.find(imgEntry.first) == tmp.documents.end()) continue;
@@ -1889,11 +1928,12 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         std::string name = idxJson.value("name", "");
         if (name.empty()) continue;
         json segments = idxJson.value("segments", json::array());
-        if (!segments.is_array() || segments.empty()) {
-            // backward compatibility: single file entry
+        if (!segments.is_array()) return false;
+        if (segments.empty()) {
             std::string file = idxJson.value("file", "");
-            if (file.empty()) continue;
-            segments = json::array({json{{"file", file}}});
+            if (!file.empty()) {
+                segments = json::array({json{{"file", file}}});
+            }
         }
 
         IndexState state;
@@ -1945,6 +1985,8 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             for (const auto& kv : chunk.vectors) {
                 state.vectors[kv.first] = kv.second;
             }
+            if (!chunk.annCentroids.empty()) state.annCentroids = chunk.annCentroids;
+            if (!chunk.annBuckets.empty()) state.annBuckets = chunk.annBuckets;
             if (chunk.docValues.contains("numeric")) {
                 auto num = chunk.docValues["numeric"];
                 if (num.is_object()) {
@@ -2016,7 +2058,11 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             vec.erase(std::unique(vec.begin(), vec.end(), [](const algo::Posting& a, const algo::Posting& b){return a.id==b.id;}), vec.end());
         }
         rebuildSkipPointers(state);
-        state.annDirty = !state.vectors.empty();
+        if (!state.annCentroids.empty()) {
+            state.annDirty = false;
+        } else {
+            state.annDirty = !state.vectors.empty();
+        }
 
         refreshAverages(state);
         // init WAL

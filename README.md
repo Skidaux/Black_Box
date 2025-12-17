@@ -38,3 +38,9 @@ BlackBox uses CMake and C++17. The `CMakeLists.txt` creates the main `BlackBox` 
    - MinGW: `cmake --build build`.
 
 The compiled executables are in `build/` (`build/Release/` when using Visual Studio multi-config generators). Point the runtime at your data/configuration, then start the Database by executing the `BlackBox` binary.
+
+---
+
+## Licence
+
+GPL-3.0-or-later. See LICENSE (or COPYING).
