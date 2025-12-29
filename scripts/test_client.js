@@ -1,7 +1,7 @@
 // Interactive CLI test runner for BlackBox HTTP API.
 // Run: node scripts/test_client.js
 // Presents a menu for: benchmark, durability, stress.
-
+const os = require('os');
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
@@ -19,10 +19,17 @@ const randomText = (words, len) => {
   for (let i = 0; i < len; ++i) out.push(randChoice(words));
   return out.join(" ");
 };
+let pathing = []
+const platfromOs = process.platform
+if (platfromOs == "win32") {
+  pathing = ["Release", "BlackBox.exe"]
+} else if (platfromOs == "linux") {
+  pathing = ["", "BlackBox"]
+}
 
 const serverCmd =
-  process.env.BLACKBOX_SERVER ||
-  path.join("build", "Release", "BlackBox.exe");
+  // process.env.BLACKBOX_SERVER ||
+  path.join("build", pathing[0], pathing[1]);
 const serverCwd = path.resolve(__dirname, "..");
 
 async function timeStep(label, fn) {

@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <nlohmann/json.hpp>
 #include "minielastic/Analyzer.hpp"
@@ -194,7 +195,7 @@ private:
     };
 
     std::string dataDir_;
-    mutable std::recursive_mutex mutex_; // protects indexes_ map and custom APIs
+    mutable std::shared_mutex mutex_; // protects indexes_ map and custom APIs
     size_t flushEveryDocs_ = 5000;
     size_t mergeSegmentsAt_ = 10;
     bool compressSnapshots_ = true;

@@ -842,7 +842,7 @@ BlackBox::~BlackBox() {
 }
 
 bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     if (name.empty()) return false;
     if (indexes_.count(name)) return false;
     indexes_[name] = IndexState{};
@@ -861,40 +861,40 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
 }
 
 bool BlackBox::indexExists(const std::string& name) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     return indexes_.count(name) > 0;
 }
 
 const BlackBox::IndexSchema* BlackBox::getSchema(const std::string& name) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.schema;
 }
 
 const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, double>>* BlackBox::getNumericValues(const std::string& name) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.numericValues;
 }
 
 const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, bool>>* BlackBox::getBoolValues(const std::string& name) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.boolValues;
 }
 
 const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<BlackBox::DocId>>>* BlackBox::getStringLists(const std::string& name) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.stringLists;
 }
 
 BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::string& jsonStr) {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
     IndexState& idx = it->second;
@@ -916,13 +916,15 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
     DocId id = applyUpsert(idx, 0, processed, true);
     refreshAverages(idx);
     writeManifest();
-    if (autoSnapshot_) saveSnapshot();
+    bool doSnapshot = autoSnapshot_;
     flushIfNeeded(index, idx);
+    lk.unlock();
+    if (doSnapshot) saveSnapshot();
     return id;
 }
 
 nlohmann::json BlackBox::getDocument(const std::string& index, DocId id) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
     const auto& docs = it->second.documents;
@@ -932,14 +934,14 @@ nlohmann::json BlackBox::getDocument(const std::string& index, DocId id) const {
 }
 
 std::optional<BlackBox::DocId> BlackBox::lookupDocId(const std::string& index, const std::string& providedId) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return std::nullopt;
     return findDocIdUnlocked(it->second, providedId);
 }
 
 std::optional<std::string> BlackBox::externalIdForDoc(const std::string& index, DocId id) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return std::nullopt;
     auto mapIt = it->second.docIdToExternal.find(id);
@@ -948,7 +950,7 @@ std::optional<std::string> BlackBox::externalIdForDoc(const std::string& index, 
 }
 
 std::optional<std::string> BlackBox::getImageBase64(const std::string& index, DocId id, const std::string& field) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return std::nullopt;
     auto fieldIt = it->second.imageValues.find(field);
@@ -959,7 +961,7 @@ std::optional<std::string> BlackBox::getImageBase64(const std::string& index, Do
 }
 
 bool BlackBox::deleteDocument(const std::string& index, DocId id) {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return false;
     IndexState& idx = it->second;
@@ -967,14 +969,16 @@ bool BlackBox::deleteDocument(const std::string& index, DocId id) {
     if (ok) {
         refreshAverages(idx);
         writeManifest();
-        if (autoSnapshot_) saveSnapshot();
+        bool doSnapshot = autoSnapshot_;
         flushIfNeeded(index, idx);
+        lk.unlock();
+        if (doSnapshot) saveSnapshot();
     }
     return ok;
 }
 
 bool BlackBox::updateDocument(const std::string& index, DocId id, const std::string& jsonStr, bool partial) {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return false;
     IndexState& idx = it->second;
@@ -999,19 +1003,21 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
     applyUpsert(idx, id, processed, true);
     refreshAverages(idx);
     writeManifest();
-    if (autoSnapshot_) saveSnapshot();
+    bool doSnapshot = autoSnapshot_;
     flushIfNeeded(index, idx);
+    lk.unlock();
+    if (doSnapshot) saveSnapshot();
     return true;
 }
 std::size_t BlackBox::documentCount(const std::string& index) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return 0;
     return it->second.documents.size();
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, const std::string& query, const std::string& mode, size_t maxResults, int maxEditDistance) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     const IndexState& idx = it->second;
@@ -1031,7 +1037,7 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index, const std::string& query, double wBm25, double wSemantic, double wLexical, size_t maxResults) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     const IndexState& idx = it->second;
@@ -1062,7 +1068,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     IndexState& idx = it->second;
@@ -1141,7 +1147,7 @@ std::vector<std::string> BlackBox::tokenize(const std::string& text) const {
 }
 
 std::vector<BlackBox::IndexStats> BlackBox::stats() const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     std::vector<IndexStats> out;
     out.reserve(indexes_.size());
     for (const auto& kv : indexes_) {
@@ -1161,7 +1167,7 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
 }
 
 nlohmann::json BlackBox::config() const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     json j{
         {"data_dir", dataDir_},
         {"flush_every_docs", flushEveryDocs_},
@@ -1803,7 +1809,7 @@ void BlackBox::replayWal(IndexState& idx) {
 }
 
 bool BlackBox::saveSnapshot(const std::string& path) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     namespace fs = std::filesystem;
     fs::path manifestPath = path.empty() ? fs::path(dataDir_) / "index.manifest" : fs::path(path);
     fs::create_directories(manifestPath.parent_path());
@@ -1902,7 +1908,7 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
 }
 
 bool BlackBox::loadSnapshot(const std::string& path) {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     namespace fs = std::filesystem;
     fs::path manifestPath = path.empty() ? fs::path(dataDir_) / "index.manifest" : fs::path(path);
     if (!fs::exists(manifestPath)) {
@@ -2197,7 +2203,7 @@ std::optional<BlackBox::DocId> BlackBox::findDocIdUnlocked(const IndexState& idx
 }
 
 bool BlackBox::createOrUpdateCustomApi(const std::string& name, const json& spec) {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     if (name.empty()) return false;
     if (!validateCustomApi(name, spec)) return false;
     customApis_[name] = spec;
@@ -2206,21 +2212,21 @@ bool BlackBox::createOrUpdateCustomApi(const std::string& name, const json& spec
 }
 
 bool BlackBox::removeCustomApi(const std::string& name) {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::unique_lock<std::shared_mutex> lk(mutex_);
     if (!customApis_.erase(name)) return false;
     saveCustomApis();
     return true;
 }
 
 std::optional<json> BlackBox::getCustomApi(const std::string& name) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = customApis_.find(name);
     if (it == customApis_.end()) return std::nullopt;
     return it->second;
 }
 
 json BlackBox::listCustomApis() const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     json arr = json::array();
     for (const auto& kv : customApis_) {
         json entry = {{"name", kv.first}};
@@ -2231,10 +2237,12 @@ json BlackBox::listCustomApis() const {
 }
 
 json BlackBox::runCustomApi(const std::string& name, const json& params) const {
-    std::lock_guard<std::recursive_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = customApis_.find(name);
     if (it == customApis_.end()) throw std::runtime_error("custom api not found");
-    return executeCustomApiInternal(name, it->second, params);
+    auto spec = it->second;
+    lk.unlock();
+    return executeCustomApiInternal(name, spec, params);
 }
 
 void BlackBox::loadCustomApis() {

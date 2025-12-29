@@ -5,9 +5,12 @@
 #include <iostream>
 #include <sstream>
 #include <functional>
+#include <thread>
 #include <unordered_set>
 #include <unordered_map>
 #include <optional>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 using json = nlohmann::json;
 
@@ -17,14 +20,21 @@ BlackBoxHttpServer::BlackBoxHttpServer(std::string host, int port, std::string d
 }
 
 void BlackBoxHttpServer::run() {
-    // Configure thread pool size for request handling (default 4 or env override)
-    int threads = 4;
+    // Configure thread pool size for request handling (default: hardware_concurrency or env override)
+    int threads = static_cast<int>(std::max(4u, std::thread::hardware_concurrency()));
     if (const char* env = std::getenv("BLACKBOX_SERVER_THREADS")) {
         try { threads = std::max(1, std::stoi(env)); } catch (...) {}
     }
     server_.new_task_queue = [threads]() {
         return new httplib::ThreadPool(static_cast<size_t>(threads));
     };
+
+    // Avoid Nagle delays on Linux; helps p99 latency on small requests
+    server_.set_socket_options([](socket_t sock) {
+        int flag = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&flag), sizeof(flag));
+        return true;
+    });
 
     std::cout << "BlackBox HTTP server listening on "
               << host_ << ":" << port_ << " with " << threads << " threads" << std::endl;
