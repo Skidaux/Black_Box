@@ -9,8 +9,13 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <optional>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#endif
 
 using json = nlohmann::json;
 
