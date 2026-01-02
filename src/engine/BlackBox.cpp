@@ -732,13 +732,22 @@ bool WalWriter::append(const WalRecord& rec) {
         std::cerr << "WalWriter: stream not good for " << path << "\n";
         return false;
     }
+    // record layout: op | docId | len | payload | crc32(op..payload)
     stream.write(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
     walWriteLE(stream, rec.docId);
     uint32_t len = static_cast<uint32_t>(rec.payload.size());
     walWriteLE(stream, len);
     if (!rec.payload.empty()) stream.write(rec.payload.data(), static_cast<std::streamsize>(rec.payload.size()));
+    std::string buf;
+    buf.reserve(sizeof(rec.op) + sizeof(rec.docId) + sizeof(len) + rec.payload.size());
+    buf.append(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+    buf.append(reinterpret_cast<const char*>(&rec.docId), sizeof(rec.docId));
+    buf.append(reinterpret_cast<const char*>(&len), sizeof(len));
+    if (!rec.payload.empty()) buf.append(rec.payload.data(), rec.payload.size());
+    uint32_t crc = crc32(buf);
+    walWriteLE(stream, crc);
     stream.flush();
-    offset += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len;
+    offset += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len + sizeof(uint32_t);
     if (!stream) {
         std::cerr << "WalWriter: stream write failed for " << path << "\n";
     }
@@ -763,10 +772,13 @@ void WalWriter::reset() {
     }
 }
 
-std::vector<WalRecord> readWalRecords(const std::string& path) {
+std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOffset) {
     std::vector<WalRecord> out;
     std::ifstream in(path, std::ios::binary);
     if (!in) return out;
+    if (startOffset > 0) {
+        in.seekg(static_cast<std::streamoff>(startOffset), std::ios::beg);
+    }
     while (true) {
         WalOp op;
         if (!in.read(reinterpret_cast<char*>(&op), sizeof(op))) break;
@@ -777,6 +789,19 @@ std::vector<WalRecord> readWalRecords(const std::string& path) {
         std::vector<char> payload(len);
         if (len > 0) {
             if (!in.read(payload.data(), len)) break;
+        }
+        uint32_t crcRead = 0;
+        if (!walReadLE(in, crcRead)) break;
+        std::string buf;
+        buf.reserve(sizeof(op) + sizeof(docId) + sizeof(len) + payload.size());
+        buf.append(reinterpret_cast<const char*>(&op), sizeof(op));
+        buf.append(reinterpret_cast<const char*>(&docId), sizeof(docId));
+        buf.append(reinterpret_cast<const char*>(&len), sizeof(len));
+        if (!payload.empty()) buf.append(payload.data(), payload.size());
+        uint32_t crcComputed = crc32(buf);
+        if (crcComputed != crcRead) {
+            std::cerr << "WAL checksum mismatch at offset " << in.tellg() << " in " << path << ", stopping replay\n";
+            break;
         }
         out.push_back({op, docId, std::move(payload)});
     }
@@ -1288,11 +1313,12 @@ void BlackBox::removeJsonRecursive(IndexState& idx, DocId id, const json& node) 
 
 void BlackBox::addPosting(IndexState& idx, const std::string& term, DocId id, uint32_t tf) {
     auto& vec = idx.invertedIndex[term];
-    if (!vec.empty() && vec.back().id == id) {
-        vec.back().tf += tf;
-        return;
+    auto it = std::lower_bound(vec.begin(), vec.end(), id, [](const algo::Posting& p, DocId v){ return p.id < v; });
+    if (it != vec.end() && it->id == id) {
+        it->tf += tf;
+    } else {
+        vec.insert(it, {id, tf});
     }
-    vec.push_back({id, tf});
 }
 
 void BlackBox::removePosting(IndexState& idx, const std::string& term, DocId id) {
@@ -1696,6 +1722,13 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
 
     fs::path segFile = fs::path(dataDir_) / (index + "_seg" + std::to_string(idx.segments.size()) + ".skd");
     if (writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
+        // remove old segments to avoid resurrecting deleted docs on restart
+        for (const auto& seg : idx.segments) {
+            fs::path p = fs::path(dataDir_) / seg.file;
+            std::error_code ec;
+            fs::remove(p, ec);
+        }
+        idx.segments.clear();
         SegmentMetadata meta;
         if (!idx.documents.empty()) {
             auto minmax = std::minmax_element(idx.documents.begin(), idx.documents.end(),
@@ -1788,13 +1821,24 @@ void BlackBox::writeManifest() const {
             {"ann_clusters", entry.second.annClusters}
         });
     }
-    std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
-    out << manifest.dump(2);
+    fs::path tmpPath = manifestPath;
+    tmpPath += ".tmp";
+    {
+        std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+        out << manifest.dump(2);
+        out.flush();
+    }
+    std::error_code ec;
+    fs::remove(manifestPath, ec);
+    fs::rename(tmpPath, manifestPath, ec);
+    if (ec) {
+        std::cerr << "BlackBox: failed to replace manifest at " << manifestPath << " err=" << ec.message() << "\n";
+    }
 }
 
-void BlackBox::replayWal(IndexState& idx) {
+void BlackBox::replayWal(IndexState& idx, uint64_t startOffset) {
     if (!idx.wal.stream.is_open()) return;
-    auto records = readWalRecords(idx.wal.path);
+    auto records = readWalRecords(idx.wal.path, startOffset);
     for (const auto& rec : records) {
         if (rec.op == WalOp::Upsert) {
             auto j = json::from_cbor(rec.payload, true, false);
@@ -1948,6 +1992,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         state.schema.schema = idxJson.value("schema", json::object());
         configureSchema(state);
 
+        uint64_t maxWalPos = 0;
         for (const auto& seg : segments) {
             std::string file;
             uint32_t minId = 0;
@@ -2056,6 +2101,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             meta.maxId = maxId;
             meta.walPos = walPos;
             state.segments.push_back(meta);
+            maxWalPos = std::max(maxWalPos, walPos);
         }
 
         // Ensure postings are sorted/unique
@@ -2076,7 +2122,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         if (!dataDir_.empty()) {
             state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
             state.wal.open();
-            replayWal(state);
+            replayWal(state, maxWalPos);
         }
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: loaded index " << name << " segments=" << segments.size() << "\n";

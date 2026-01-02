@@ -1,11 +1,11 @@
 // Interactive CLI test runner for BlackBox HTTP API.
 // Run: node scripts/test_client.js
 // Presents a menu for: benchmark, durability, stress.
-const os = require('os');
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const readline = require("readline");
+
 const axios = require("axios").create({
   baseURL: "http://127.0.0.1:8080",
   timeout: 15000,
@@ -19,12 +19,12 @@ const randomText = (words, len) => {
   for (let i = 0; i < len; ++i) out.push(randChoice(words));
   return out.join(" ");
 };
-let pathing = []
-const platfromOs = process.platform
+let pathing = [];
+const platfromOs = process.platform;
 if (platfromOs == "win32") {
-  pathing = ["Release", "BlackBox.exe"]
+  pathing = ["Release", "BlackBox.exe"];
 } else if (platfromOs == "linux") {
-  pathing = ["", "BlackBox"]
+  pathing = ["", "BlackBox"];
 }
 
 const serverCmd =
@@ -200,7 +200,11 @@ async function runBenchmark() {
       const step = await timeStep(`index_${doc.title}`, () =>
         indexDoc(primaryIndex, doc)
       );
-      docTimings.push({ doc: doc.title, ms: step.ms, status: step.result.status });
+      docTimings.push({
+        doc: doc.title,
+        ms: step.ms,
+        status: step.result.status,
+      });
       if (step.result.status === 201) benchmark.docsIndexed[primaryIndex] += 1;
     }
     benchmark.timings.push({
@@ -297,9 +301,12 @@ async function runBenchmark() {
     ];
     for (const q of queries) {
       const idx = q.index || primaryIndex;
-      const step = await timeStep(`search_${q.name}`, () => runSearch(idx, q.params));
+      const step = await timeStep(`search_${q.name}`, () =>
+        runSearch(idx, q.params)
+      );
       const payload = step.result.data || {};
-      const hits = payload.data && payload.data.hits ? payload.data.hits.length : 0;
+      const hits =
+        payload.data && payload.data.hits ? payload.data.hits.length : 0;
       benchmark.queries.push({
         targetIndex: idx,
         name: q.name,
@@ -345,14 +352,22 @@ async function runDurability() {
     const docId =
       inserted.data && inserted.data.data ? inserted.data.data.id : undefined;
     if (!docId) throw new Error("Durability doc missing id");
-    results.steps.push({ step: "index_doc", id: docId, status: inserted.status });
+    results.steps.push({
+      step: "index_doc",
+      id: docId,
+      status: inserted.status,
+    });
 
     // Force snapshot so data is persisted beyond WAL for tiny workloads
     try {
       const snap = await axios.post("/v1/snapshot");
       results.steps.push({ step: "snapshot", status: snap.status });
     } catch (e) {
-      results.steps.push({ step: "snapshot", status: "failed", error: e.message });
+      results.steps.push({
+        step: "snapshot",
+        status: "failed",
+        error: e.message,
+      });
     }
 
     await stopServerProcess(proc);
@@ -399,7 +414,17 @@ async function runStress(maxDocs, concurrency) {
   };
   try {
     await ensureIndex(index, { fields: { title: "text", body: "text" } });
-    const vocab = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "lambda"];
+    const vocab = [
+      "alpha",
+      "beta",
+      "gamma",
+      "delta",
+      "epsilon",
+      "zeta",
+      "eta",
+      "theta",
+      "lambda",
+    ];
     let counter = 0;
     let failed = false;
     const start = hrMs();
@@ -413,7 +438,8 @@ async function runStress(maxDocs, concurrency) {
             results.successes += 1;
           } else {
             results.failures += 1;
-            if (!results.firstError) results.firstError = { status: res.status, data: res.data };
+            if (!results.firstError)
+              results.firstError = { status: res.status, data: res.data };
             failed = true;
             break;
           }
@@ -427,7 +453,11 @@ async function runStress(maxDocs, concurrency) {
     }
     await Promise.all(Array.from({ length: concurrency }, worker));
     results.durationMs = hrMs() - start;
-    const search = await runSearch(index, { q: "alpha", mode: "bm25", size: 1 });
+    const search = await runSearch(index, {
+      q: "alpha",
+      mode: "bm25",
+      size: 1,
+    });
     results.searchStatus = search.status;
     results.searchHits = search.data?.data?.hits?.length ?? 0;
   } catch (err) {
@@ -441,7 +471,10 @@ async function runStress(maxDocs, concurrency) {
 }
 
 function promptMenu() {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
   return new Promise((resolve) => {
     console.log("Select a test to run:");
     console.log("  1) Benchmark (multi-index, bulk, searches)");
@@ -455,7 +488,10 @@ function promptMenu() {
 }
 
 function promptNumber(question, defaultVal) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
   return new Promise((resolve) => {
     rl.question(`${question} (default ${defaultVal}): `, (answer) => {
       rl.close();

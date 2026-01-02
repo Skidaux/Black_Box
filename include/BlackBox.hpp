@@ -60,7 +60,7 @@ inline void readLE(std::istream& in, T& value) {
         void reset();
     };
 
-    std::vector<WalRecord> readWalRecords(const std::string& path);
+    std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOffset = 0);
 
 } // namespace minielastic
 namespace minielastic {
@@ -233,7 +233,7 @@ private:
     void flushIfNeeded(const std::string& index, IndexState& idx);
     void maybeMergeSegments(const std::string& index, IndexState& idx);
     void writeManifest() const;
-    void replayWal(IndexState& idx);
+    void replayWal(IndexState& idx, uint64_t startOffset = 0);
     void loadWalOnly();
     void configureSchema(IndexState& state);
     std::optional<std::string> extractCustomId(const IndexState& idx, const nlohmann::json& doc) const;
