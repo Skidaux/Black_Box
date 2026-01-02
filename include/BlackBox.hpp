@@ -12,6 +12,9 @@
 #include <mutex>
 #include <shared_mutex>
 #include <optional>
+#include <atomic>
+#include <thread>
+#include <chrono>
 #include <nlohmann/json.hpp>
 #include "minielastic/Analyzer.hpp"
 #include "minielastic/algorithms/SearchAlgorithms.hpp"
@@ -50,6 +53,10 @@ inline void readLE(std::istream& in, T& value) {
         std::string path;
         std::ofstream stream;
         uint64_t offset = 0;
+        uint64_t pendingBytes = 0;
+        uint64_t flushThresholdBytes = 64 * 1024;
+        std::chrono::steady_clock::time_point lastFlush = std::chrono::steady_clock::now();
+        std::chrono::milliseconds flushInterval{200};
 
         WalWriter() = default;
         explicit WalWriter(std::string p) : path(std::move(p)) {}
@@ -57,6 +64,7 @@ inline void readLE(std::istream& in, T& value) {
         bool open();
         void close();
         bool append(const WalRecord& rec);
+        void maybeFlush(bool force = false);
         void reset();
     };
 
@@ -192,6 +200,7 @@ private:
         std::vector<SegmentMetadata> segments;
         WalWriter wal;
         size_t opsSinceFlush = 0;
+        bool manifestDirty = false;
     };
 
     std::string dataDir_;
@@ -201,6 +210,11 @@ private:
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
+    uint64_t walFlushBytes_ = 64 * 1024;
+    uint64_t walFlushMs_ = 200;
+    std::atomic<bool> manifestDirty_{false};
+    std::thread maintenanceThread_;
+    std::atomic<bool> stopMaintenance_{false};
     mutable std::unordered_map<std::string, IndexState> indexes_;
     std::unordered_map<std::string, nlohmann::json> customApis_;
     std::string customApiPath_;
@@ -247,6 +261,8 @@ private:
     bool validateCustomApi(const std::string& name, const nlohmann::json& spec) const;
     nlohmann::json executeCustomApiInternal(const std::string& name, const nlohmann::json& spec, const nlohmann::json& params) const;
     nlohmann::json buildCustomRelationTree(const std::string& baseIndex, const nlohmann::json& doc, DocId docId, const nlohmann::json& relationSpec) const;
+    void startMaintenance();
+    void stopMaintenance();
 };
 
 } // namespace minielastic

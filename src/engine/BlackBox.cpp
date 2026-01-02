@@ -726,6 +726,19 @@ void WalWriter::close() {
     if (stream.is_open()) stream.close();
 }
 
+void WalWriter::maybeFlush(bool force) {
+    if (!stream.is_open()) return;
+    auto now = std::chrono::steady_clock::now();
+    if (!force) {
+        if (pendingBytes < flushThresholdBytes && (now - lastFlush) < flushInterval) {
+            return;
+        }
+    }
+    stream.flush();
+    pendingBytes = 0;
+    lastFlush = now;
+}
+
 bool WalWriter::append(const WalRecord& rec) {
     if (!stream.is_open()) return false;
     if (!stream.good()) {
@@ -746,8 +759,9 @@ bool WalWriter::append(const WalRecord& rec) {
     if (!rec.payload.empty()) buf.append(rec.payload.data(), rec.payload.size());
     uint32_t crc = crc32(buf);
     walWriteLE(stream, crc);
-    stream.flush();
     offset += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len + sizeof(uint32_t);
+    pendingBytes += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len + sizeof(uint32_t);
+    maybeFlush(false);
     if (!stream) {
         std::cerr << "WalWriter: stream write failed for " << path << "\n";
     }
@@ -755,6 +769,7 @@ bool WalWriter::append(const WalRecord& rec) {
 }
 
 void WalWriter::reset() {
+    maybeFlush(true);
     close();
     if (!path.empty()) {
         try {
@@ -769,6 +784,7 @@ void WalWriter::reset() {
         }
         truncStream.close();
         offset = 0;
+        pendingBytes = 0;
     }
 }
 
@@ -827,6 +843,12 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envMerge = std::getenv("BLACKBOX_MERGE_SEGMENTS")) {
         try { mergeSegmentsAt_ = std::max<size_t>(1, static_cast<size_t>(std::stoull(envMerge))); } catch (...) {}
     }
+    if (const char* envWalBytes = std::getenv("BLACKBOX_WAL_FLUSH_BYTES")) {
+        try { walFlushBytes_ = std::max<uint64_t>(4096, std::stoull(envWalBytes)); } catch (...) {}
+    }
+    if (const char* envWalMs = std::getenv("BLACKBOX_WAL_FLUSH_MS")) {
+        try { walFlushMs_ = std::max<uint64_t>(10, std::stoull(envWalMs)); } catch (...) {}
+    }
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -847,6 +869,8 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
             if (kv.second.wal.path.empty()) {
                 kv.second.wal.path = (std::filesystem::path(dataDir_) / (kv.first + ".wal")).string();
             }
+            kv.second.wal.flushThresholdBytes = walFlushBytes_;
+            kv.second.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
             if (!kv.second.wal.stream.is_open()) {
                 kv.second.wal.open();
             }
@@ -859,10 +883,18 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
         }
         std::cerr << "BlackBox: init complete; indexes=" << indexes_.size() << "\n";
         loadCustomApis();
+        startMaintenance();
     }
 }
 
 BlackBox::~BlackBox() {
+    stopMaintenance();
+    {
+        std::shared_lock<std::shared_mutex> lk(mutex_);
+        for (auto& kv : indexes_) {
+            kv.second.wal.maybeFlush(true);
+        }
+    }
     writeManifest();
 }
 
@@ -878,10 +910,13 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     // init WAL
     if (!dataDir_.empty()) {
         indexes_[name].wal.path = (std::filesystem::path(dataDir_) / (name + ".wal")).string();
+        indexes_[name].wal.flushThresholdBytes = walFlushBytes_;
+        indexes_[name].wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
         indexes_[name].wal.reset();
         indexes_[name].wal.open();
-        writeManifest();
+        indexes_[name].manifestDirty = true;
     }
+    manifestDirty_.store(true, std::memory_order_relaxed);
     return true;
 }
 
@@ -940,9 +975,9 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
     auto processed = preprocessIncomingDocument(idx, j);
     DocId id = applyUpsert(idx, 0, processed, true);
     refreshAverages(idx);
-    writeManifest();
+    idx.manifestDirty = true;
+    manifestDirty_.store(true, std::memory_order_relaxed);
     bool doSnapshot = autoSnapshot_;
-    flushIfNeeded(index, idx);
     lk.unlock();
     if (doSnapshot) saveSnapshot();
     return id;
@@ -993,9 +1028,9 @@ bool BlackBox::deleteDocument(const std::string& index, DocId id) {
     bool ok = applyDelete(idx, id, true);
     if (ok) {
         refreshAverages(idx);
-        writeManifest();
+        idx.manifestDirty = true;
+        manifestDirty_.store(true, std::memory_order_relaxed);
         bool doSnapshot = autoSnapshot_;
-        flushIfNeeded(index, idx);
         lk.unlock();
         if (doSnapshot) saveSnapshot();
     }
@@ -1027,9 +1062,9 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
     auto processed = preprocessIncomingDocument(idx, merged);
     applyUpsert(idx, id, processed, true);
     refreshAverages(idx);
-    writeManifest();
+    idx.manifestDirty = true;
+    manifestDirty_.store(true, std::memory_order_relaxed);
     bool doSnapshot = autoSnapshot_;
-    flushIfNeeded(index, idx);
     lk.unlock();
     if (doSnapshot) saveSnapshot();
     return true;
@@ -1744,6 +1779,8 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         idx.wal.open();
         idx.opsSinceFlush = 0;
         writeManifest();
+        idx.manifestDirty = false;
+        manifestDirty_.store(false, std::memory_order_relaxed);
         maybeMergeSegments(index, idx);
     }
 }
@@ -1802,6 +1839,8 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     idx.wal.open();
     idx.opsSinceFlush = 0;
     writeManifest();
+    idx.manifestDirty = false;
+    manifestDirty_.store(false, std::memory_order_relaxed);
 }
 
 void BlackBox::writeManifest() const {
@@ -2121,6 +2160,8 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         // init WAL
         if (!dataDir_.empty()) {
             state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
+            state.wal.flushThresholdBytes = walFlushBytes_;
+            state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
             state.wal.open();
             replayWal(state, maxWalPos);
         }
@@ -2143,6 +2184,8 @@ void BlackBox::loadWalOnly() {
         IndexState state;
         state.annClusters = defaultAnnClusters_;
         state.wal.path = path.string();
+        state.wal.flushThresholdBytes = walFlushBytes_;
+        state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
         state.wal.open();
         replayWal(state);
         indexes_[name] = std::move(state);
@@ -2318,6 +2361,53 @@ void BlackBox::saveCustomApis() const {
     if (out) {
         out << payload.dump(2);
     }
+}
+
+void BlackBox::startMaintenance() {
+    if (maintenanceThread_.joinable()) return;
+    stopMaintenance_.store(false);
+    maintenanceThread_ = std::thread([this]() {
+        using namespace std::chrono;
+        while (!stopMaintenance_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::vector<std::string> toFlush;
+            bool needManifest = manifestDirty_.load(std::memory_order_relaxed);
+            {
+                std::shared_lock<std::shared_mutex> lk(mutex_);
+                for (const auto& kv : indexes_) {
+                    if (flushEveryDocs_ > 0 && kv.second.opsSinceFlush >= flushEveryDocs_) {
+                        toFlush.push_back(kv.first);
+                    }
+                    if (kv.second.manifestDirty) needManifest = true;
+                }
+            }
+            for (const auto& name : toFlush) {
+                std::unique_lock<std::shared_mutex> lk(mutex_);
+                auto it = indexes_.find(name);
+                if (it != indexes_.end()) {
+                    flushIfNeeded(name, it->second);
+                    it->second.manifestDirty = false;
+                }
+            }
+            if (needManifest) {
+                std::shared_lock<std::shared_mutex> lk(mutex_);
+                writeManifest();
+                manifestDirty_.store(false, std::memory_order_relaxed);
+                for (auto& kv : indexes_) kv.second.manifestDirty = false;
+            }
+            {
+                std::shared_lock<std::shared_mutex> lk(mutex_);
+                for (auto& kv : indexes_) {
+                    kv.second.wal.maybeFlush(false);
+                }
+            }
+        }
+    });
+}
+
+void BlackBox::stopMaintenance() {
+    stopMaintenance_.store(true);
+    if (maintenanceThread_.joinable()) maintenanceThread_.join();
 }
 
 bool BlackBox::validateCustomApi(const std::string& name, const json& spec) const {

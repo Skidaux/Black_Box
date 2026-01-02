@@ -330,6 +330,59 @@ void BlackBoxHttpServer::setupRoutes() {
         addCors(res);
     });
 
+    // --- BULK INDEX ---
+    server_.Post(R"(/v1/([^/]+)/_bulk)", [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res) {
+        std::string index = req.matches[1];
+        if (!isJsonContent(req)) {
+            res.status = 415;
+            res.set_content(err(415, "Content-Type must be application/json").dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        bool continueOnError = req.get_param_value("continue_on_error") != "false";
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(err(400, std::string("Invalid JSON: ") + e.what()).dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        const json* docsNode = nullptr;
+        if (body.is_array()) {
+            docsNode = &body;
+        } else if (body.is_object() && body.contains("docs") && body["docs"].is_array()) {
+            docsNode = &body["docs"];
+        }
+        if (!docsNode) {
+            res.status = 400;
+            res.set_content(err(400, "Body must be an array or an object with 'docs' array").dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        std::vector<uint32_t> ids;
+        std::vector<json> errors;
+        ids.reserve(docsNode->size());
+        for (size_t i = 0; i < docsNode->size(); ++i) {
+            try {
+                auto id = db_.indexDocument(index, (*docsNode)[i].dump());
+                ids.push_back(id);
+            } catch (const std::exception& e) {
+                errors.push_back(json{{"index", i}, {"error", e.what()}});
+                if (!continueOnError) break;
+            }
+        }
+        json payload{
+            {"indexed", ids.size()},
+            {"ids", ids},
+            {"errors", errors}
+        };
+        res.status = errors.empty() ? 201 : 207;
+        res.set_content(ok(payload).dump(), "application/json");
+        addCors(res);
+    });
+
     // --- GET DOCUMENT ---
     server_.Get(R"(/v1/([^/]+)/doc/([^/]+))", [this, ok, err, addCors, resolveDocId](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];

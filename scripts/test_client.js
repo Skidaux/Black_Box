@@ -53,6 +53,14 @@ async function indexDoc(index, doc) {
   });
 }
 
+async function bulkIndex(index, docs, continueOnError = true) {
+  return axios.post(
+    `/v1/${index}/_bulk?continue_on_error=${continueOnError}`,
+    docs,
+    { headers: { "Content-Type": "application/json" } }
+  );
+}
+
 async function patchDoc(index, id, body) {
   return axios.patch(`/v1/${index}/doc/${id}`, body, {
     headers: { "Content-Type": "application/json" },
@@ -400,13 +408,14 @@ async function runDurability() {
   }
 }
 
-async function runStress(maxDocs, concurrency) {
+async function runStress(maxDocs, concurrency, batchSize = 200) {
   const index = `stress_${Date.now()}`;
   const results = {
     timestamp: new Date().toISOString(),
     index,
     targetDocs: maxDocs,
     concurrency,
+    batchSize,
     successes: 0,
     failures: 0,
     firstError: null,
@@ -429,22 +438,35 @@ async function runStress(maxDocs, concurrency) {
     let failed = false;
     const start = hrMs();
     async function worker() {
-      while (!failed && counter < maxDocs) {
-        const id = ++counter;
-        const doc = { title: `Doc ${id}`, body: randomText(vocab, 12) };
+      while (!failed) {
+        let startId;
+        let docs = [];
+        // reserve next batch atomically-ish
+        if (counter >= maxDocs) break;
+        startId = counter + 1;
+        const remaining = maxDocs - counter;
+        const take = Math.min(batchSize, remaining);
+        counter += take;
+        for (let i = 0; i < take; ++i) {
+          const id = startId + i;
+          docs.push({ title: `Doc ${id}`, body: randomText(vocab, 12) });
+        }
         try {
-          const res = await indexDoc(index, doc);
-          if (res.status === 201) {
-            results.successes += 1;
-          } else {
-            results.failures += 1;
-            if (!results.firstError)
-              results.firstError = { status: res.status, data: res.data };
+          const res = await bulkIndex(index, docs, true);
+          const okIds = res.data?.data?.ids || res.data?.ids || [];
+          const errs = res.data?.data?.errors || res.data?.errors || [];
+          results.successes += okIds.length;
+          results.failures += errs.length + Math.max(0, take - okIds.length - errs.length);
+          if (res.status !== 201 && res.status !== 207 && !results.firstError) {
+            results.firstError = { status: res.status, data: res.data };
             failed = true;
             break;
           }
+          if (errs.length && !results.firstError) {
+            results.firstError = { status: res.status, errors: errs };
+          }
         } catch (err) {
-          results.failures += 1;
+          results.failures += take;
           if (!results.firstError) results.firstError = { error: err.message };
           failed = true;
           break;
@@ -511,7 +533,8 @@ async function main() {
   } else if (choice === "3") {
     const maxDocs = await promptNumber("Max documents to attempt", 5000);
     const concurrency = await promptNumber("Concurrency", 32);
-    await runStress(maxDocs, concurrency);
+    const batchSize = await promptNumber("Bulk batch size", 200);
+    await runStress(maxDocs, concurrency, batchSize);
   } else {
     console.log("Invalid choice.");
     process.exit(1);
