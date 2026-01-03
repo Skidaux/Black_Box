@@ -5,6 +5,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <thread>
 
 using minielastic::BlackBox;
 using nlohmann::json;
@@ -134,6 +135,36 @@ int main() {
         expect(hits.empty(), "deleted doc should not resurrect after reload");
         expect(dbReload.documentCount(delIndex) == 0, "doc count should remain 0 after reload");
     }
+
+    // Update path should refresh _updated_at and preserve id
+    auto newId = db.indexDocument(indexName, R"({"title":"Doc2","body":"foo bar"})");
+    auto before = db.getDocument(indexName, newId)["_updated_at"].get<int64_t>();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    expect(db.updateDocument(indexName, newId, R"({"body":"foo baz"})", true), "partial update");
+    auto after = db.getDocument(indexName, newId)["_updated_at"].get<int64_t>();
+    expect(after > before, "_updated_at should advance on update");
+
+    // Bulk indexing via HTTP client simulated: ensure uniqueness enforcement on doc_id
+    const std::string uniqIndex = "uniq_index";
+    BlackBox::IndexSchema uniqSchema;
+    uniqSchema.schema = {
+        {"fields", {{"title", "text"}, {"sku", "text"}}},
+        {"doc_id", {{"field", "sku"}, {"type", "string"}, {"enforce_unique", true}}}
+    };
+    expect(db.createIndex(uniqIndex, uniqSchema), "create uniq index");
+    auto uid1 = db.indexDocument(uniqIndex, R"({"title":"first","sku":"ABC"})");
+    expect(uid1 == 1, "first doc id");
+    bool threw = false;
+    try {
+        db.indexDocument(uniqIndex, R"({"title":"dupe","sku":"ABC"})");
+    } catch (...) {
+        threw = true;
+    }
+    expect(threw, "duplicate doc_id should throw");
+
+    // Fuzzy search returns results with edit distance
+    auto fuzzy2 = db.search(indexName, "quik", "fuzzy", 10, 2);
+    expect(!fuzzy2.empty(), "fuzzy search should still return");
 
     std::cout << "All tests passed." << std::endl;
     return 0;

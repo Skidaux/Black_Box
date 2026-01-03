@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-01-03T15:39:45.812Z",
+  "timestamp": "2026-01-03T23:17:34.561Z",
   "baseURL": "http://127.0.0.1:8080",
   "indexes": [
     "demo",
@@ -7,49 +7,49 @@
   ],
   "docsIndexed": {
     "demo": 3,
-    "related_demo": 202
+    "related_demo": 0
   },
   "timings": [
     {
       "step": "create_primary",
-      "ms": 9.533500015735626,
-      "status": 201
+      "ms": 29.62270000576973,
+      "status": 400
     },
     {
       "step": "create_related",
-      "ms": 3.09689998626709,
-      "status": 201
+      "ms": 2.6637000143527985,
+      "status": 400
     },
     {
       "step": "index_documents_total",
-      "ms": 2.7437000274658203,
+      "ms": 3.8566000163555145,
       "status": "aggregate",
       "perDoc": [
         {
           "doc": "Doc1",
-          "ms": 1.3368000090122223,
+          "ms": 1.527099996805191,
           "status": 201
         },
         {
           "doc": "Doc2",
-          "ms": 0.8176000118255615,
+          "ms": 1.6448000073432922,
           "status": 201
         },
         {
           "doc": "Doc3",
-          "ms": 0.5893000066280365,
+          "ms": 0.6847000122070312,
           "status": 201
         }
       ]
     },
     {
       "step": "patch_parent",
-      "ms": 0.6509999930858612,
+      "ms": 0.8212999999523163,
       "status": 200
     },
     {
       "step": "bulk_related",
-      "ms": 94.71040001511574,
+      "ms": 134.9060000181198,
       "status": "aggregate",
       "docs": 200
     }
@@ -62,10 +62,10 @@
         "q": "quick fox",
         "mode": "bm25"
       },
-      "ms": 0.9590999782085419,
+      "ms": 5.5658000111579895,
       "status": 200,
-      "hits": 1,
-      "total": 1
+      "hits": 3,
+      "total": 3
     },
     {
       "targetIndex": "demo",
@@ -79,10 +79,10 @@
         "filter_priority_min": 1,
         "filter_priority_max": 6
       },
-      "ms": 0.5647000074386597,
+      "ms": 0.523499995470047,
       "status": 200,
-      "hits": 1,
-      "total": 1
+      "hits": 3,
+      "total": 3
     },
     {
       "targetIndex": "demo",
@@ -94,10 +94,10 @@
         "w_semantic": 1.2,
         "w_lexical": 0.4
       },
-      "ms": 0.5311000049114227,
+      "ms": 0.8359000086784363,
       "status": 200,
-      "hits": 2,
-      "total": 2
+      "hits": 6,
+      "total": 6
     },
     {
       "targetIndex": "demo",
@@ -108,10 +108,10 @@
         "vec": "1,0,0",
         "size": 3
       },
-      "ms": 0.37119999527931213,
+      "ms": 0.3783000111579895,
       "status": 200,
-      "hits": 2,
-      "total": 2
+      "hits": 3,
+      "total": 3
     },
     {
       "targetIndex": "related_demo",
@@ -121,10 +121,32 @@
         "mode": "bm25",
         "size": 5
       },
-      "ms": 1.0232999920845032,
+      "ms": 0.5004999935626984,
       "status": 200,
       "hits": 5,
       "total": 5
+    },
+    {
+      "targetIndex": "related_demo",
+      "name": "relation_parent",
+      "params": {
+        "q": "Parent",
+        "mode": "bm25",
+        "size": 2
+      },
+      "ms": 0.3452000021934509,
+      "status": 200,
+      "hits": 2,
+      "total": 2
+    },
+    {
+      "name": "relation_parent_fetch",
+      "params": {
+        "child": 1,
+        "parent": "sku-1"
+      },
+      "status": 200,
+      "parentTitle": "Parent A"
     }
   ],
   "notes": "Benchmark: multi-index workflow, bulk ingest, vector/lexical/fuzzy/hybrid searches, relation testing."

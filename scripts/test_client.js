@@ -306,6 +306,11 @@ async function runBenchmark() {
         index: relatedIndex,
         params: { q: "bulk", mode: "bm25", size: 5 },
       },
+      {
+        name: "relation_parent",
+        index: relatedIndex,
+        params: { q: "Parent", mode: "bm25", size: 2 },
+      },
     ];
     for (const q of queries) {
       const idx = q.index || primaryIndex;
@@ -323,6 +328,31 @@ async function runBenchmark() {
         status: step.result.status,
         hits,
         total: payload.data ? payload.data.total : undefined,
+      });
+    }
+
+    // Relation fetch: get child doc and resolve its parent from relatedIndex
+    try {
+      const childRes = await axios.get(`/v1/${primaryIndex}/doc/1`);
+      if (childRes.status === 200) {
+        const parent = childRes.data?.data?.doc?.parent;
+        if (parent && parent.id) {
+          const parentDoc = await axios.get(
+            `/v1/${relatedIndex}/doc/${parent.id}`
+          );
+          benchmark.queries.push({
+            name: "relation_parent_fetch",
+            params: { child: 1, parent: parent.id },
+            status: parentDoc.status,
+            parentTitle: parentDoc.data?.data?.doc?.title,
+          });
+        }
+      }
+    } catch (e) {
+      benchmark.queries.push({
+        name: "relation_parent_fetch",
+        status: "error",
+        error: e.message,
       });
     }
 
@@ -397,6 +427,50 @@ async function runDurability() {
       status: search.status,
       hits: search.data?.data?.hits?.length ?? 0,
     });
+
+    // Delete and ensure tombstone survives restart
+    const del = await axios.delete(`/v1/${testIndex}/doc/${docId}`);
+    results.steps.push({ step: "delete_doc", status: del.status });
+    await stopServerProcess(proc);
+    results.steps.push({ step: "shutdown_post_delete", status: "ok" });
+    proc = startServerProcess();
+    await waitForServer();
+    results.steps.push({ step: "restart_after_delete", status: "ok" });
+    const fetchAfterDelete = await axios.get(`/v1/${testIndex}/doc/${docId}`);
+    results.steps.push({
+      step: "fetch_after_delete_restart",
+      status: fetchAfterDelete.status,
+      payload: fetchAfterDelete.data,
+    });
+    const searchAfterDelete = await runSearch(testIndex, {
+      q: "persist",
+      mode: "bm25",
+    });
+    results.steps.push({
+      step: "search_after_delete_restart",
+      status: searchAfterDelete.status,
+      hits: searchAfterDelete.data?.data?.hits?.length ?? 0,
+    });
+
+    // Corrupt WAL tail simulation: append garbage and ensure we still start
+    const walPath = path.join(serverCwd, "data", `${testIndex}.wal`);
+    try {
+      fs.appendFileSync(walPath, "CORRUPTTAIL");
+      results.steps.push({ step: "wal_corrupt_tail", status: "ok" });
+    } catch (e) {
+      results.steps.push({
+        step: "wal_corrupt_tail",
+        status: "failed",
+        error: e.message,
+      });
+    }
+    await stopServerProcess(proc);
+    results.steps.push({ step: "shutdown_after_corrupt", status: "ok" });
+    proc = startServerProcess();
+    await waitForServer();
+    results.steps.push({ step: "restart_after_corrupt", status: "ok" });
+    const health = await axios.get("/v1/health");
+    results.steps.push({ step: "health_after_corrupt", status: health.status });
   } catch (err) {
     results.steps.push({ step: "error", message: err.message });
     console.error("Durability test failed:", err.message);

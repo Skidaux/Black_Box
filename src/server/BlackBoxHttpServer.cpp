@@ -137,6 +137,68 @@ void BlackBoxHttpServer::setupRoutes() {
         addCors(res);
     });
 
+    // --- PROMETHEUS METRICS ---
+    server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+        auto now = std::chrono::steady_clock::now();
+        double uptimeSec = std::chrono::duration<double>(now - startTime_).count();
+        auto stats = db_.stats();
+        std::size_t totalDocs = 0;
+        std::size_t totalSegments = 0;
+        std::size_t totalVectors = 0;
+        uint64_t totalWal = 0;
+        std::ostringstream out;
+        out << "# HELP blackbox_uptime_seconds Uptime of the BlackBox server in seconds\n";
+        out << "# TYPE blackbox_uptime_seconds gauge\n";
+        out << "blackbox_uptime_seconds " << uptimeSec << "\n";
+
+        out << "# HELP blackbox_indexes Number of indexes\n";
+        out << "# TYPE blackbox_indexes gauge\n";
+        out << "blackbox_indexes " << stats.size() << "\n";
+
+        out << "# HELP blackbox_documents_total Total documents across all indexes\n";
+        out << "# TYPE blackbox_documents_total gauge\n";
+        for (const auto& s : stats) totalDocs += s.documents;
+        out << "blackbox_documents_total " << totalDocs << "\n";
+
+        out << "# HELP blackbox_segments_total Total segments across all indexes\n";
+        out << "# TYPE blackbox_segments_total gauge\n";
+        for (const auto& s : stats) totalSegments += s.segments;
+        out << "blackbox_segments_total " << totalSegments << "\n";
+
+        out << "# HELP blackbox_vectors_total Total vectors across all indexes\n";
+        out << "# TYPE blackbox_vectors_total gauge\n";
+        for (const auto& s : stats) totalVectors += s.vectors;
+        out << "blackbox_vectors_total " << totalVectors << "\n";
+
+        out << "# HELP blackbox_wal_bytes_total WAL bytes across all indexes\n";
+        out << "# TYPE blackbox_wal_bytes_total gauge\n";
+        for (const auto& s : stats) totalWal += s.walBytes;
+        out << "blackbox_wal_bytes_total " << totalWal << "\n";
+
+        out << "# HELP blackbox_index_documents Documents per index\n";
+        out << "# TYPE blackbox_index_documents gauge\n";
+        for (const auto& s : stats) {
+            out << "blackbox_index_documents{index=\"" << s.name << "\"} " << s.documents << "\n";
+        }
+        out << "# HELP blackbox_index_segments Segments per index\n";
+        out << "# TYPE blackbox_index_segments gauge\n";
+        for (const auto& s : stats) {
+            out << "blackbox_index_segments{index=\"" << s.name << "\"} " << s.segments << "\n";
+        }
+        out << "# HELP blackbox_index_wal_bytes WAL bytes per index\n";
+        out << "# TYPE blackbox_index_wal_bytes gauge\n";
+        for (const auto& s : stats) {
+            out << "blackbox_index_wal_bytes{index=\"" << s.name << "\"} " << s.walBytes << "\n";
+        }
+        out << "# HELP blackbox_index_pending_ops Pending in-memory ops per index\n";
+        out << "# TYPE blackbox_index_pending_ops gauge\n";
+        for (const auto& s : stats) {
+            out << "blackbox_index_pending_ops{index=\"" << s.name << "\"} " << s.pendingOps << "\n";
+        }
+
+        res.set_content(out.str(), "text/plain; version=0.0.4");
+    });
+
     // --- CONFIG ---
     server_.Get("/v1/config", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
         res.set_content(ok(db_.config()).dump(), "application/json");

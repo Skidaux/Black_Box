@@ -87,6 +87,7 @@ public:
         std::unordered_map<std::string, FieldType> fieldTypes;
         std::string vectorField;
         std::unordered_map<std::string, size_t> imageMaxKB;
+        uint32_t schemaVersion = 1;
         struct DocIdConfig {
             std::string field;
             FieldType type = FieldType::Unknown;

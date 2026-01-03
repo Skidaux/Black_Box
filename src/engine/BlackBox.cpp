@@ -16,6 +16,7 @@
 #include <cstring>
 #include <iostream>
 #include <optional>
+#include <chrono>
 #include "minielastic/Checksum.hpp"
 
 using json = nlohmann::json;
@@ -1113,6 +1114,8 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
     auto processed = preprocessIncomingDocument(idx, merged);
     applyUpsert(idx, id, processed, true);
     refreshAverages(idx);
+    // Update timestamp
+    idx.documents[id]["_updated_at"] = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     idx.manifestDirty = true;
     manifestDirty_.store(true, std::memory_order_relaxed);
     bool doSnapshot = autoSnapshot_;
@@ -1566,6 +1569,13 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
 BlackBox::ProcessedDoc BlackBox::preprocessIncomingDocument(IndexState& idx, const nlohmann::json& doc) const {
     ProcessedDoc processed;
     processed.doc = doc;
+    // Auto timestamps
+    auto nowTs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!processed.doc.contains("_created_at")) {
+        processed.doc["_created_at"] = nowTs;
+    }
+    processed.doc["_updated_at"] = nowTs;
     for (const auto& ft : idx.schema.fieldTypes) {
         if (ft.second != FieldType::Image) continue;
         const auto& field = ft.first;
@@ -2310,6 +2320,11 @@ void BlackBox::configureSchema(IndexState& state) {
         rel.targetIndex = relJson.value("target_index", "");
         rel.allowCrossIndex = relJson.value("allow_cross_index", true);
         if (!rel.field.empty()) state.schema.relation = rel;
+    }
+    if (state.schema.schema.contains("schema_version") && state.schema.schema["schema_version"].is_number_unsigned()) {
+        state.schema.schemaVersion = state.schema.schema["schema_version"].get<uint32_t>();
+    } else {
+        state.schema.schema["schema_version"] = state.schema.schemaVersion;
     }
 }
 
