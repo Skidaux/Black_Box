@@ -12,6 +12,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <optional>
+#include <unordered_set>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -201,6 +202,8 @@ private:
         WalWriter wal;
         size_t opsSinceFlush = 0;
         bool manifestDirty = false;
+        std::unordered_set<DocId> tombstones;
+        std::unordered_set<DocId> persistedDeletes; // delete bitmap persisted in segment
     };
 
     std::string dataDir_;

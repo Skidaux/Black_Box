@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-12-11T23:11:49.714Z",
+  "timestamp": "2026-01-03T15:39:45.812Z",
   "baseURL": "http://127.0.0.1:8080",
   "indexes": [
     "demo",
@@ -12,66 +12,46 @@
   "timings": [
     {
       "step": "create_primary",
-      "ms": 11.436226001009345,
+      "ms": 9.533500015735626,
       "status": 201
     },
     {
       "step": "create_related",
-      "ms": 42.50867900066078,
+      "ms": 3.09689998626709,
       "status": 201
     },
     {
       "step": "index_documents_total",
-      "ms": 129.31009299866855,
+      "ms": 2.7437000274658203,
       "status": "aggregate",
       "perDoc": [
         {
           "doc": "Doc1",
-          "ms": 43.676678000018,
+          "ms": 1.3368000090122223,
           "status": 201
         },
         {
           "doc": "Doc2",
-          "ms": 43.7432610001415,
+          "ms": 0.8176000118255615,
           "status": 201
         },
         {
           "doc": "Doc3",
-          "ms": 41.89015399850905,
+          "ms": 0.5893000066280365,
           "status": 201
         }
       ]
     },
     {
       "step": "patch_parent",
-      "ms": 43.52621599845588,
+      "ms": 0.6509999930858612,
       "status": 200
     },
     {
       "step": "bulk_related",
-      "ms": 8294.336004000157,
+      "ms": 94.71040001511574,
       "status": "aggregate",
       "docs": 200
-    },
-    {
-      "step": "fetch_parent_sku",
-      "ms": 42.260704999789596,
-      "status": 200
-    },
-    {
-      "step": "delete_parent_sku",
-      "ms": 42.852996999397874,
-      "status": 200
-    },
-    {
-      "step": "custom_api_create",
-      "ms": 41.67074600048363,
-      "status": 200
-    },
-    {
-      "step": "custom_api_query",
-      "ms": 42.14140100032091,
-      "status": 200
     }
   ],
   "queries": [
@@ -82,23 +62,9 @@
         "q": "quick fox",
         "mode": "bm25"
       },
-      "ms": 42.751919999718666,
+      "ms": 0.9590999782085419,
       "status": 200,
       "hits": 1,
-      "total": 1
-    },
-    {
-      "targetIndex": "demo",
-      "name": "bm25_paged",
-      "params": {
-        "q": "quick brown fox",
-        "mode": "bm25",
-        "from": 1,
-        "size": 2
-      },
-      "ms": 42.13963600061834,
-      "status": 200,
-      "hits": 0,
       "total": 1
     },
     {
@@ -113,129 +79,25 @@
         "filter_priority_min": 1,
         "filter_priority_max": 6
       },
-      "ms": 42.42064799927175,
+      "ms": 0.5647000074386597,
       "status": 200,
       "hits": 1,
       "total": 1
     },
     {
       "targetIndex": "demo",
-      "name": "lexical_array_filter",
-      "params": {
-        "q": "quiet",
-        "mode": "lexical",
-        "filter_labels": "short"
-      },
-      "ms": 41.779931999742985,
-      "status": 200,
-      "hits": 0,
-      "total": 0
-    },
-    {
-      "targetIndex": "demo",
-      "name": "fuzzy",
-      "params": {
-        "q": "quik fox",
-        "mode": "fuzzy",
-        "distance": 2
-      },
-      "ms": 41.91791199892759,
-      "status": 200,
-      "hits": 1,
-      "total": 1
-    },
-    {
-      "targetIndex": "demo",
-      "name": "hybrid_weighted",
+      "name": "hybrid",
       "params": {
         "q": "quick fox",
         "mode": "hybrid",
         "w_bm25": 0.7,
-        "w_semantic": 1.5,
-        "w_lexical": 0.3
+        "w_semantic": 1.2,
+        "w_lexical": 0.4
       },
-      "ms": 41.808849999681115,
+      "ms": 0.5311000049114227,
       "status": 200,
       "hits": 2,
       "total": 2
-    },
-    {
-      "targetIndex": "demo",
-      "name": "semantic",
-      "params": {
-        "q": "quick brown fox",
-        "mode": "semantic"
-      },
-      "ms": 41.83460900001228,
-      "status": 200,
-      "hits": 2,
-      "total": 2
-    },
-    {
-      "targetIndex": "demo",
-      "name": "bm25_relation_inline",
-      "params": {
-        "q": "fox",
-        "mode": "bm25",
-        "include_relations": "inline"
-      },
-      "ms": 43.03875599987805,
-      "status": 200,
-      "hits": 2,
-      "total": 2
-    },
-    {
-      "targetIndex": "demo",
-      "name": "bm25_relation_hierarchy",
-      "params": {
-        "q": "fox",
-        "mode": "bm25",
-        "include_relations": "hierarchy",
-        "max_relation_depth": 2
-      },
-      "ms": 41.96219700016081,
-      "status": 200,
-      "hits": 2,
-      "total": 2
-    },
-    {
-      "targetIndex": "demo",
-      "name": "bm25_relation_cross_index",
-      "params": {
-        "q": "root",
-        "mode": "bm25",
-        "include_relations": "inline"
-      },
-      "ms": 41.619145998731256,
-      "status": 200,
-      "hits": 0,
-      "total": 0
-    },
-    {
-      "targetIndex": "related_demo",
-      "name": "bm25_related_index",
-      "params": {
-        "q": "root",
-        "mode": "bm25",
-        "size": 5
-      },
-      "ms": 41.81629900075495,
-      "status": 200,
-      "hits": 2,
-      "total": 2
-    },
-    {
-      "targetIndex": "related_demo",
-      "name": "related_custom_id_eq",
-      "params": {
-        "q": "Parent",
-        "mode": "bm25",
-        "filter_sku": "sku-1"
-      },
-      "ms": 41.99370200000703,
-      "status": 200,
-      "hits": 1,
-      "total": 1
     },
     {
       "targetIndex": "demo",
@@ -243,13 +105,27 @@
       "params": {
         "q": "vector",
         "mode": "vector",
-        "vec": "1,0,0"
+        "vec": "1,0,0",
+        "size": 3
       },
-      "ms": 42.33650999888778,
+      "ms": 0.37119999527931213,
       "status": 200,
       "hits": 2,
       "total": 2
+    },
+    {
+      "targetIndex": "related_demo",
+      "name": "bulk_search",
+      "params": {
+        "q": "bulk",
+        "mode": "bm25",
+        "size": 5
+      },
+      "ms": 1.0232999920845032,
+      "status": 200,
+      "hits": 5,
+      "total": 5
     }
   ],
-  "notes": "Exercises multi-index usage, custom IDs, relations, binary images, custom aggregations, and relation-aware queries."
+  "notes": "Benchmark: multi-index workflow, bulk ingest, vector/lexical/fuzzy/hybrid searches, relation testing."
 }

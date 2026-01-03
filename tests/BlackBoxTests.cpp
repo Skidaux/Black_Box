@@ -53,8 +53,8 @@ int main() {
     expect(!sem.empty() && sem[0].id == id, "semantic should find doc");
 
     // Snapshot save/load roundtrip
-    const auto snapPath = std::filesystem::path(dataDir) / "index.skd";
-    expect(db.saveSnapshot(snapPath.string()), "snapshot save");
+    // Persist and reload
+    expect(db.saveSnapshot(), "snapshot save");
 
     BlackBox db2(dataDir);
     auto bm25b = db2.search(indexName, "quick fox");
@@ -113,6 +113,27 @@ int main() {
     expect(parentDoc.contains("favicon"), "favicon metadata missing");
     expect(db.deleteDocument(relIndex, *childLookup), "delete child");
     expect(!db.lookupDocId(relIndex, "sku-2").has_value(), "child lookup should be cleared");
+
+    // Delete durability: index + delete + restart should not resurrect
+    const std::string delIndex = "del_index";
+    BlackBox::IndexSchema delSchema;
+    delSchema.schema = {
+        {"fields", {
+            {"title", "text"},
+            {"body", "text"}
+        }}
+    };
+    expect(db.createIndex(delIndex, delSchema), "failed to create delete index");
+    auto did = db.indexDocument(delIndex, R"({"title":"T","body":"to be removed"})");
+    expect(db.deleteDocument(delIndex, did), "delete doc before snapshot");
+    expect(db.documentCount(delIndex) == 0, "doc count should be 0 after delete");
+    expect(db.saveSnapshot(), "snapshot save after delete");
+    {
+        BlackBox dbReload(dataDir);
+        auto hits = dbReload.search(delIndex, "removed");
+        expect(hits.empty(), "deleted doc should not resurrect after reload");
+        expect(dbReload.documentCount(delIndex) == 0, "doc count should remain 0 after reload");
+    }
 
     std::cout << "All tests passed." << std::endl;
     return 0;

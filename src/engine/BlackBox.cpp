@@ -50,6 +50,7 @@ struct SnapshotChunk {
     json docValues; // numeric, bool, string lists
     std::vector<std::vector<float>> annCentroids;
     std::vector<std::vector<uint32_t>> annBuckets;
+    std::vector<uint32_t> tombstones;
     struct SnapshotImage {
         std::string format;
         std::string data;
@@ -65,6 +66,7 @@ void walWriteLE(std::ostream& out, T value) {
     }
 }
 
+
 template <typename T>
 bool walReadLE(std::istream& in, T& value) {
     value = 0;
@@ -74,6 +76,12 @@ bool walReadLE(std::istream& in, T& value) {
         value |= static_cast<uint64_t>(static_cast<unsigned char>(byte)) << (8 * i);
     }
     return true;
+}
+
+static void flushAndSync(std::ofstream& stream) {
+    if (!stream.is_open()) return;
+    stream.flush();
+    // NOTE: portable fsync is non-trivial in MSVC; this is a best-effort flush.
 }
 
 enum class SectionEncoding : uint16_t { Raw = 0, Zstd = 1 };
@@ -297,6 +305,16 @@ static bool writeSnapshotFile(const std::string& path,
         {"buckets", chunk.annBuckets}
     }.dump(), compressSections);
 
+    // Section 12: tombstones (doc ids)
+    std::string tombPayload;
+    if (!chunk.tombstones.empty()) {
+        std::vector<uint32_t> ids = chunk.tombstones;
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        for (auto id : ids) writeLE(tombPayload, id);
+    }
+    Section tombSec = makeSection(12, std::move(tombPayload), compressSections);
+
     std::string imagePayload;
     if (!chunk.images.empty()) {
         std::vector<std::string> fields;
@@ -334,6 +352,7 @@ static bool writeSnapshotFile(const std::string& path,
     sections.push_back(std::move(dvSec));
     sections.push_back(std::move(annSec));
     if (!imageSec.payload.empty()) sections.push_back(std::move(imageSec));
+    if (!tombSec.payload.empty()) sections.push_back(std::move(tombSec));
 
     constexpr uint16_t kVersion = 1;
     constexpr size_t kHeaderPad = 64;
@@ -379,6 +398,7 @@ static bool writeSnapshotFile(const std::string& path,
 
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(file.data(), static_cast<std::streamsize>(file.size()));
+    flushAndSync(out);
     return static_cast<bool>(out);
 }
 
@@ -469,6 +489,13 @@ static bool readSnapshotFile(const std::string& path,
     };
 
     if (!validateCrc(3, docTableViewCompressed) || !validateCrc(4, docBlobViewCompressed)) return false;
+    // Validate optional sections CRC
+    auto validateSection = [&](uint16_t id) -> bool {
+        auto sec = getSection(id);
+        if (!sec) return true;
+        return validateCrc(id, sec->first);
+    };
+    if (!validateSection(5) || !validateSection(8) || !validateSection(9) || !validateSection(10) || !validateSection(11) || !validateSection(12)) return false;
     if (!toc.empty()) {
         auto metaSec = getSection(1);
         if (metaSec && validateCrc(1, metaSec->first)) {
@@ -539,6 +566,7 @@ static bool readSnapshotFile(const std::string& path,
     const auto dvSec = getSection(9);
     const auto annSec = getSection(11);
     const auto imageSec = getSection(10);
+    const auto tombSec = getSection(12);
 
     std::string termDictDecoded;
     std::string postingsDecoded;
@@ -659,6 +687,24 @@ static bool readSnapshotFile(const std::string& path,
                     outChunk.annBuckets = annj["buckets"].get<std::vector<std::vector<uint32_t>>>();
                 }
             }
+        }
+    }
+
+    // Tombstones
+    if (tombSec && validateCrc(12, tombSec->first)) {
+        std::string tombDecoded;
+        std::string_view tombView;
+        if (tombSec->second == static_cast<uint16_t>(SectionEncoding::Raw)) {
+            tombDecoded.assign(tombSec->first.begin(), tombSec->first.end());
+        } else {
+            if (!maybeDecompress(tombSec->first, tombSec->second, tombDecoded)) return false;
+        }
+        tombView = std::string_view(tombDecoded);
+        size_t tc = 0;
+        while (tc + sizeof(uint32_t) <= tombView.size()) {
+            uint32_t id{};
+            if (!readLE(tombView, tc, id)) break;
+            outChunk.tombstones.push_back(id);
         }
     }
 
@@ -785,6 +831,11 @@ void WalWriter::reset() {
         truncStream.close();
         offset = 0;
         pendingBytes = 0;
+        // ensure truncation persisted
+        truncStream.open(path, std::ios::binary | std::ios::app);
+        if (truncStream) {
+            flushAndSync(truncStream);
+        }
     }
 }
 
@@ -1673,6 +1724,7 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const Processed
     }
     rebuildSkipPointers(idx);
     idx.annDirty = true;
+    idx.tombstones.erase(assignId);
     ++idx.opsSinceFlush;
     return assignId;
 }
@@ -1700,6 +1752,7 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
     for (auto& imgField : idx.imageValues) {
         imgField.second.erase(id);
     }
+    idx.tombstones.insert(id);
     if (logWal) {
         if (!idx.wal.stream.is_open() && !idx.wal.path.empty()) {
             idx.wal.open();
@@ -1741,6 +1794,11 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         {"bool", idx.boolValues},
         {"strings", idx.stringLists}
     };
+    chunk.tombstones.assign(idx.tombstones.begin(), idx.tombstones.end());
+    // include persisted deletes bitmap
+    if (!idx.persistedDeletes.empty()) {
+        chunk.tombstones.insert(chunk.tombstones.end(), idx.persistedDeletes.begin(), idx.persistedDeletes.end());
+    }
     chunk.annCentroids = idx.annCentroids;
     chunk.annBuckets = idx.annBuckets;
     for (const auto& field : idx.imageValues) {
@@ -1778,6 +1836,7 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         idx.wal.reset();
         idx.wal.open();
         idx.opsSinceFlush = 0;
+        idx.tombstones.clear();
         writeManifest();
         idx.manifestDirty = false;
         manifestDirty_.store(false, std::memory_order_relaxed);
@@ -1800,6 +1859,7 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         {"bool", idx.boolValues},
         {"strings", idx.stringLists}
     };
+    chunk.tombstones.assign(idx.tombstones.begin(), idx.tombstones.end());
     chunk.annCentroids = idx.annCentroids;
     chunk.annBuckets = idx.annBuckets;
     for (const auto& field : idx.imageValues) {
@@ -1838,6 +1898,8 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     idx.wal.reset();
     idx.wal.open();
     idx.opsSinceFlush = 0;
+    idx.persistedDeletes.clear();
+    idx.tombstones.clear();
     writeManifest();
     idx.manifestDirty = false;
     manifestDirty_.store(false, std::memory_order_relaxed);
@@ -1865,7 +1927,7 @@ void BlackBox::writeManifest() const {
     {
         std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
         out << manifest.dump(2);
-        out.flush();
+        flushAndSync(out);
     }
     std::error_code ec;
     fs::remove(manifestPath, ec);
@@ -2123,6 +2185,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                     }
                 }
             }
+            for (auto id : chunk.tombstones) state.tombstones.insert(id);
             // Record segments metadata from manifest (fall back to deriving id range if absent)
             if ((minId == 0 || maxId == 0) && !chunk.docs.empty()) {
                 uint32_t derivedMin = std::numeric_limits<uint32_t>::max();
@@ -2143,6 +2206,13 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             maxWalPos = std::max(maxWalPos, walPos);
         }
 
+        // Apply tombstones to remove any resurrected docs/postings
+        if (!state.tombstones.empty()) {
+            for (auto id : state.tombstones) {
+                applyDelete(state, id, false);
+            }
+        }
+
         // Ensure postings are sorted/unique
         for (auto& termEntry : state.invertedIndex) {
             auto& vec = termEntry.second;
@@ -2158,16 +2228,21 @@ bool BlackBox::loadSnapshot(const std::string& path) {
 
         refreshAverages(state);
         // init WAL
-        if (!dataDir_.empty()) {
-            state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
-            state.wal.flushThresholdBytes = walFlushBytes_;
-            state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
-            state.wal.open();
-            replayWal(state, maxWalPos);
-        }
-        indexes_[name] = std::move(state);
-        std::cerr << "BlackBox: loaded index " << name << " segments=" << segments.size() << "\n";
+    if (!dataDir_.empty()) {
+        state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
+        state.wal.flushThresholdBytes = walFlushBytes_;
+        state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
+        state.wal.open();
+        replayWal(state, maxWalPos);
     }
+    // apply persisted deletes bitmap if present
+    if (!state.tombstones.empty()) {
+        for (auto id : state.tombstones) state.persistedDeletes.insert(id);
+        for (auto id : state.tombstones) applyDelete(state, id, false);
+    }
+    indexes_[name] = std::move(state);
+    std::cerr << "BlackBox: loaded index " << name << " segments=" << segments.size() << "\n";
+}
     return true;
 }
 
@@ -2389,12 +2464,12 @@ void BlackBox::startMaintenance() {
                     it->second.manifestDirty = false;
                 }
             }
-            if (needManifest) {
-                std::shared_lock<std::shared_mutex> lk(mutex_);
-                writeManifest();
-                manifestDirty_.store(false, std::memory_order_relaxed);
-                for (auto& kv : indexes_) kv.second.manifestDirty = false;
-            }
+    if (needManifest) {
+        std::unique_lock<std::shared_mutex> lk(mutex_);
+        writeManifest();
+        manifestDirty_.store(false, std::memory_order_relaxed);
+        for (auto& kv : indexes_) kv.second.manifestDirty = false;
+    }
             {
                 std::shared_lock<std::shared_mutex> lk(mutex_);
                 for (auto& kv : indexes_) {
