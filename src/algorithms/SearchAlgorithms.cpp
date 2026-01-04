@@ -170,6 +170,42 @@ std::vector<SearchHit> searchBm25(const SearchContext& ctx, const std::vector<st
     return hits;
 }
 
+std::vector<SearchHit> searchBm25Or(const SearchContext& ctx, const std::vector<std::string>& terms, size_t maxResults) {
+    if (terms.empty()) return {};
+    const double k1 = 1.5;
+    const double b = 0.75;
+    const double avgLen = ctx.avgDocLen > 0 ? ctx.avgDocLen : 1.0;
+    const double N = static_cast<double>(ctx.docs.size());
+    if (N == 0) return {};
+
+    std::unordered_map<uint32_t, double> scores;
+    for (const auto& term : terms) {
+        auto it = ctx.index.find(term);
+        if (it == ctx.index.end()) continue;
+        const auto& plist = it->second;
+        const double df = static_cast<double>(plist.size());
+        const double idf = std::log((N - df + 0.5) / (df + 0.5) + 1.0);
+        for (const auto& p : plist) {
+            const double tf = static_cast<double>(p.tf);
+            auto dlIt = ctx.docLengths.find(p.id);
+            const double dl = dlIt != ctx.docLengths.end() ? static_cast<double>(dlIt->second) : 1.0;
+            const double denom = tf + k1 * (1.0 - b + b * (dl / avgLen));
+            const double score = idf * (tf * (k1 + 1.0)) / denom;
+            scores[p.id] += score;
+        }
+    }
+
+    std::vector<SearchHit> hits;
+    hits.reserve(scores.size());
+    for (const auto& kv : scores) hits.push_back({kv.first, kv.second});
+    std::sort(hits.begin(), hits.end(), [](const SearchHit& a, const SearchHit& b) {
+        if (a.score == b.score) return a.id < b.id;
+        return a.score > b.score;
+    });
+    if (hits.size() > maxResults) hits.resize(maxResults);
+    return hits;
+}
+
 int editDistance(const std::string& a, const std::string& b, int maxCost) {
     const int n = static_cast<int>(a.size());
     const int m = static_cast<int>(b.size());
@@ -197,12 +233,17 @@ std::vector<SearchHit> searchFuzzy(const SearchContext& ctx, const std::vector<s
     std::vector<std::string> expandedTerms;
     expandedTerms.reserve(ctx.index.size());
 
+    constexpr size_t kMaxFuzzyExpansions = 2000;
+    size_t expansions = 0;
     for (const auto& term : terms) {
         for (const auto& entry : ctx.index) {
+            if (expansions >= kMaxFuzzyExpansions) break;
             if (editDistance(term, entry.first, maxEditDistance) <= maxEditDistance) {
                 expandedTerms.push_back(entry.first);
+                ++expansions;
             }
         }
+        if (expansions >= kMaxFuzzyExpansions) break;
     }
     if (expandedTerms.empty()) return {};
     return searchBm25(ctx, expandedTerms, maxResults);

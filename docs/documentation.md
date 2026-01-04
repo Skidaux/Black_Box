@@ -47,6 +47,7 @@ Schema extensions:
 - `GET /v1/{index}/search`
   - Common params: `q` (query text), `mode` (`bm25`, `lexical`, `fuzzy`, `semantic`, `hybrid`, `vector`), `from`, `size`.
   - Fuzzy: `distance` (max edit distance).
+  - OR mode: `mode=or`/`bm25_or` computes BM25 across the union of query terms (not just intersection).
   - Hybrid: `w_bm25`, `w_semantic`, `w_lexical` weights.
   - Vector: `mode=vector`, `vec=comma,separated,floats` (provide `q` placeholder if required by clients).
   - Relations: `include_relations=inline|hierarchy|none` (default `none`) and `max_relation_depth` (default `1`).
@@ -92,6 +93,7 @@ Environment variables:
 - `BLACKBOX_COMPRESS` – `1/true/on` to compress snapshot sections (default on).
 - `BLACKBOX_AUTO_SNAPSHOT` – `1/true/on` to snapshot after each write (default off).
 - `BLACKBOX_ANN_CLUSTERS` – default coarse vector clusters (default 8).
+- `BLACKBOX_ANN_PROBES` – number of ANN centroids to probe per query (default 2).
 - `BLACKBOX_WAL_FLUSH_BYTES` / `BLACKBOX_WAL_FLUSH_MS` – thresholds for WAL flush (defaults 64KB / 200ms).
 - `BLACKBOX_WAL_FSYNC` – `1/true/on` to fsync WAL on flush (default on).
 - `BLACKBOX_MAX_BODY_KB` – max HTTP request body size (default 1024 KB).

@@ -935,6 +935,9 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envAnn = std::getenv("BLACKBOX_ANN_CLUSTERS")) {
         try { defaultAnnClusters_ = static_cast<uint32_t>(std::max<uint64_t>(1, std::stoull(envAnn))); } catch (...) {}
     }
+    if (const char* envAnnProbes = std::getenv("BLACKBOX_ANN_PROBES")) {
+        try { defaultAnnProbes_ = static_cast<uint32_t>(std::max<uint64_t>(1, std::stoull(envAnnProbes))); } catch (...) {}
+    }
     if (const char* envMerge = std::getenv("BLACKBOX_MERGE_SEGMENTS")) {
         try { mergeSegmentsAt_ = std::max<size_t>(1, static_cast<size_t>(std::stoull(envMerge))); } catch (...) {}
     }
@@ -1006,6 +1009,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     indexes_[name].schema = schema;
     indexes_[name].annClusters = defaultAnnClusters_;
     indexes_[name].annClusters = defaultAnnClusters_;
+    indexes_[name].annProbes = defaultAnnProbes_;
     configureSchema(indexes_[name]);
     persistSchema(name, indexes_[name]);
     // init WAL
@@ -1198,6 +1202,7 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
     if (terms.empty()) return {};
     algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen, &idx.skipPointers};
     if (mode == "lexical") return algo::searchLexical(ctx, terms);
+    if (mode == "or" || mode == "bm25_or") return algo::searchBm25Or(ctx, terms, maxResults);
     if (mode == "fuzzy") return algo::searchFuzzy(ctx, terms, maxEditDistance, maxResults);
     if (mode == "semantic" || mode == "vector" || mode == "tfidf") {
         auto hits = algo::searchSemantic(ctx, terms, maxResults);
@@ -1270,30 +1275,36 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
         hits.push_back({docId, score});
     };
 
-    // ANN: probe closest centroids then brute within buckets
+    // ANN: probe multiple closest centroids then fallback to brute if needed
     if (!idx.annCentroids.empty() && !idx.annBuckets.empty()) {
-        double best1 = -1e9, best2 = -1e9;
-        size_t c1 = 0, c2 = 0;
+        size_t probes = std::max<size_t>(1, std::min<size_t>(idx.annCentroids.size(), idx.annProbes));
+        std::vector<std::pair<size_t, double>> scored;
+        scored.reserve(idx.annCentroids.size());
         for (size_t c = 0; c < idx.annCentroids.size(); ++c) {
             double s = dot(idx.annCentroids[c], queryVec);
-            if (s > best1) { best2 = best1; c2 = c1; best1 = s; c1 = c; }
-            else if (s > best2) { best2 = s; c2 = c; }
+            scored.push_back({c, s});
         }
+        std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+            if (a.second == b.second) return a.first < b.first;
+            return a.second > b.second;
+        });
         std::unordered_set<uint32_t> visited;
-        auto probe = [&](size_t bucketIdx) {
-            if (bucketIdx >= idx.annBuckets.size()) return;
+        for (size_t i = 0; i < probes && i < scored.size(); ++i) {
+            size_t bucketIdx = scored[i].first;
+            if (bucketIdx >= idx.annBuckets.size()) continue;
             for (auto docId : idx.annBuckets[bucketIdx]) {
                 if (!visited.insert(docId).second) continue;
                 auto itv = idx.vectors.find(docId);
                 if (itv == idx.vectors.end()) continue;
                 scoreDoc(docId, itv->second);
             }
-        };
-        probe(c1);
-        if (idx.annBuckets.size() > 1) probe(c2);
-        // fallback to ensure some results
-        if (hits.empty()) {
-            for (const auto& kv : idx.vectors) scoreDoc(kv.first, kv.second);
+        }
+        if (hits.size() < maxResults) {
+            for (const auto& kv : idx.vectors) {
+                if (visited.insert(kv.first).second) {
+                    scoreDoc(kv.first, kv.second);
+                }
+            }
         }
     } else {
         for (const auto& kv : idx.vectors) scoreDoc(kv.first, kv.second);
@@ -2048,7 +2059,8 @@ bool BlackBox::writeManifest() const {
             {"name", entry.first},
             {"segments", segs},
             {"schema", entry.second.schema.schema},
-            {"ann_clusters", entry.second.annClusters}
+            {"ann_clusters", entry.second.annClusters},
+            {"ann_probes", entry.second.annProbes}
         });
     }
     fs::path tmpPath = manifestPath;
@@ -2176,7 +2188,8 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
             {"name", name},
             {"segments", segs},
             {"schema", idx.schema.schema},
-            {"ann_clusters", idx.annClusters}
+            {"ann_clusters", idx.annClusters},
+            {"ann_probes", idx.annProbes}
         });
     }
     std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
@@ -2222,6 +2235,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
 
         IndexState state;
         state.annClusters = idxJson.value("ann_clusters", defaultAnnClusters_);
+        state.annProbes = idxJson.value("ann_probes", defaultAnnProbes_);
         state.schema.schema = idxJson.value("schema", json::object());
         configureSchema(state);
 
@@ -2381,6 +2395,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         state.wal.enableFsync = walFsyncEnabled_;
         state.wal.open();
         replayWal(state, maxWalPos);
+        if (state.annProbes == 0) state.annProbes = defaultAnnProbes_;
     }
     // apply persisted deletes bitmap if present
     if (!state.tombstones.empty()) {
@@ -2426,6 +2441,7 @@ void BlackBox::loadWalOnly() {
         state.wal.enableFsync = walFsyncEnabled_;
         state.wal.open();
         replayWal(state);
+        state.annProbes = defaultAnnProbes_;
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: built index " << name << " from WAL\n";
     }

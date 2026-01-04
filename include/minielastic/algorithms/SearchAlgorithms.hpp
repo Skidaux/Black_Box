@@ -32,6 +32,7 @@ struct SearchContext {
 
 std::vector<SearchHit> searchLexical(const SearchContext& ctx, const std::vector<std::string>& terms);
 std::vector<SearchHit> searchBm25(const SearchContext& ctx, const std::vector<std::string>& terms, size_t maxResults);
+std::vector<SearchHit> searchBm25Or(const SearchContext& ctx, const std::vector<std::string>& terms, size_t maxResults);
 std::vector<SearchHit> searchFuzzy(const SearchContext& ctx, const std::vector<std::string>& terms, int maxEditDistance, size_t maxResults);
 std::vector<SearchHit> searchSemantic(const SearchContext& ctx, const std::vector<std::string>& terms, size_t maxResults);
 

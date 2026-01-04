@@ -208,6 +208,7 @@ private:
         std::unordered_set<DocId> tombstones;
         std::unordered_set<DocId> persistedDeletes; // delete bitmap persisted in segment
         std::shared_ptr<std::mutex> mtx = std::make_shared<std::mutex>(); // per-index lock
+        uint32_t annProbes = 2;
     };
 
     std::string dataDir_;
@@ -217,6 +218,7 @@ private:
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
+    uint32_t defaultAnnProbes_ = 2;
     uint64_t walFlushBytes_ = 64 * 1024;
     uint64_t walFlushMs_ = 200;
     bool walFsyncEnabled_ = true;
