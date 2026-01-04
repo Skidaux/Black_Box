@@ -402,6 +402,18 @@ void BlackBoxHttpServer::setupRoutes() {
     // --- BULK INDEX ---
     server_.Post(R"(/v1/([^/]+)/_bulk)", [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];
+        if (!db_.indexExists(index)) {
+            res.status = 404;
+            res.set_content(err(404, "Index not found").dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        if (db_.shouldBackpressure(index)) {
+            res.status = 429;
+            res.set_content(err(429, "Backpressure: flush backlog, retry later").dump(), "application/json");
+            addCors(res);
+            return;
+        }
         if (!isJsonContent(req)) {
             res.status = 415;
             res.set_content(err(415, "Content-Type must be application/json").dump(), "application/json");

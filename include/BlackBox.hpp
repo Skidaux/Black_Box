@@ -163,6 +163,7 @@ public:
     std::optional<nlohmann::json> getCustomApi(const std::string& name) const;
     nlohmann::json listCustomApis() const;
     nlohmann::json runCustomApi(const std::string& name, const nlohmann::json& params) const;
+    bool shouldBackpressure(const std::string& index) const;
 
 private:
     struct ImageBlob { std::string format; std::string data; };
@@ -209,11 +210,15 @@ private:
         std::unordered_set<DocId> persistedDeletes; // delete bitmap persisted in segment
         std::shared_ptr<std::mutex> mtx = std::make_shared<std::mutex>(); // per-index lock
         uint32_t annProbes = 2;
+        uint64_t lastFlushedWalOffset = 0;
+        std::chrono::steady_clock::time_point lastFlushAt = std::chrono::steady_clock::now();
     };
 
     std::string dataDir_;
     mutable std::shared_mutex mutex_; // protects indexes_ map and custom APIs
     size_t flushEveryDocs_ = 5000;
+    uint64_t flushEveryMs_ = 0;
+    uint64_t flushWalBytesThreshold_ = 8 * 1024 * 1024;
     size_t mergeSegmentsAt_ = 10;
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;

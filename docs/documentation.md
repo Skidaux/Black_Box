@@ -34,6 +34,7 @@ Base URL: `http://127.0.0.1:8080`
 ## Documents
 - `POST /v1/{index}/doc` – index a document (Content-Type: application/json). Returns `id` and, when configured, `doc_id` (custom identifier derived from schema). Image fields use `{ "content": "<base64>", "format": "png", "encoding": "base64" }`; the server stores raw binary and enforces `max_kb` limits.
 - `POST /v1/{index}/_bulk` – bulk index; body is an array or `{ "docs": [...] }`. Supports `continue_on_error=true|false` (default true). Returns `indexed`, `ids`, and `errors`.
+  - May return `429 Backpressure` when in-memory backlog exceeds flush thresholds; retry after a short delay.
 - `GET /v1/{index}/doc/{id}` – fetch a document by auto-increment ID or custom ID.
 - `PUT /v1/{index}/doc/{id}` – replace a document (accepts either ID form).
 - `PATCH /v1/{index}/doc/{id}` – partial update (merge fields).
@@ -89,6 +90,8 @@ Response shape (example):
 ## Configuration / Tunables
 Environment variables:
 - `BLACKBOX_FLUSH_DOCS` – number of ops before forcing WAL→segment flush (default 5000).
+- `BLACKBOX_FLUSH_MS` – max time between segment flushes (0 disables).
+- `BLACKBOX_FLUSH_WAL_BYTES` – WAL growth that triggers a segment flush (default 8 MB).
 - `BLACKBOX_MERGE_SEGMENTS` – max segments before auto-merge into one (default 10).
 - `BLACKBOX_COMPRESS` – `1/true/on` to compress snapshot sections (default on).
 - `BLACKBOX_AUTO_SNAPSHOT` – `1/true/on` to snapshot after each write (default off).

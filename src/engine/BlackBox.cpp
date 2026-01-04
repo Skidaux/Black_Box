@@ -951,6 +951,18 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
         std::string v(envWalFsync);
         walFsyncEnabled_ = !(v == "0" || v == "false" || v == "off");
     }
+    if (const char* envFlushMs = std::getenv("BLACKBOX_FLUSH_MS")) {
+        try { flushEveryMs_ = std::stoull(envFlushMs); } catch (...) {}
+    }
+    if (const char* envFlushWal = std::getenv("BLACKBOX_FLUSH_WAL_BYTES")) {
+        try { flushWalBytesThreshold_ = std::max<uint64_t>(1024 * 1024, std::stoull(envFlushWal)); } catch (...) {}
+    }
+    if (const char* envFlushMs = std::getenv("BLACKBOX_FLUSH_MS")) {
+        try { flushEveryMs_ = std::stoull(envFlushMs); } catch (...) {}
+    }
+    if (const char* envFlushWal = std::getenv("BLACKBOX_FLUSH_WAL_BYTES")) {
+        try { flushWalBytesThreshold_ = std::max<uint64_t>(1024 * 1024, std::stoull(envFlushWal)); } catch (...) {}
+    }
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -1010,6 +1022,8 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     indexes_[name].annClusters = defaultAnnClusters_;
     indexes_[name].annClusters = defaultAnnClusters_;
     indexes_[name].annProbes = defaultAnnProbes_;
+    indexes_[name].lastFlushAt = std::chrono::steady_clock::now();
+    indexes_[name].lastFlushedWalOffset = 0;
     configureSchema(indexes_[name]);
     persistSchema(name, indexes_[name]);
     // init WAL
@@ -1358,6 +1372,8 @@ nlohmann::json BlackBox::config() const {
     json j{
         {"data_dir", dataDir_},
         {"flush_every_docs", flushEveryDocs_},
+        {"flush_every_ms", flushEveryMs_},
+        {"flush_wal_bytes", flushWalBytesThreshold_},
         {"merge_segments_at", mergeSegmentsAt_},
         {"compress_snapshots", compressSnapshots_},
         {"auto_snapshot", autoSnapshot_},
@@ -1872,8 +1888,12 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
 }
 
 void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
-    if (flushEveryDocs_ == 0) return;
-    if (idx.opsSinceFlush < flushEveryDocs_) return;
+    auto now = std::chrono::steady_clock::now();
+    bool triggerOps = flushEveryDocs_ > 0 && idx.opsSinceFlush >= flushEveryDocs_;
+    uint64_t walSince = idx.wal.offset >= idx.lastFlushedWalOffset ? idx.wal.offset - idx.lastFlushedWalOffset : 0;
+    bool triggerWal = flushWalBytesThreshold_ > 0 && walSince >= flushWalBytesThreshold_;
+    bool triggerTime = flushEveryMs_ > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(now - idx.lastFlushAt).count() >= static_cast<long long>(flushEveryMs_);
+    if (!triggerOps && !triggerWal && !triggerTime) return;
     // build a new segment for the index and write manifest
     namespace fs = std::filesystem;
     if (dataDir_.empty()) return;
@@ -1938,6 +1958,8 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
     idx.persistedDeletes.insert(meta.deletes.begin(), meta.deletes.end());
     idx.tombstones.clear();
     idx.opsSinceFlush = 0;
+    idx.lastFlushedWalOffset = idx.wal.offset;
+    idx.lastFlushAt = now;
     idx.manifestDirty = false;
     manifestDirty_.store(false, std::memory_order_relaxed);
 
@@ -2032,6 +2054,8 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     }
     idx.wal.reset();
     idx.wal.open();
+    idx.lastFlushedWalOffset = idx.wal.offset;
+    idx.lastFlushAt = std::chrono::steady_clock::now();
     // delete old segment files
     for (const auto& seg : oldSegments) {
         fs::path p = fs::path(dataDir_) / seg.file;
@@ -2388,20 +2412,22 @@ bool BlackBox::loadSnapshot(const std::string& path) {
 
         refreshAverages(state);
         // init WAL
-    if (!dataDir_.empty()) {
-        state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
-        state.wal.flushThresholdBytes = walFlushBytes_;
-        state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
-        state.wal.enableFsync = walFsyncEnabled_;
-        state.wal.open();
-        replayWal(state, maxWalPos);
-        if (state.annProbes == 0) state.annProbes = defaultAnnProbes_;
-    }
-    // apply persisted deletes bitmap if present
-    if (!state.tombstones.empty()) {
-        for (auto id : state.tombstones) state.persistedDeletes.insert(id);
-        for (auto id : state.tombstones) applyDelete(state, id, false);
-    }
+        if (!dataDir_.empty()) {
+            state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
+            state.wal.flushThresholdBytes = walFlushBytes_;
+            state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
+            state.wal.enableFsync = walFsyncEnabled_;
+            state.wal.open();
+            replayWal(state, maxWalPos);
+            if (state.annProbes == 0) state.annProbes = defaultAnnProbes_;
+            state.lastFlushedWalOffset = maxWalPos;
+            state.lastFlushAt = std::chrono::steady_clock::now();
+        }
+        // apply persisted deletes bitmap if present
+        if (!state.tombstones.empty()) {
+            for (auto id : state.tombstones) state.persistedDeletes.insert(id);
+            for (auto id : state.tombstones) applyDelete(state, id, false);
+        }
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: loaded index " << name << " segments=" << segments.size() << "\n";
     }
@@ -2441,6 +2467,8 @@ void BlackBox::loadWalOnly() {
         state.wal.enableFsync = walFsyncEnabled_;
         state.wal.open();
         replayWal(state);
+        state.lastFlushedWalOffset = 0;
+        state.lastFlushAt = std::chrono::steady_clock::now();
         state.annProbes = defaultAnnProbes_;
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: built index " << name << " from WAL\n";
@@ -2613,6 +2641,19 @@ json BlackBox::runCustomApi(const std::string& name, const json& params) const {
     return executeCustomApiInternal(name, spec, params);
 }
 
+bool BlackBox::shouldBackpressure(const std::string& index) const {
+    std::shared_lock<std::shared_mutex> lk(mutex_);
+    auto it = indexes_.find(index);
+    if (it == indexes_.end()) return false;
+    const IndexState& idx = it->second;
+    auto now = std::chrono::steady_clock::now();
+    uint64_t walSince = idx.wal.offset >= idx.lastFlushedWalOffset ? idx.wal.offset - idx.lastFlushedWalOffset : 0;
+    bool opBacklog = flushEveryDocs_ > 0 && idx.opsSinceFlush >= flushEveryDocs_ * 2;
+    bool walBacklog = flushWalBytesThreshold_ > 0 && walSince >= flushWalBytesThreshold_ * 2;
+    bool timeBacklog = flushEveryMs_ > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(now - idx.lastFlushAt).count() >= static_cast<long long>(flushEveryMs_ * 2);
+    return opBacklog || walBacklog || timeBacklog;
+}
+
 void BlackBox::loadCustomApis() {
     customApis_.clear();
     if (dataDir_.empty()) return;
@@ -2654,9 +2695,12 @@ void BlackBox::startMaintenance() {
             {
                 std::shared_lock<std::shared_mutex> lk(mutex_);
                 for (const auto& kv : indexes_) {
-                    if (flushEveryDocs_ > 0 && kv.second.opsSinceFlush >= flushEveryDocs_) {
-                        toFlush.push_back(kv.first);
-                    }
+                    auto now = std::chrono::steady_clock::now();
+                    bool triggerOps = flushEveryDocs_ > 0 && kv.second.opsSinceFlush >= flushEveryDocs_;
+                    uint64_t walSince = kv.second.wal.offset >= kv.second.lastFlushedWalOffset ? kv.second.wal.offset - kv.second.lastFlushedWalOffset : 0;
+                    bool triggerWal = flushWalBytesThreshold_ > 0 && walSince >= flushWalBytesThreshold_;
+                    bool triggerTime = flushEveryMs_ > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(now - kv.second.lastFlushAt).count() >= static_cast<long long>(flushEveryMs_);
+                    if (triggerOps || triggerWal || triggerTime) toFlush.push_back(kv.first);
                     if (kv.second.manifestDirty) needManifest = true;
                 }
             }
