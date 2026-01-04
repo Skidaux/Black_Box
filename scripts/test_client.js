@@ -411,11 +411,138 @@ async function runQueryValueTest() {
   }
 }
 
+async function runFullFeatureTest() {
+  const sitesIndex = `sites_${Date.now()}`;
+  const pagesIndex = `pages_${Date.now()}`;
+  const favicon = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mO0dOjYfwAJ7APc6+UeFwAAAABJRU5ErkJggg==";
+  const schemaSites = {
+    fields: {
+      title: "text",
+      body: "text",
+      domain: "text",
+      tags: "array",
+      labels: "array",
+      flag: "bool",
+      priority: "number",
+      vec: { type: "vector", dim: 3 },
+      favicon: { type: "image", max_kb: 4 },
+    },
+    doc_id: { field: "domain", type: "string" },
+  };
+  const schemaPages = {
+    fields: {
+      title: "text",
+      body: "text",
+      tags: "array",
+      labels: "array",
+      flag: "bool",
+      priority: "number",
+      vec: { type: "vector", dim: 3 },
+      version: { type: "number", searchable: false },
+      queries: { type: "query_values", searchable: true },
+    },
+    relation: { field: "site_ref", target_index: sitesIndex },
+  };
+
+  const results = { status: "pending", steps: [] };
+  try {
+    let res = await ensureIndex(sitesIndex, schemaSites);
+    results.steps.push({ step: "create_sites", status: res.status });
+    res = await ensureIndex(pagesIndex, schemaPages);
+    results.steps.push({ step: "create_pages", status: res.status });
+
+    const siteDoc = {
+      domain: "youtube.com",
+      title: "YouTube",
+      body: "Video platform",
+      tags: ["video", "platform"],
+      labels: ["root"],
+      flag: true,
+      priority: 10,
+      vec: [0.9, 0.05, 0.05],
+      favicon: { format: "png", encoding: "base64", content: favicon },
+    };
+    res = await indexDoc(sitesIndex, siteDoc);
+    const siteId = res.data?.data?.id;
+    results.steps.push({ step: "index_site", status: res.status, id: siteId });
+
+    const pageDoc = {
+      title: "YouTube Home",
+      body: "Welcome to YouTube",
+      tags: ["video", "home"],
+      labels: ["landing"],
+      flag: true,
+      priority: 9,
+      vec: [0.85, 0.1, 0.05],
+      version: 1,
+      queries: [{ query: "yt", score: 1.0 }, { query: "youtube", score: 0.9 }],
+      site_ref: { id: "youtube.com", index: sitesIndex },
+    };
+    res = await indexDoc(pagesIndex, pageDoc);
+    const pageId = res.data?.data?.id;
+    results.steps.push({ step: "index_page", status: res.status, id: pageId });
+
+    const altPageDoc = {
+      title: "YouTube About",
+      body: "Learn about YouTube",
+      tags: ["video", "about"],
+      labels: ["info"],
+      flag: false,
+      priority: 5,
+      vec: [0.8, 0.15, 0.05],
+      version: 2,
+      queries: [{ query: "youtube", score: 0.7 }],
+      site_ref: { id: "youtube.com", index: sitesIndex },
+    };
+    const altRes = await indexDoc(pagesIndex, altPageDoc);
+    const altPageId = altRes.data?.data?.id;
+    results.steps.push({ step: "index_page_alt", status: altRes.status, id: altPageId });
+
+    // Search should return the page boosted by query_values and include relation + favicon metadata
+    const search = await runSearch(pagesIndex, {
+      q: "yt",
+      mode: "bm25",
+      include_relations: "inline",
+    });
+    const hits = search.data?.data?.hits ?? [];
+    const top = hits[0] || {};
+    const relFaviconBytes =
+      top.relation && top.relation.doc && top.relation.doc.favicon
+        ? top.relation.doc.favicon.bytes
+        : undefined;
+    results.steps.push({
+      step: "search_pages",
+      status: search.status,
+      topId: top.id,
+      hitsCount: hits.length,
+      hitsFull: hits,
+      relationIndex: top.relation ? top.relation.index : null,
+      faviconBytes: relFaviconBytes,
+    });
+
+    // Stored-match should find the version field even though it's non-searchable
+    const sm = await axios.get(`/v1/${pagesIndex}/stored_match?field=version&value=1`);
+    results.steps.push({ step: "stored_match_version", status: sm.status, hits: sm.data?.data?.hits?.length ?? 0 });
+
+    results.status = "ok";
+    const outPath = path.join(__dirname, "full_feature_results.json");
+    fs.writeFileSync(outPath, JSON.stringify(results, null, 2), "utf8");
+    console.log(`Full feature test results written to ${outPath}`);
+  } catch (e) {
+    results.status = "error";
+    results.error = e.message;
+    console.error("Full feature test failed:", e);
+  }
+}
+
 async function runDurability() {
   const testIndex = `durability_${Date.now()}`;
+  const relIndex = `durability_rel_${Date.now()}`;
+  const favicon = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mO0dOjYfwAJ7APc6+UeFwAAAABJRU5ErkJggg==";
   const results = {
     timestamp: new Date().toISOString(),
     index: testIndex,
+    relIndex,
     server: serverCmd,
     steps: [],
   };
@@ -426,12 +553,26 @@ async function runDurability() {
     await waitForServer();
     results.steps.push({ step: "server_start", status: "ok" });
     await ensureIndex(testIndex, {
-      fields: { title: "text", body: "text", vec: { type: "vector", dim: 3 } },
+      fields: {
+        title: "text",
+        body: "text",
+        vec: { type: "vector", dim: 3 },
+        version: { type: "number", searchable: false },
+      },
+    });
+    await ensureIndex(relIndex, {
+      fields: {
+        title: "text",
+        favicon: { type: "image", max_kb: 4 },
+        domain: "text",
+      },
+      doc_id: { field: "domain", type: "string" },
     });
     const doc = {
       title: "durable",
       body: "persist across restarts",
       vec: [0.5, 0.1, 0.3],
+      version: 1,
     };
     const inserted = await indexDoc(testIndex, doc);
     const docId =
@@ -448,6 +589,19 @@ async function runDurability() {
       id: docId,
       status: inserted.status,
     });
+
+    // Update document to test persistence of updates
+    const patchRes = await patchDoc(testIndex, docId, { body: "persist updated", version: 2 });
+    results.steps.push({ step: "patch_doc", status: patchRes.status });
+
+    // Index related doc with image + custom id
+    const relRes = await indexDoc(relIndex, {
+      title: "Site Root",
+      domain: "example.com",
+      favicon: { format: "png", encoding: "base64", content: favicon },
+    });
+    const relId = relRes.data?.data?.id;
+    results.steps.push({ step: "index_rel_doc", status: relRes.status, id: relId });
 
     // Force snapshot so data is persisted beyond WAL for tiny workloads
     try {
@@ -479,6 +633,12 @@ async function runDurability() {
       step: "search_after_restart",
       status: search.status,
       hits: search.data?.data?.hits?.length ?? 0,
+    });
+    const relFetch = await axios.get(`/v1/${relIndex}/doc/example.com`);
+    results.steps.push({
+      step: "fetch_rel_after_restart",
+      status: relFetch.status,
+      payload: relFetch.data,
     });
 
     // Delete and ensure tombstone survives restart
@@ -633,11 +793,12 @@ function promptMenu() {
   });
   return new Promise((resolve) => {
     console.log("Select a test to run:");
-  console.log("  1) Benchmark (multi-index, bulk, searches)");
-  console.log("  2) Durability (restart and verify persistence)");
-  console.log("  3) Stress (bulk spam until limit)");
-  console.log("  4) Query-values / non-searchable fields");
-  rl.question("Enter choice [1-4]: ", (answer) => {
+    console.log("  1) Benchmark (multi-index, bulk, searches)");
+    console.log("  2) Durability (restart and verify persistence)");
+    console.log("  3) Stress (bulk spam until limit)");
+    console.log("  4) Query-values / non-searchable fields");
+    console.log("  5) Full relations + images + query_values");
+    rl.question("Enter choice [1-5]: ", (answer) => {
       rl.close();
       resolve(answer.trim());
     });
@@ -672,6 +833,8 @@ async function main() {
     await runStress(maxDocs, concurrency, batchSize);
   } else if (choice === "4") {
     await runQueryValueTest();
+  } else if (choice === "5") {
+    await runFullFeatureTest();
   } else {
     console.log("Invalid choice.");
     process.exit(1);
