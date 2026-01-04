@@ -21,6 +21,12 @@ using json = nlohmann::json;
 
 BlackBoxHttpServer::BlackBoxHttpServer(std::string host, int port, std::string dataDir)
     : host_(std::move(host)), port_(port), db_(dataDir), dataDir_(std::move(dataDir)), startTime_(std::chrono::steady_clock::now()) {
+    // Cap request bodies to avoid unbounded memory usage
+    size_t maxBodyKB = 1024;
+    if (const char* env = std::getenv("BLACKBOX_MAX_BODY_KB")) {
+        try { maxBodyKB = std::max<size_t>(1, static_cast<size_t>(std::stoull(env))); } catch (...) {}
+    }
+    server_.set_payload_max_length(maxBodyKB * 1024);
     setupRoutes();
 }
 

@@ -92,7 +92,6 @@ bool walReadLE(std::istream& in, T& value) {
 static void flushAndSync(std::ofstream& stream) {
     if (!stream.is_open()) return;
     stream.flush();
-    // NOTE: portable fsync is non-trivial in MSVC; this is a best-effort flush.
 }
 
 enum class SectionEncoding : uint16_t { Raw = 0, Zstd = 1 };
@@ -192,6 +191,8 @@ static bool maybeDecompress(std::string_view in, uint16_t encoding, std::string&
     std::cerr << "Snapshot: unsupported encoding=" << encoding << "\n";
     return false;
 }
+
+static void flushFilePath(const std::string& path);
 
 static bool writeSnapshotFile(const std::string& path,
                               const SnapshotChunk& chunk,
@@ -410,6 +411,7 @@ static bool writeSnapshotFile(const std::string& path,
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(file.data(), static_cast<std::streamsize>(file.size()));
     flushAndSync(out);
+    flushFilePath(path);
     return static_cast<bool>(out);
 }
 
@@ -809,7 +811,7 @@ void WalWriter::maybeFlush(bool force) {
         }
     }
     stream.flush();
-    flushFilePath(path);
+    if (enableFsync) flushFilePath(path);
     pendingBytes = 0;
     lastFlush = now;
 }
@@ -942,6 +944,10 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envWalMs = std::getenv("BLACKBOX_WAL_FLUSH_MS")) {
         try { walFlushMs_ = std::max<uint64_t>(10, std::stoull(envWalMs)); } catch (...) {}
     }
+    if (const char* envWalFsync = std::getenv("BLACKBOX_WAL_FSYNC")) {
+        std::string v(envWalFsync);
+        walFsyncEnabled_ = !(v == "0" || v == "false" || v == "off");
+    }
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -964,6 +970,7 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
             }
             kv.second.wal.flushThresholdBytes = walFlushBytes_;
             kv.second.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
+            kv.second.wal.enableFsync = walFsyncEnabled_;
             if (!kv.second.wal.stream.is_open()) {
                 kv.second.wal.open();
             }
@@ -1006,6 +1013,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
         indexes_[name].wal.path = (std::filesystem::path(dataDir_) / (name + ".wal")).string();
         indexes_[name].wal.flushThresholdBytes = walFlushBytes_;
         indexes_[name].wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
+        indexes_[name].wal.enableFsync = walFsyncEnabled_;
         indexes_[name].wal.reset();
         indexes_[name].wal.open();
         indexes_[name].manifestDirty = true;
@@ -2057,6 +2065,7 @@ bool BlackBox::writeManifest() const {
         std::cerr << "BlackBox: failed to replace manifest at " << manifestPath << " err=" << ec.message() << "\n";
         return false;
     }
+    flushFilePath(manifestPath.string());
     return true;
 }
 
@@ -2369,6 +2378,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
         state.wal.flushThresholdBytes = walFlushBytes_;
         state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
+        state.wal.enableFsync = walFsyncEnabled_;
         state.wal.open();
         replayWal(state, maxWalPos);
     }
@@ -2413,6 +2423,7 @@ void BlackBox::loadWalOnly() {
         state.wal.path = path.string();
         state.wal.flushThresholdBytes = walFlushBytes_;
         state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
+        state.wal.enableFsync = walFsyncEnabled_;
         state.wal.open();
         replayWal(state);
         indexes_[name] = std::move(state);

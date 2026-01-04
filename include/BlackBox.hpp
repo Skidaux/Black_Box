@@ -58,6 +58,7 @@ inline void readLE(std::istream& in, T& value) {
         uint64_t flushThresholdBytes = 64 * 1024;
         std::chrono::steady_clock::time_point lastFlush = std::chrono::steady_clock::now();
         std::chrono::milliseconds flushInterval{200};
+        bool enableFsync = true;
 
         WalWriter() = default;
         explicit WalWriter(std::string p) : path(std::move(p)) {}
@@ -218,6 +219,7 @@ private:
     uint32_t defaultAnnClusters_ = 8;
     uint64_t walFlushBytes_ = 64 * 1024;
     uint64_t walFlushMs_ = 200;
+    bool walFsyncEnabled_ = true;
     std::atomic<bool> manifestDirty_{false};
     std::thread maintenanceThread_;
     std::atomic<bool> stopMaintenance_{false};
