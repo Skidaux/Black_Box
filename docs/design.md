@@ -17,7 +17,7 @@
 
 - Append-only WAL for durability and crash recovery with per-record CRC32.
 - Manifest file (`data/index.manifest`) tracks active segments, next ID, and settings; writes are fsynced before old segments are deleted. Segment flush triggers include op count, time (`BLACKBOX_FLUSH_MS`), and WAL growth (`BLACKBOX_FLUSH_WAL_BYTES`) to bound in-memory backlog; bulk endpoints can 429 when backpressure is active.
-- Segment files (`*.skd`) contain docs, postings, doc-values, vectors, images, ANN metadata, and tombstones; sections are checksummed and optionally compressed.
+- Segment files (`*.skd`) contain docs, postings, doc-values, vectors, images, ANN metadata (centroids + HNSW graph with M/ef_search), and tombstones; sections are checksummed and optionally compressed.
 - Schema sidecars (`<index>.schema.json`) are persisted so WAL-only recovery retains field settings (doc_id/relation/vector/image).
 - Tombstones recorded in WAL and segment tombstone lists; applied at query time and cleared during merge.
 - Background merge compacts multiple segments into one to keep posting lists short and reclaim deletes.

@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <unordered_set>
+#include <queue>
 #include <cstdlib>
 #include <stdexcept>
 #include <string_view>
@@ -61,6 +62,9 @@ struct SnapshotChunk {
     json docValues; // numeric, bool, string lists
     std::vector<std::vector<float>> annCentroids;
     std::vector<std::vector<uint32_t>> annBuckets;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> annGraph;
+    uint32_t annM = 16;
+    uint32_t annEfSearch = 64;
     std::vector<uint32_t> tombstones;
     struct SnapshotImage {
         std::string format;
@@ -314,7 +318,10 @@ static bool writeSnapshotFile(const std::string& path,
     // Section 11: ANN (centroids + bucket docIds) stored as JSON
     Section annSec = makeSection(11, json{
         {"centroids", chunk.annCentroids},
-        {"buckets", chunk.annBuckets}
+        {"buckets", chunk.annBuckets},
+        {"graph", chunk.annGraph},
+        {"m", chunk.annM},
+        {"ef_search", chunk.annEfSearch}
     }.dump(), compressSections);
 
     // Section 12: tombstones (doc ids)
@@ -716,6 +723,19 @@ static bool readSnapshotFile(const std::string& path,
                 if (annj.contains("buckets") && annj["buckets"].is_array()) {
                     outChunk.annBuckets = annj["buckets"].get<std::vector<std::vector<uint32_t>>>();
                 }
+                if (annj.contains("graph") && annj["graph"].is_object()) {
+                    for (auto it = annj["graph"].begin(); it != annj["graph"].end(); ++it) {
+                        if (!it.value().is_array()) continue;
+                        uint32_t id = static_cast<uint32_t>(std::stoul(it.key()));
+                        outChunk.annGraph[id] = it.value().get<std::vector<uint32_t>>();
+                    }
+                }
+                if (annj.contains("m") && annj["m"].is_number_unsigned()) {
+                    outChunk.annM = annj["m"].get<uint32_t>();
+                }
+                if (annj.contains("ef_search") && annj["ef_search"].is_number_unsigned()) {
+                    outChunk.annEfSearch = annj["ef_search"].get<uint32_t>();
+                }
             }
         }
     }
@@ -938,6 +958,12 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envAnnProbes = std::getenv("BLACKBOX_ANN_PROBES")) {
         try { defaultAnnProbes_ = static_cast<uint32_t>(std::max<uint64_t>(1, std::stoull(envAnnProbes))); } catch (...) {}
     }
+    if (const char* envAnnM = std::getenv("BLACKBOX_ANN_M")) {
+        try { defaultAnnM_ = static_cast<uint32_t>(std::max<uint64_t>(4, std::stoull(envAnnM))); } catch (...) {}
+    }
+    if (const char* envAnnEf = std::getenv("BLACKBOX_ANN_EF_SEARCH")) {
+        try { defaultAnnEfSearch_ = static_cast<uint32_t>(std::max<uint64_t>(8, std::stoull(envAnnEf))); } catch (...) {}
+    }
     if (const char* envMerge = std::getenv("BLACKBOX_MERGE_SEGMENTS")) {
         try { mergeSegmentsAt_ = std::max<size_t>(1, static_cast<size_t>(std::stoull(envMerge))); } catch (...) {}
     }
@@ -1022,6 +1048,8 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     indexes_[name].annClusters = defaultAnnClusters_;
     indexes_[name].annClusters = defaultAnnClusters_;
     indexes_[name].annProbes = defaultAnnProbes_;
+    indexes_[name].annM = defaultAnnM_;
+    indexes_[name].annEfSearch = defaultAnnEfSearch_;
     indexes_[name].lastFlushAt = std::chrono::steady_clock::now();
     indexes_[name].lastFlushedWalOffset = 0;
     configureSchema(indexes_[name]);
@@ -1289,6 +1317,12 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
         hits.push_back({docId, score});
     };
 
+    // Prefer HNSW graph when available
+    if (!idx.annGraph.empty()) {
+        auto graphHits = searchHnsw(idx, queryVec, maxResults);
+        if (!graphHits.empty()) return graphHits;
+    }
+
     // ANN: probe multiple closest centroids then fallback to brute if needed
     if (!idx.annCentroids.empty() && !idx.annBuckets.empty()) {
         size_t probes = std::max<size_t>(1, std::min<size_t>(idx.annCentroids.size(), idx.annProbes));
@@ -1377,7 +1411,10 @@ nlohmann::json BlackBox::config() const {
         {"merge_segments_at", mergeSegmentsAt_},
         {"compress_snapshots", compressSnapshots_},
         {"auto_snapshot", autoSnapshot_},
-        {"default_ann_clusters", defaultAnnClusters_}
+        {"default_ann_clusters", defaultAnnClusters_},
+        {"default_ann_probes", defaultAnnProbes_},
+        {"default_ann_m", defaultAnnM_},
+        {"default_ann_ef_search", defaultAnnEfSearch_}
     };
     return j;
 }
@@ -1592,7 +1629,150 @@ void BlackBox::rebuildAnn(IndexState& idx) const {
         }
         idx.annBuckets[bestIdx].push_back(kv.first);
     }
+    rebuildHnsw(idx);
     idx.annDirty = false;
+}
+
+void BlackBox::rebuildHnsw(IndexState& idx) const {
+    const uint32_t dim = idx.schema.vectorDim;
+    idx.annGraph.clear();
+    if (dim == 0 || idx.vectors.empty()) return;
+
+    auto dot = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double s = 0.0;
+        size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) s += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        return s;
+    };
+    std::unordered_map<DocId, double> norms;
+    norms.reserve(idx.vectors.size());
+    for (const auto& kv : idx.vectors) {
+        double n = 0.0;
+        for (float v : kv.second) n += static_cast<double>(v) * static_cast<double>(v);
+        norms[kv.first] = std::sqrt(n);
+    }
+    auto cosine = [&](DocId a, DocId b) -> double {
+        auto ita = idx.vectors.find(a);
+        auto itb = idx.vectors.find(b);
+        if (ita == idx.vectors.end() || itb == idx.vectors.end()) return -1e9;
+        double na = norms[a];
+        double nb = norms[b];
+        if (na == 0 || nb == 0) return -1e9;
+        return dot(ita->second, itb->second) / (na * nb + 1e-9);
+    };
+    std::vector<DocId> ids;
+    ids.reserve(idx.vectors.size());
+    for (const auto& kv : idx.vectors) ids.push_back(kv.first);
+    std::sort(ids.begin(), ids.end());
+
+    auto prune = [&](DocId id) {
+        auto& nbrs = idx.annGraph[id];
+        if (nbrs.size() <= idx.annM) return;
+        std::vector<std::pair<double, DocId>> scored;
+        scored.reserve(nbrs.size());
+        for (auto n : nbrs) {
+            scored.push_back({cosine(id, n), n});
+        }
+        std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b){
+            if (a.first == b.first) return a.second < b.second;
+            return a.first > b.first;
+        });
+        if (scored.size() > idx.annM) scored.resize(idx.annM);
+        nbrs.clear();
+        for (const auto& s : scored) nbrs.push_back(s.second);
+    };
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        DocId cur = ids[i];
+        std::vector<std::pair<double, DocId>> sims;
+        sims.reserve(i);
+        for (size_t j = 0; j < i; ++j) {
+            DocId other = ids[j];
+            double score = cosine(cur, other);
+            sims.push_back({score, other});
+        }
+        std::sort(sims.begin(), sims.end(), [](const auto& a, const auto& b){
+            if (a.first == b.first) return a.second < b.second;
+            return a.first > b.first;
+        });
+        if (sims.size() > idx.annM) sims.resize(idx.annM);
+        auto& nbrs = idx.annGraph[cur];
+        for (const auto& s : sims) nbrs.push_back(s.second);
+        prune(cur);
+        for (const auto& s : sims) {
+            idx.annGraph[s.second].push_back(cur);
+            prune(s.second);
+        }
+    }
+}
+
+std::vector<BlackBox::SearchHit> BlackBox::searchHnsw(IndexState& idx, const std::vector<float>& queryVec, size_t maxResults) const {
+    if (idx.annGraph.empty()) return {};
+    auto dot = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double s = 0.0;
+        size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) s += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        return s;
+    };
+    auto norm = [](const std::vector<float>& a) {
+        double s = 0.0;
+        for (auto v : a) s += static_cast<double>(v) * static_cast<double>(v);
+        return std::sqrt(s);
+    };
+    const double qn = norm(queryVec);
+    if (qn == 0) return {};
+    auto scoreDoc = [&](DocId id) -> double {
+        auto it = idx.vectors.find(id);
+        if (it == idx.vectors.end() || it->second.size() != queryVec.size()) return -1e9;
+        double n = norm(it->second);
+        if (n == 0) return -1e9;
+        return dot(queryVec, it->second) / (qn * n + 1e-9);
+    };
+
+    auto entryIt = idx.annGraph.begin();
+    if (entryIt == idx.annGraph.end()) return {};
+    DocId entry = entryIt->first;
+    double entryScore = scoreDoc(entry);
+    size_t ef = std::max<size_t>(maxResults, idx.annEfSearch);
+
+    using Pair = std::pair<double, DocId>;
+    struct MaxCmp { bool operator()(const Pair& a, const Pair& b) const { return a.first < b.first; } };
+    struct MinCmp { bool operator()(const Pair& a, const Pair& b) const { return a.first > b.first; } };
+    std::priority_queue<Pair, std::vector<Pair>, MaxCmp> candidates;
+    std::priority_queue<Pair, std::vector<Pair>, MinCmp> top;
+    std::unordered_set<DocId> visited;
+    candidates.push({entryScore, entry});
+    top.push({entryScore, entry});
+    visited.insert(entry);
+
+    while (!candidates.empty()) {
+        auto cur = candidates.top();
+        candidates.pop();
+        double lowerBound = top.empty() ? -1e9 : top.top().first;
+        if (top.size() >= ef && cur.first < lowerBound) break;
+        auto itNbr = idx.annGraph.find(cur.second);
+        if (itNbr == idx.annGraph.end()) continue;
+        for (auto n : itNbr->second) {
+            if (!visited.insert(n).second) continue;
+            double s = scoreDoc(n);
+            candidates.push({s, n});
+            top.push({s, n});
+            if (top.size() > ef) top.pop();
+        }
+    }
+
+    std::vector<SearchHit> hits;
+    hits.reserve(top.size());
+    while (!top.empty()) {
+        hits.push_back({top.top().second, top.top().first});
+        top.pop();
+    }
+    std::sort(hits.begin(), hits.end(), [](const SearchHit& a, const SearchHit& b) {
+        if (a.score == b.score) return a.id < b.id;
+        return a.score > b.score;
+    });
+    if (hits.size() > maxResults) hits.resize(maxResults);
+    return hits;
 }
 
 bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc) const {
@@ -1917,6 +2097,9 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
     }
     chunk.annCentroids = idx.annCentroids;
     chunk.annBuckets = idx.annBuckets;
+    chunk.annGraph = idx.annGraph;
+    chunk.annM = idx.annM;
+    chunk.annEfSearch = idx.annEfSearch;
     for (const auto& field : idx.imageValues) {
         for (const auto& entry : field.second) {
             chunk.images[field.first][entry.first] = SnapshotChunk::SnapshotImage{entry.second.format, entry.second.data};
@@ -2005,6 +2188,9 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     chunk.tombstones.assign(idx.tombstones.begin(), idx.tombstones.end());
     chunk.annCentroids = idx.annCentroids;
     chunk.annBuckets = idx.annBuckets;
+    chunk.annGraph = idx.annGraph;
+    chunk.annM = idx.annM;
+    chunk.annEfSearch = idx.annEfSearch;
     for (const auto& field : idx.imageValues) {
         for (const auto& entry : field.second) {
             chunk.images[field.first][entry.first] = SnapshotChunk::SnapshotImage{entry.second.format, entry.second.data};
@@ -2084,7 +2270,9 @@ bool BlackBox::writeManifest() const {
             {"segments", segs},
             {"schema", entry.second.schema.schema},
             {"ann_clusters", entry.second.annClusters},
-            {"ann_probes", entry.second.annProbes}
+            {"ann_probes", entry.second.annProbes},
+            {"ann_m", entry.second.annM},
+            {"ann_ef_search", entry.second.annEfSearch}
         });
     }
     fs::path tmpPath = manifestPath;
@@ -2213,7 +2401,9 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
             {"segments", segs},
             {"schema", idx.schema.schema},
             {"ann_clusters", idx.annClusters},
-            {"ann_probes", idx.annProbes}
+            {"ann_probes", idx.annProbes},
+            {"ann_m", idx.annM},
+            {"ann_ef_search", idx.annEfSearch}
         });
     }
     std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
@@ -2260,6 +2450,8 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         IndexState state;
         state.annClusters = idxJson.value("ann_clusters", defaultAnnClusters_);
         state.annProbes = idxJson.value("ann_probes", defaultAnnProbes_);
+        state.annM = idxJson.value("ann_m", defaultAnnM_);
+        state.annEfSearch = idxJson.value("ann_ef_search", defaultAnnEfSearch_);
         state.schema.schema = idxJson.value("schema", json::object());
         configureSchema(state);
 
@@ -2316,6 +2508,9 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             }
             if (!chunk.annCentroids.empty()) state.annCentroids = chunk.annCentroids;
             if (!chunk.annBuckets.empty()) state.annBuckets = chunk.annBuckets;
+            if (!chunk.annGraph.empty()) state.annGraph = chunk.annGraph;
+            if (chunk.annM > 0) state.annM = chunk.annM;
+            if (chunk.annEfSearch > 0) state.annEfSearch = chunk.annEfSearch;
             if (chunk.docValues.contains("numeric")) {
                 auto num = chunk.docValues["numeric"];
                 if (num.is_object()) {
@@ -2420,6 +2615,8 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             state.wal.open();
             replayWal(state, maxWalPos);
             if (state.annProbes == 0) state.annProbes = defaultAnnProbes_;
+            if (state.annM == 0) state.annM = defaultAnnM_;
+            if (state.annEfSearch == 0) state.annEfSearch = defaultAnnEfSearch_;
             state.lastFlushedWalOffset = maxWalPos;
             state.lastFlushAt = std::chrono::steady_clock::now();
         }
@@ -2449,6 +2646,8 @@ void BlackBox::loadWalOnly() {
         if (indexes_.count(name)) continue;
         IndexState state;
         state.annClusters = defaultAnnClusters_;
+        state.annM = defaultAnnM_;
+        state.annEfSearch = defaultAnnEfSearch_;
         // best-effort load schema sidecar so WAL replay has correct field config
         fs::path schemaPath = fs::path(dataDir_) / (name + ".schema.json");
         if (fs::exists(schemaPath)) {
@@ -2470,6 +2669,8 @@ void BlackBox::loadWalOnly() {
         state.lastFlushedWalOffset = 0;
         state.lastFlushAt = std::chrono::steady_clock::now();
         state.annProbes = defaultAnnProbes_;
+        state.annM = defaultAnnM_;
+        state.annEfSearch = defaultAnnEfSearch_;
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: built index " << name << " from WAL\n";
     }

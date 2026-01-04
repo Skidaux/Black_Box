@@ -51,6 +51,7 @@ Schema extensions:
   - OR mode: `mode=or`/`bm25_or` computes BM25 across the union of query terms (not just intersection).
   - Hybrid: `w_bm25`, `w_semantic`, `w_lexical` weights.
   - Vector: `mode=vector`, `vec=comma,separated,floats` (provide `q` placeholder if required by clients).
+    - Uses HNSW graph (configurable via `BLACKBOX_ANN_M`, `BLACKBOX_ANN_EF_SEARCH`) with fallback to IVF buckets and brute force when needed.
   - Relations: `include_relations=inline|hierarchy|none` (default `none`) and `max_relation_depth` (default `1`).
     - `inline` embeds the linked document under each hit.
     - `hierarchy` groups hits beneath their shared relation reference and adds `relation_groups` to the response.
@@ -97,6 +98,8 @@ Environment variables:
 - `BLACKBOX_AUTO_SNAPSHOT` – `1/true/on` to snapshot after each write (default off).
 - `BLACKBOX_ANN_CLUSTERS` – default coarse vector clusters (default 8).
 - `BLACKBOX_ANN_PROBES` – number of ANN centroids to probe per query (default 2).
+- `BLACKBOX_ANN_M` – HNSW max neighbors per node (default 16).
+- `BLACKBOX_ANN_EF_SEARCH` – HNSW search breadth (default 64).
 - `BLACKBOX_WAL_FLUSH_BYTES` / `BLACKBOX_WAL_FLUSH_MS` – thresholds for WAL flush (defaults 64KB / 200ms).
 - `BLACKBOX_WAL_FSYNC` – `1/true/on` to fsync WAL on flush (default on).
 - `BLACKBOX_MAX_BODY_KB` – max HTTP request body size (default 1024 KB).

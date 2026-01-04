@@ -202,6 +202,9 @@ private:
         uint32_t annClusters = 8;
         std::vector<std::vector<float>> annCentroids;
         std::vector<std::vector<DocId>> annBuckets;
+        std::unordered_map<DocId, std::vector<DocId>> annGraph;
+        uint32_t annM = 16;
+        uint32_t annEfSearch = 64;
         std::vector<SegmentMetadata> segments;
         WalWriter wal;
         size_t opsSinceFlush = 0;
@@ -224,6 +227,8 @@ private:
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
     uint32_t defaultAnnProbes_ = 2;
+    uint32_t defaultAnnM_ = 16;
+    uint32_t defaultAnnEfSearch_ = 64;
     uint64_t walFlushBytes_ = 64 * 1024;
     uint64_t walFlushMs_ = 200;
     bool walFsyncEnabled_ = true;
@@ -253,6 +258,8 @@ private:
     void removePosting(IndexState& idx, const std::string& term, DocId id);
     void rebuildSkipPointers(IndexState& idx);
     void rebuildAnn(IndexState& idx) const;
+    void rebuildHnsw(IndexState& idx) const;
+    std::vector<SearchHit> searchHnsw(IndexState& idx, const std::vector<float>& queryVec, size_t maxResults) const;
 
     bool validateDocument(const IndexState& idx, const nlohmann::json& doc) const;
 
