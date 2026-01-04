@@ -15,6 +15,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cstring>
+#include <limits>
 #include <iostream>
 #include <optional>
 #include <chrono>
@@ -98,6 +99,90 @@ static void flushAndSync(std::ofstream& stream) {
     stream.flush();
 }
 
+constexpr char kWalMagic[] = "BBWAL";
+constexpr uint16_t kWalVersion = 2;
+constexpr uint16_t kWalRecordVersion = 2;
+static void flushFilePath(const std::string& path);
+
+static uint64_t writeWalHeader(std::ostream& out, const std::string& schemaId) {
+    std::string header;
+    header.append(kWalMagic, kWalMagic + 5);
+    writeLE(header, kWalVersion);
+    uint16_t flags = 0;
+    writeLE(header, flags);
+    uint16_t schemaLen = static_cast<uint16_t>(std::min<size_t>(schemaId.size(), std::numeric_limits<uint16_t>::max()));
+    writeLE(header, schemaLen);
+    if (schemaLen > 0) header.append(schemaId.data(), schemaLen);
+    uint32_t crc = minielastic::crc32(std::string_view(header));
+    writeLE(header, crc);
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    return header.size();
+}
+
+static std::optional<std::tuple<uint16_t, uint16_t, std::string, uint64_t>> parseWalHeader(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    char magic[5] = {0};
+    if (!in.read(magic, 5)) return std::nullopt;
+    if (std::string_view(magic, 5) != std::string_view(kWalMagic, 5)) return std::nullopt;
+    uint16_t version = 0;
+    uint16_t flags = 0;
+    uint16_t schemaLen = 0;
+    if (!walReadLE(in, version)) return std::nullopt;
+    if (!walReadLE(in, flags)) return std::nullopt;
+    if (!walReadLE(in, schemaLen)) return std::nullopt;
+    std::string schemaId;
+    if (schemaLen > 0) {
+        schemaId.resize(schemaLen);
+        if (!in.read(schemaId.data(), schemaLen)) return std::nullopt;
+    }
+    uint32_t storedCrc = 0;
+    if (!walReadLE(in, storedCrc)) return std::nullopt;
+    std::string hdr;
+    hdr.append(kWalMagic, kWalMagic + 5);
+    writeLE(hdr, version);
+    writeLE(hdr, flags);
+    writeLE(hdr, schemaLen);
+    if (schemaLen > 0) hdr.append(schemaId);
+    uint32_t computed = minielastic::crc32(std::string_view(hdr));
+    if (computed != storedCrc) return std::nullopt;
+    uint64_t headerBytes = static_cast<uint64_t>(in.tellg());
+    return std::make_tuple(version, flags, schemaId, headerBytes);
+}
+
+static bool rewriteWalWithHeader(const std::string& path, const std::string& schemaId, const std::vector<minielastic::WalRecord>& records) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path bak = fs::path(path).replace_extension(".legacy");
+    fs::rename(path, bak, ec); // best-effort backup
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    (void)writeWalHeader(out, schemaId);
+    for (const auto& rec : records) {
+        uint16_t recVersion = kWalRecordVersion;
+        walWriteLE(out, recVersion);
+        out.write(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+        uint64_t opId = rec.opId ? rec.opId : 0;
+        walWriteLE(out, opId);
+        walWriteLE(out, rec.docId);
+        uint32_t len = static_cast<uint32_t>(rec.payload.size());
+        walWriteLE(out, len);
+        if (!rec.payload.empty()) out.write(rec.payload.data(), static_cast<std::streamsize>(rec.payload.size()));
+        std::string buf;
+        ::writeLE(buf, recVersion);
+        buf.append(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+        ::writeLE(buf, opId);
+        ::writeLE(buf, rec.docId);
+        ::writeLE(buf, len);
+        if (!rec.payload.empty()) buf.append(rec.payload.data(), rec.payload.size());
+        uint32_t crc = minielastic::crc32(buf);
+        walWriteLE(out, crc);
+    }
+    out.flush();
+    flushFilePath(path);
+    return static_cast<bool>(out);
+}
+
 enum class SectionEncoding : uint16_t { Raw = 0, Zstd = 1 };
 
 static const char kB64Alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -147,6 +232,14 @@ static std::string crcHex(const std::string& input) {
     std::ostringstream oss;
     oss << std::hex << std::setw(8) << std::setfill('0') << crc;
     return oss.str();
+}
+
+static std::string computeSchemaId(const nlohmann::json& schema) {
+    // Use canonical JSON dump checksum to derive a stable schema id (excluding any existing schema_id field).
+    nlohmann::json clone = schema;
+    if (clone.contains("schema_id")) clone.erase("schema_id");
+    auto dumped = clone.dump();
+    return crcHex(dumped);
 }
 
 #ifdef BLACKBOX_USE_ZSTD
@@ -803,11 +896,18 @@ namespace minielastic {
 
 bool WalWriter::open() {
     if (path.empty()) return false;
+    legacyFormat = false;
+    fileVersion = 0;
+    headerBytes = 0;
+    headerSchemaId.clear();
+    upgradedFromLegacy = false;
+    schemaMismatch = false;
     try {
         std::filesystem::create_directories(std::filesystem::path(path).parent_path());
     } catch (...) {
         std::cerr << "WalWriter: failed to create dir for " << path << "\n";
     }
+    auto header = parseWalHeader(path);
     stream.open(path, std::ios::binary | std::ios::app | std::ios::out);
     if (!stream) {
         std::cerr << "WalWriter: failed to open " << path << "\n";
@@ -815,6 +915,46 @@ bool WalWriter::open() {
     }
     stream.seekp(0, std::ios::end);
     offset = static_cast<uint64_t>(stream.tellp());
+    if (offset == 0) {
+        headerBytes = writeWalHeader(stream, schemaId);
+        offset = static_cast<uint64_t>(stream.tellp());
+        fileVersion = kWalVersion;
+        headerSchemaId = schemaId;
+        flushAndSync(stream);
+        flushFilePath(path);
+    } else if (header) {
+        fileVersion = std::get<0>(*header);
+        fileFlags = std::get<1>(*header);
+        headerSchemaId = std::get<2>(*header);
+        headerBytes = std::get<3>(*header);
+        if (!schemaId.empty() && !headerSchemaId.empty() && headerSchemaId != schemaId) {
+            schemaMismatch = true;
+            std::cerr << "WalWriter: schema id mismatch for " << path << " header=" << headerSchemaId << " current=" << schemaId << "\n";
+        }
+    } else {
+        legacyFormat = true;
+        // attempt to migrate legacy WAL to versioned format if we can
+        if (offset > 0 && !schemaId.empty()) {
+            stream.close();
+            auto recs = readWalRecords(path, 0);
+            if (!recs.empty()) {
+                if (rewriteWalWithHeader(path, schemaId, recs)) {
+                    upgradedFromLegacy = true;
+                    legacyFormat = false;
+                    header = parseWalHeader(path);
+                    stream.open(path, std::ios::binary | std::ios::app | std::ios::out);
+                    stream.seekp(0, std::ios::end);
+                    offset = static_cast<uint64_t>(stream.tellp());
+                    if (header) {
+                        fileVersion = std::get<0>(*header);
+                        fileFlags = std::get<1>(*header);
+                        headerSchemaId = std::get<2>(*header);
+                        headerBytes = std::get<3>(*header);
+                    }
+                }
+            }
+        }
+    }
     return true;
 }
 
@@ -842,22 +982,45 @@ bool WalWriter::append(const WalRecord& rec) {
         std::cerr << "WalWriter: stream not good for " << path << "\n";
         return false;
     }
-    // record layout: op | docId | len | payload | crc32(op..payload)
-    stream.write(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
-    walWriteLE(stream, rec.docId);
     uint32_t len = static_cast<uint32_t>(rec.payload.size());
-    walWriteLE(stream, len);
-    if (!rec.payload.empty()) stream.write(rec.payload.data(), static_cast<std::streamsize>(rec.payload.size()));
-    std::string buf;
-    buf.reserve(sizeof(rec.op) + sizeof(rec.docId) + sizeof(len) + rec.payload.size());
-    buf.append(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
-    buf.append(reinterpret_cast<const char*>(&rec.docId), sizeof(rec.docId));
-    buf.append(reinterpret_cast<const char*>(&len), sizeof(len));
-    if (!rec.payload.empty()) buf.append(rec.payload.data(), rec.payload.size());
-    uint32_t crc = crc32(buf);
-    walWriteLE(stream, crc);
-    offset += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len + sizeof(uint32_t);
-    pendingBytes += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len + sizeof(uint32_t);
+    if (legacyFormat) {
+        // legacy record layout: op | docId | len | payload | crc32(op..payload)
+        stream.write(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+        walWriteLE(stream, rec.docId);
+        walWriteLE(stream, len);
+        if (!rec.payload.empty()) stream.write(rec.payload.data(), static_cast<std::streamsize>(rec.payload.size()));
+        std::string buf;
+        buf.reserve(sizeof(rec.op) + sizeof(rec.docId) + sizeof(len) + rec.payload.size());
+        buf.append(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+        buf.append(reinterpret_cast<const char*>(&rec.docId), sizeof(rec.docId));
+        buf.append(reinterpret_cast<const char*>(&len), sizeof(len));
+        if (!rec.payload.empty()) buf.append(rec.payload.data(), rec.payload.size());
+        uint32_t crc = crc32(buf);
+        walWriteLE(stream, crc);
+        offset += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len + sizeof(uint32_t);
+        pendingBytes += sizeof(rec.op) + sizeof(uint32_t) + sizeof(uint32_t) + len + sizeof(uint32_t);
+    } else {
+        // versioned record layout: recVersion | op | opId | docId | len | payload | crc32(all previous)
+        uint16_t recVersion = kWalRecordVersion;
+        walWriteLE(stream, recVersion);
+        stream.write(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+        walWriteLE(stream, rec.opId);
+        walWriteLE(stream, rec.docId);
+        walWriteLE(stream, len);
+        if (!rec.payload.empty()) stream.write(rec.payload.data(), static_cast<std::streamsize>(rec.payload.size()));
+        std::string buf;
+        ::writeLE(buf, recVersion);
+        buf.append(reinterpret_cast<const char*>(&rec.op), sizeof(rec.op));
+        ::writeLE(buf, rec.opId);
+        ::writeLE(buf, rec.docId);
+        ::writeLE(buf, len);
+        if (!rec.payload.empty()) buf.append(rec.payload.data(), rec.payload.size());
+        uint32_t crc = crc32(buf);
+        walWriteLE(stream, crc);
+        uint64_t written = sizeof(recVersion) + sizeof(rec.op) + sizeof(rec.opId) + sizeof(rec.docId) + sizeof(len) + len + sizeof(uint32_t);
+        offset += written;
+        pendingBytes += written;
+    }
     maybeFlush(false);
     if (!stream) {
         std::cerr << "WalWriter: stream write failed for " << path << "\n";
@@ -868,6 +1031,10 @@ bool WalWriter::append(const WalRecord& rec) {
 void WalWriter::reset() {
     maybeFlush(true);
     close();
+    legacyFormat = false;
+    fileVersion = 0;
+    headerBytes = 0;
+    headerSchemaId.clear();
     if (!path.empty()) {
         try {
             std::filesystem::create_directories(std::filesystem::path(path).parent_path());
@@ -893,48 +1060,106 @@ void WalWriter::reset() {
 
 std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOffset) {
     std::vector<WalRecord> out;
+    auto header = parseWalHeader(path);
+    bool hasHeader = header.has_value();
+    uint16_t walVersion = hasHeader ? std::get<0>(*header) : 0;
+    uint64_t headerBytes = hasHeader ? std::get<3>(*header) : 0;
     std::ifstream in(path, std::ios::binary);
     if (!in) return out;
-    if (startOffset > 0) {
-        in.seekg(static_cast<std::streamoff>(startOffset), std::ios::beg);
+    uint64_t seekOffset = startOffset;
+    if (hasHeader && seekOffset < headerBytes) seekOffset = headerBytes;
+    if (seekOffset > 0) {
+        in.seekg(static_cast<std::streamoff>(seekOffset), std::ios::beg);
     }
-    uint64_t lastGoodOffset = startOffset;
+    uint64_t lastGoodOffset = static_cast<uint64_t>(in.tellg());
+    uint64_t syntheticOpId = 0;
     while (true) {
-        WalOp op;
-        if (!in.read(reinterpret_cast<char*>(&op), sizeof(op))) break;
-        uint32_t docId = 0;
-        if (!walReadLE(in, docId)) break;
-        uint32_t len = 0;
-        if (!walReadLE(in, len)) break;
-        std::vector<char> payload(len);
-        if (len > 0) {
-            if (!in.read(payload.data(), len)) break;
-        }
-        uint32_t crcRead = 0;
-        if (!walReadLE(in, crcRead)) break;
-        std::string buf;
-        buf.reserve(sizeof(op) + sizeof(docId) + sizeof(len) + payload.size());
-        buf.append(reinterpret_cast<const char*>(&op), sizeof(op));
-        buf.append(reinterpret_cast<const char*>(&docId), sizeof(docId));
-        buf.append(reinterpret_cast<const char*>(&len), sizeof(len));
-        if (!payload.empty()) buf.append(payload.data(), payload.size());
-        uint32_t crcComputed = crc32(buf);
-        if (crcComputed != crcRead) {
-            auto pos = in.tellg();
-            std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
-            std::error_code ec;
-            try {
-                std::filesystem::resize_file(path, lastGoodOffset, ec);
-            } catch (const std::exception& e) {
-                std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
+        if (hasHeader && walVersion >= 2) {
+            uint16_t recVersion = 0;
+            if (!walReadLE(in, recVersion)) break;
+            if (recVersion != kWalRecordVersion) {
+                std::cerr << "WAL unsupported record version " << recVersion << " in " << path << "\n";
+                break;
             }
-            if (ec) {
-                std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
+            uint8_t opByte = 0;
+            if (!in.read(reinterpret_cast<char*>(&opByte), 1)) break;
+            WalOp op = static_cast<WalOp>(opByte);
+            uint64_t opId = 0;
+            if (!walReadLE(in, opId)) break;
+            uint32_t docId = 0;
+            if (!walReadLE(in, docId)) break;
+            uint32_t len = 0;
+            if (!walReadLE(in, len)) break;
+            std::vector<char> payload(len);
+            if (len > 0) {
+                if (!in.read(payload.data(), len)) break;
             }
-            break;
+            uint32_t crcRead = 0;
+            if (!walReadLE(in, crcRead)) break;
+            std::string buf;
+            ::writeLE(buf, recVersion);
+            buf.append(reinterpret_cast<const char*>(&op), sizeof(op));
+            ::writeLE(buf, opId);
+            ::writeLE(buf, docId);
+            ::writeLE(buf, len);
+            if (!payload.empty()) buf.append(payload.data(), payload.size());
+            uint32_t crcComputed = crc32(buf);
+            if (crcComputed != crcRead) {
+                auto pos = in.tellg();
+                std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
+                std::error_code ec;
+                try {
+                    std::filesystem::resize_file(path, lastGoodOffset, ec);
+                } catch (const std::exception& e) {
+                    std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
+                }
+                if (ec) {
+                    std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
+                }
+                break;
+            }
+            out.push_back({op, opId, docId, std::move(payload)});
+            auto tell = in.tellg();
+            if (tell != -1) lastGoodOffset = static_cast<uint64_t>(tell);
+        } else {
+            WalOp op;
+            if (!in.read(reinterpret_cast<char*>(&op), sizeof(op))) break;
+            uint32_t docId = 0;
+            if (!walReadLE(in, docId)) break;
+            uint32_t len = 0;
+            if (!walReadLE(in, len)) break;
+            std::vector<char> payload(len);
+            if (len > 0) {
+                if (!in.read(payload.data(), len)) break;
+            }
+            uint32_t crcRead = 0;
+            if (!walReadLE(in, crcRead)) break;
+            std::string buf;
+            buf.reserve(sizeof(op) + sizeof(docId) + sizeof(len) + payload.size());
+            buf.append(reinterpret_cast<const char*>(&op), sizeof(op));
+            buf.append(reinterpret_cast<const char*>(&docId), sizeof(docId));
+            buf.append(reinterpret_cast<const char*>(&len), sizeof(len));
+            if (!payload.empty()) buf.append(payload.data(), payload.size());
+            uint32_t crcComputed = crc32(buf);
+            if (crcComputed != crcRead) {
+                auto pos = in.tellg();
+                std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
+                std::error_code ec;
+                try {
+                    std::filesystem::resize_file(path, lastGoodOffset, ec);
+                } catch (const std::exception& e) {
+                    std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
+                }
+                if (ec) {
+                    std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
+                }
+                break;
+            }
+            uint64_t assignedOpId = ++syntheticOpId;
+            out.push_back({op, assignedOpId, docId, std::move(payload)});
+            auto tell = in.tellg();
+            if (tell != -1) lastGoodOffset = static_cast<uint64_t>(tell);
         }
-        out.push_back({op, docId, std::move(payload)});
-        lastGoodOffset = static_cast<uint64_t>(in.tellg());
     }
     return out;
 }
@@ -1009,6 +1234,7 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
             if (kv.second.wal.path.empty()) {
                 kv.second.wal.path = (std::filesystem::path(dataDir_) / (kv.first + ".wal")).string();
             }
+            kv.second.wal.schemaId = kv.second.schema.schemaId;
             kv.second.wal.flushThresholdBytes = walFlushBytes_;
             kv.second.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
             kv.second.wal.enableFsync = walFsyncEnabled_;
@@ -1016,6 +1242,10 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
                 kv.second.wal.open();
             }
             if (kv.second.wal.stream.is_open()) {
+                if (!kv.second.wal.headerSchemaId.empty() && !kv.second.schema.schemaId.empty() && kv.second.wal.headerSchemaId != kv.second.schema.schemaId) {
+                    kv.second.wal.schemaMismatch = true;
+                    std::cerr << "BlackBox: WAL schema mismatch for index " << kv.first << " header=" << kv.second.wal.headerSchemaId << " schema=" << kv.second.schema.schemaId << "\n";
+                }
                 replayWal(kv.second);
                 std::cerr << "BlackBox: replayed WAL for index " << kv.first << "\n";
             } else {
@@ -1054,6 +1284,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     indexes_[name].lastFlushedWalOffset = 0;
     configureSchema(indexes_[name]);
     persistSchema(name, indexes_[name]);
+    indexes_[name].wal.schemaId = indexes_[name].schema.schemaId;
     // init WAL
     if (!dataDir_.empty()) {
         indexes_[name].wal.path = (std::filesystem::path(dataDir_) / (name + ".wal")).string();
@@ -1062,6 +1293,9 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
         indexes_[name].wal.enableFsync = walFsyncEnabled_;
         indexes_[name].wal.reset();
         indexes_[name].wal.open();
+        if (indexes_[name].wal.schemaMismatch) {
+            std::cerr << "BlackBox: WAL schema mismatch on createIndex for " << name << "\n";
+        }
         indexes_[name].manifestDirty = true;
     }
     manifestDirty_.store(true, std::memory_order_relaxed);
@@ -1446,6 +1680,8 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
         s.walBytes = st.wal.offset;
         s.pendingOps = st.opsSinceFlush;
         s.avgDocLen = st.avgDocLen;
+        s.walSchemaMismatch = st.wal.schemaMismatch;
+        s.walUpgraded = st.wal.upgradedFromLegacy;
         out.push_back(std::move(s));
     }
     return out;
@@ -2096,6 +2332,7 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const Processed
             std::vector<uint8_t> cbor = json::to_cbor(walDoc);
             WalRecord rec;
             rec.op = WalOp::Upsert;
+            rec.opId = idx.nextOpId++;
             rec.docId = assignId;
             rec.payload.assign(reinterpret_cast<char*>(cbor.data()), reinterpret_cast<char*>(cbor.data()) + cbor.size());
             if (!idx.wal.append(rec)) {
@@ -2145,6 +2382,7 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
         if (idx.wal.stream.is_open()) {
             WalRecord rec;
             rec.op = WalOp::Delete;
+            rec.opId = idx.nextOpId++;
             rec.docId = id;
             if (!idx.wal.append(rec)) {
                 std::cerr << "WAL append failed for " << idx.wal.path << "\n";
@@ -2347,7 +2585,7 @@ bool BlackBox::writeManifest() const {
     namespace fs = std::filesystem;
     if (dataDir_.empty()) return true;
     fs::path manifestPath = fs::path(dataDir_) / "index.manifest";
-    json manifest = {{"version", 1}, {"indexes", json::array()}};
+    json manifest = {{"format", "blackbox_manifest"}, {"version", 2}, {"indexes", json::array()}};
     for (const auto& entry : indexes_) {
         persistSchema(entry.first, entry.second);
         json segs = json::array();
@@ -2362,10 +2600,14 @@ bool BlackBox::writeManifest() const {
             {"name", entry.first},
             {"segments", segs},
             {"schema", entry.second.schema.schema},
+            {"schema_id", entry.second.schema.schemaId},
+            {"schema_version", entry.second.schema.schemaVersion},
             {"ann_clusters", entry.second.annClusters},
             {"ann_probes", entry.second.annProbes},
             {"ann_m", entry.second.annM},
-            {"ann_ef_search", entry.second.annEfSearch}
+            {"ann_ef_search", entry.second.annEfSearch},
+            {"next_op_id", entry.second.nextOpId},
+            {"wal_bytes", entry.second.wal.offset}
         });
     }
     fs::path tmpPath = manifestPath;
@@ -2390,6 +2632,11 @@ void BlackBox::replayWal(IndexState& idx, uint64_t startOffset) {
     if (!idx.wal.stream.is_open()) return;
     auto records = readWalRecords(idx.wal.path, startOffset);
     for (const auto& rec : records) {
+        if (rec.opId > 0) {
+            idx.nextOpId = std::max<uint64_t>(idx.nextOpId, rec.opId + 1);
+        } else {
+            ++idx.nextOpId;
+        }
         if (rec.op == WalOp::Upsert) {
             auto j = json::from_cbor(rec.payload, true, false);
             if (j.is_discarded()) continue;
@@ -2408,7 +2655,7 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
     fs::path manifestPath = path.empty() ? fs::path(dataDir_) / "index.manifest" : fs::path(path);
     fs::create_directories(manifestPath.parent_path());
 
-    json manifest = {{"version", 1}, {"indexes", json::array()}};
+    json manifest = {{"format", "blackbox_manifest"}, {"version", 2}, {"indexes", json::array()}};
     for (const auto& entry : indexes_) {
         const auto& name = entry.first;
         const auto& idx = entry.second;
@@ -2499,10 +2746,14 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
             {"name", name},
             {"segments", segs},
             {"schema", idx.schema.schema},
+            {"schema_id", idx.schema.schemaId},
+            {"schema_version", idx.schema.schemaVersion},
             {"ann_clusters", idx.annClusters},
             {"ann_probes", idx.annProbes},
             {"ann_m", idx.annM},
-            {"ann_ef_search", idx.annEfSearch}
+            {"ann_ef_search", idx.annEfSearch},
+            {"next_op_id", idx.nextOpId},
+            {"wal_bytes", idx.wal.offset}
         });
     }
     std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
@@ -2528,6 +2779,12 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         std::cerr << "BlackBox: manifest parse error\n";
         return false;
     }
+    int manifestVersion = manifest.value("version", 1);
+    if (manifestVersion > 2) {
+        std::cerr << "BlackBox: unsupported manifest version " << manifestVersion << "\n";
+        return false;
+    }
+    bool legacyManifest = manifestVersion < 2;
     auto arr = manifest.value("indexes", json::array());
     if (!arr.is_array()) return false;
 
@@ -2552,7 +2809,19 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         state.annM = idxJson.value("ann_m", defaultAnnM_);
         state.annEfSearch = idxJson.value("ann_ef_search", defaultAnnEfSearch_);
         state.schema.schema = idxJson.value("schema", json::object());
+        if (idxJson.contains("schema_version") && idxJson["schema_version"].is_number_unsigned()) {
+            state.schema.schema["schema_version"] = idxJson["schema_version"];
+        }
+        if (idxJson.contains("schema_id") && idxJson["schema_id"].is_string()) {
+            state.schema.schema["schema_id"] = idxJson["schema_id"];
+        }
         configureSchema(state);
+        state.wal.schemaId = state.schema.schemaId;
+        if (!state.wal.headerSchemaId.empty() && !state.schema.schemaId.empty() && state.wal.headerSchemaId != state.schema.schemaId) {
+            state.wal.schemaMismatch = true;
+            std::cerr << "BlackBox: WAL schema mismatch for index " << name << " header=" << state.wal.headerSchemaId << " schema=" << state.schema.schemaId << "\n";
+        }
+        state.nextOpId = idxJson.value("next_op_id", state.nextOpId);
 
         uint64_t maxWalPos = 0;
         for (const auto& seg : segments) {
@@ -2731,6 +3000,10 @@ bool BlackBox::loadSnapshot(const std::string& path) {
     for (const auto& kv : indexes_) {
         persistSchema(kv.first, kv.second);
     }
+    if (legacyManifest) {
+        std::cerr << "BlackBox: rewriting legacy manifest to latest format\n";
+        (void)writeManifest();
+    }
     return true;
 }
 
@@ -2757,14 +3030,22 @@ void BlackBox::loadWalOnly() {
                 if (!parsed.is_discarded()) {
                     state.schema.schema = parsed;
                     configureSchema(state);
+                    state.wal.schemaId = state.schema.schemaId;
                 }
             }
+        }
+        if (state.wal.schemaId.empty() && !state.schema.schema.empty()) {
+            state.wal.schemaId = state.schema.schemaId;
         }
         state.wal.path = path.string();
         state.wal.flushThresholdBytes = walFlushBytes_;
         state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
         state.wal.enableFsync = walFsyncEnabled_;
         state.wal.open();
+        if (!state.wal.headerSchemaId.empty() && !state.schema.schemaId.empty() && state.wal.headerSchemaId != state.schema.schemaId) {
+            state.wal.schemaMismatch = true;
+            std::cerr << "BlackBox: WAL schema mismatch for index " << name << " header=" << state.wal.headerSchemaId << " schema=" << state.schema.schemaId << "\n";
+        }
         replayWal(state);
         state.lastFlushedWalOffset = 0;
         state.lastFlushAt = std::chrono::steady_clock::now();
@@ -2840,6 +3121,8 @@ void BlackBox::configureSchema(IndexState& state) {
     } else {
         state.schema.schema["schema_version"] = state.schema.schemaVersion;
     }
+    state.schema.schemaId = computeSchemaId(state.schema.schema);
+    state.schema.schema["schema_id"] = state.schema.schemaId;
 }
 
 void BlackBox::persistSchema(const std::string& name, const IndexState& state) const {
@@ -2965,18 +3248,23 @@ std::vector<BlackBox::DocId> BlackBox::scanStoredEquals(const std::string& index
         const auto& doc = kv.second;
         if (!doc.contains(field)) continue;
         const auto& node = doc[field];
-        if (node.type() != value.type()) {
-            continue;
-        }
-        if (node == value) {
-            hits.push_back(kv.first);
-        } else if (node.is_array()) {
-            // allow membership test for array fields
+        auto numericEqual = [](const nlohmann::json& a, const nlohmann::json& b) {
+            if (!(a.is_number() && b.is_number())) return false;
+            return a.get<double>() == b.get<double>();
+        };
+        if (node.is_array()) {
             for (const auto& elem : node) {
-                if (elem.type() == value.type() && elem == value) {
+                if ((elem.type() == value.type() || (elem.is_number() && value.is_number())) &&
+                    (elem == value || numericEqual(elem, value))) {
                     hits.push_back(kv.first);
                     break;
                 }
+            }
+            continue;
+        }
+        if (node.type() == value.type() || (node.is_number() && value.is_number())) {
+            if (node == value || numericEqual(node, value)) {
+                hits.push_back(kv.first);
             }
         }
     }

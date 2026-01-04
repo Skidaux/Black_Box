@@ -30,6 +30,8 @@ Base URL: `http://127.0.0.1:8080`
 - Snapshots:
   - `POST /v1/snapshot` (optional `?path=...`) – write manifest/snapshots.
   - `POST /v1/snapshot/load` (optional `?path=...`) – load a manifest/snapshots.
+- Durability/compatibility: WAL files include a `BBWAL` magic header with version + `schema_id`, and versioned records carry `op_id`; manifests are versioned (`format=blackbox_manifest`, `version=2`) and persist `schema_id`/`schema_version` and `next_op_id` for forward-compatible upgrades.
+  - Legacy WALs are auto-rewritten to the new format (backup as .legacy) when opened with a known schema; schema_id mismatches emit warnings and are surfaced in stats; legacy manifests are rewritten to the latest format during load.
 
 ## Documents
 - `POST /v1/{index}/doc` – index a document (Content-Type: application/json). Returns `id` and, when configured, `doc_id` (custom identifier derived from schema). Image fields use `{ "content": "<base64>", "format": "png", "encoding": "base64" }`; the server stores raw binary and enforces `max_kb` limits.

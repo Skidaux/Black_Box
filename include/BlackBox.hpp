@@ -46,12 +46,14 @@ inline void readLE(std::istream& in, T& value) {
 
     struct WalRecord {
         WalOp op;
-        uint32_t docId;
+        uint64_t opId = 0;
+        uint32_t docId = 0;
         std::vector<char> payload; // CBOR data
     };
 
     struct WalWriter {
         std::string path;
+        std::string schemaId;
         std::ofstream stream;
         uint64_t offset = 0;
         uint64_t pendingBytes = 0;
@@ -59,6 +61,13 @@ inline void readLE(std::istream& in, T& value) {
         std::chrono::steady_clock::time_point lastFlush = std::chrono::steady_clock::now();
         std::chrono::milliseconds flushInterval{200};
         bool enableFsync = true;
+        bool legacyFormat = false;
+        uint16_t fileVersion = 0;
+        uint16_t fileFlags = 0;
+        uint64_t headerBytes = 0;
+        std::string headerSchemaId;
+        bool upgradedFromLegacy = false;
+        bool schemaMismatch = false;
 
         WalWriter() = default;
         explicit WalWriter(std::string p) : path(std::move(p)) {}
@@ -90,6 +99,7 @@ public:
         std::string vectorField;
         std::unordered_map<std::string, size_t> imageMaxKB;
         uint32_t schemaVersion = 1;
+        std::string schemaId;
         struct DocIdConfig {
             std::string field;
             FieldType type = FieldType::Unknown;
@@ -154,6 +164,8 @@ public:
         uint64_t walBytes = 0;
         std::size_t pendingOps = 0;
         double avgDocLen = 0.0;
+        bool walSchemaMismatch = false;
+        bool walUpgraded = false;
     };
 
     std::vector<IndexStats> stats() const;
@@ -213,6 +225,7 @@ private:
         std::vector<SegmentMetadata> segments;
         WalWriter wal;
         size_t opsSinceFlush = 0;
+        uint64_t nextOpId = 1;
         bool manifestDirty = false;
         std::unordered_set<DocId> tombstones;
         std::unordered_set<DocId> persistedDeletes; // delete bitmap persisted in segment

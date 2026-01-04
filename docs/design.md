@@ -15,8 +15,9 @@
 
 ## Storage Direction
 
-- Append-only WAL for durability and crash recovery with per-record CRC32.
-- Manifest file (`data/index.manifest`) tracks active segments, next ID, and settings; writes are fsynced before old segments are deleted. Segment flush triggers include op count, time (`BLACKBOX_FLUSH_MS`), and WAL growth (`BLACKBOX_FLUSH_WAL_BYTES`) to bound in-memory backlog; bulk endpoints can 429 when backpressure is active.
+- Append-only WAL for durability and crash recovery with per-record CRC32. WAL now carries a `BBWAL` magic + versioned header (with `schema_id`) and versioned records that include `op_id` so readers can validate format and ordering; legacy WALs remain readable.
+- Manifest file (`data/index.manifest`) is versioned (`format=blackbox_manifest`, `version=2`) and records active segments, `next_id`, `next_op_id`, `schema_id`/`schema_version`, and settings; writes are fsynced before old segments are deleted. Segment flush triggers include op count, time (`BLACKBOX_FLUSH_MS`), and WAL growth (`BLACKBOX_FLUSH_WAL_BYTES`) to bound in-memory backlog; bulk endpoints can 429 when backpressure is active.
+- WAL migration: legacy WALs are auto-rewritten to the versioned format (backup as `.legacy`) on open when a schema_id is available; schema_id mismatches are logged and surfaced via stats for operational visibility. Loading legacy manifests triggers an automatic rewrite to the latest manifest format.
 - Segment files (`*.skd`) contain docs, postings, doc-values, vectors, images, ANN metadata (centroids + HNSW graph with M/ef_search), and tombstones; sections are checksummed and optionally compressed.
 - Schema sidecars (`<index>.schema.json`) are persisted so WAL-only recovery retains field settings (doc_id/relation/vector/image).
 - Tombstones recorded in WAL and segment tombstone lists; applied at query time and cleared during merge.

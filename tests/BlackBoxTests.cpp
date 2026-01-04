@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,6 +19,7 @@ static void expect(bool cond, const std::string& msg) {
 }
 
 int main() {
+try {
     const std::string dataDir = "testdata";
     std::filesystem::remove_all(dataDir);
     BlackBox db(dataDir);
@@ -161,6 +163,49 @@ int main() {
     expect(hitsLex.empty(), "non-searchable field should not be indexed");
     auto hitsBoost = db.search(extraIndex, "yt", "bm25");
     expect(!hitsBoost.empty() && hitsBoost[0].id == mid, "query_values boost should surface doc");
+    auto storedMatch = db.scanStoredEquals(extraIndex, "version", 1);
+    expect(storedMatch.size() == 1 && storedMatch[0] == mid, "stored-match should find non-searchable version");
+
+    // WAL header should be versioned and carry magic
+    {
+        std::ifstream wal((std::filesystem::path(dataDir) / (extraIndex + ".wal")).string(), std::ios::binary);
+        expect(static_cast<bool>(wal), "wal should exist");
+        char magic[5] = {0};
+        wal.read(magic, 5);
+        expect(std::string(magic, 5) == "BBWAL", "wal magic should be BBWAL");
+    }
+
+    // Manifest should include format/version/schema_id/next_op_id
+    expect(db.saveSnapshot(), "snapshot save for manifest inspection");
+    {
+        std::ifstream manifestIn(std::filesystem::path(dataDir) / "index.manifest");
+        expect(static_cast<bool>(manifestIn), "manifest readable");
+        json manifest = json::parse(manifestIn, nullptr, false);
+        expect(!manifest.is_discarded(), "manifest parse");
+        expect(manifest.value("format", "") == "blackbox_manifest", "manifest format tag");
+        expect(manifest.value("version", 0) >= 2, "manifest version >=2");
+        bool found = false;
+        for (const auto& idx : manifest.value("indexes", json::array())) {
+            if (!idx.is_object()) continue;
+            if (idx.value("name", "") != extraIndex) continue;
+            found = true;
+            auto schemaId = idx.value("schema_id", std::string());
+            expect(!schemaId.empty(), "schema_id present in manifest");
+            auto nextOp = idx.value("next_op_id", 0ull);
+            expect(nextOp > 0, "next_op_id populated");
+            break;
+        }
+        expect(found, "extra index present in manifest");
+    }
+
+    // Reload and ensure query_values + stored-match survive
+    {
+        BlackBox dbReload(dataDir);
+        auto hitsReload = dbReload.search(extraIndex, "yt", "bm25");
+        expect(!hitsReload.empty() && hitsReload[0].id == mid, "reload query_values boost");
+        auto storedReload = dbReload.scanStoredEquals(extraIndex, "version", 1);
+        expect(storedReload.size() == 1 && storedReload[0] == mid, "reload stored-match non-searchable");
+    }
 
     // Bulk indexing via HTTP client simulated: ensure uniqueness enforcement on doc_id
     const std::string uniqIndex = "uniq_index";
@@ -180,10 +225,97 @@ int main() {
     }
     expect(threw, "duplicate doc_id should throw");
 
+    // Non-searchable array field membership scan
+    const std::string arrayIndex = "array_meta";
+    BlackBox::IndexSchema arraySchema;
+    arraySchema.schema = {
+        {"fields", {
+            {"tags", {{"type","array"}, {"searchable", false}}},
+            {"title", "text"}
+        }}
+    };
+    expect(db.createIndex(arrayIndex, arraySchema), "create array index");
+    auto aid = db.indexDocument(arrayIndex, R"({"title":"hidden tags","tags":["foo","bar"]})");
+    auto tagSearch = db.search(arrayIndex, "foo", "bm25");
+    expect(tagSearch.empty(), "non-searchable array should not be indexed");
+    auto tagStored = db.scanStoredEquals(arrayIndex, "tags", "foo");
+    expect(tagStored.size() == 1 && tagStored[0] == aid, "stored-match should find array member");
+
+    // Query-values stored-only should not boost
+    const std::string qvStoredIndex = "qv_stored";
+    BlackBox::IndexSchema qvStoredSchema;
+    qvStoredSchema.schema = {
+        {"fields", {
+            {"title", "text"},
+            {"queries", {{"type","query_values"}, {"searchable", false}}}
+        }}
+    };
+    expect(db.createIndex(qvStoredIndex, qvStoredSchema), "create qv stored-only index");
+    auto qvsId = db.indexDocument(qvStoredIndex, R"({"title":"plain","queries":[{"query":"boostme","score":1.0}]})");
+    auto qvsHits = db.search(qvStoredIndex, "boostme", "bm25");
+    expect(qvsHits.empty(), "query_values stored-only should not affect search");
+    auto qvsStored = db.scanStoredEquals(qvStoredIndex, "queries", json::object({{"query","boostme"},{"score",1.0}}));
+    expect(qvsStored.size() == 1 && qvsStored[0] == qvsId, "stored-match should find query_values payload");
+
+    // Doc_id uniqueness: updating same doc_id should be allowed
+    auto uid1b = db.lookupDocId(uniqIndex, "ABC");
+    expect(uid1b.has_value(), "doc_id should be present");
+    expect(db.updateDocument(uniqIndex, *uid1b, R"({"title":"updated title"})", true), "update existing doc_id");
+    auto updatedDoc = db.getDocument(uniqIndex, *uid1b);
+    expect(updatedDoc["title"] == "updated title", "doc updated in place");
+
+    // Relation validation when cross-index not allowed
+    const std::string relStrictIdx = "rel_strict";
+    BlackBox::IndexSchema relStrictSchema;
+    relStrictSchema.schema = {
+        {"fields", {{"title", "text"}, {"parent", "text"}}},
+        {"relation", {{"field","parent"}, {"target_index","rel_strict"}, {"allow_cross_index", false}}}
+    };
+    expect(db.createIndex(relStrictIdx, relStrictSchema), "create strict relation index");
+    bool relThrew = false;
+    try {
+        db.indexDocument(relStrictIdx, R"({"title":"bad","parent":{"id":"1","index":"other"}})");
+    } catch (...) {
+        relThrew = true;
+    }
+    expect(relThrew, "cross-index relation should be rejected when disallowed");
+
+    // Persist current state so reopened instances see newly added indexes
+    expect(db.saveSnapshot(), "snapshot save before wal reopen");
+
+    // WAL header persistence across reopen (ensure magic is present after new header write)
+    {
+        BlackBox dbWal(dataDir);
+        auto wid = dbWal.indexDocument(arrayIndex, R"({"title":"wal-ping","tags":["wal"]})");
+        expect(wid > 0, "wal write doc");
+    }
+    {
+        std::ifstream wal((std::filesystem::path(dataDir) / (arrayIndex + ".wal")).string(), std::ios::binary);
+        expect(static_cast<bool>(wal), "wal exists after reopen");
+        char magic[5] = {0};
+        wal.read(magic, 5);
+        expect(std::string(magic, 5) == "BBWAL", "wal magic present after reopen");
+    }
+
     // Fuzzy search returns results with edit distance
     auto fuzzy2 = db.search(indexName, "quik", "fuzzy", 10, 2);
     expect(!fuzzy2.empty(), "fuzzy search should still return");
 
+    // Stats should surface WAL mismatch/upgrade flags (default false)
+    auto stats = db.stats();
+    expect(!stats.empty(), "stats not empty");
+    for (const auto& st : stats) {
+        expect(!st.walSchemaMismatch, "wal schema mismatch should be false");
+        expect(!st.walUpgraded, "wal upgraded should be false");
+    }
+
     std::cout << "All tests passed." << std::endl;
     return 0;
+} catch (const std::exception& e) {
+    std::cerr << "Test failed with exception: " << e.what() << std::endl;
+    return 1;
+} catch (...) {
+    std::cerr << "Test failed with unknown exception" << std::endl;
+    return 1;
+}
 }

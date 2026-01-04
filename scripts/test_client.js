@@ -786,6 +786,88 @@ async function runStress(maxDocs, concurrency, batchSize = 200) {
   }
 }
 
+async function runSnapshotTest() {
+  const name = `snapshot_${Date.now()}`;
+  const snapshotDir = path.join(serverCwd, "data", `${name}_snap`);
+  const snapshotPath = path.join(snapshotDir, "index.manifest");
+  const results = {
+    timestamp: new Date().toISOString(),
+    index: name,
+    snapshotPath,
+    steps: [],
+  };
+  let proc = null;
+  try {
+    proc = startServerProcess();
+    await waitForServer();
+    results.steps.push({ step: "server_start", status: "ok" });
+    await ensureIndex(name, {
+      fields: {
+        title: "text",
+        body: "text",
+        version: { type: "number", searchable: false },
+      },
+    });
+    const docRes = await indexDoc(name, {
+      title: "snap",
+      body: "persist me",
+      version: 1,
+    });
+    const docId = docRes.data?.data?.id;
+    results.steps.push({ step: "index_doc", status: docRes.status, id: docId });
+
+    // Save snapshot to a custom path
+    const snapRes = await axios.post(`/v1/snapshot?path=${encodeURIComponent(snapshotPath)}`);
+    results.steps.push({ step: "snapshot_save", status: snapRes.status });
+
+    // Mutate state (delete doc) to ensure load restores it
+    await axios.delete(`/v1/${name}/doc/${docId}`);
+    results.steps.push({ step: "delete_doc", status: "ok" });
+
+    // Stop server and wipe data dir to force load from snapshot
+    await stopServerProcess(proc);
+    proc = null;
+    results.steps.push({ step: "shutdown", status: "ok" });
+    try {
+      fs.rmSync(path.join(serverCwd, "data"), { recursive: true, force: true });
+      results.steps.push({ step: "wipe_data", status: "ok" });
+    } catch (e) {
+      results.steps.push({ step: "wipe_data", status: "failed", error: e.message });
+    }
+
+    // Restart and load from snapshot
+    proc = startServerProcess();
+    await waitForServer();
+    results.steps.push({ step: "restart", status: "ok" });
+    const loadRes = await axios.post(`/v1/snapshot/load?path=${encodeURIComponent(snapshotPath)}`);
+    results.steps.push({ step: "snapshot_load", status: loadRes.status });
+
+    const search = await runSearch(name, { q: "persist", mode: "bm25" });
+    results.steps.push({
+      step: "search_after_load",
+      status: search.status,
+      hits: search.data?.data?.hits?.length ?? 0,
+    });
+    const stored = await axios.get(`/v1/${name}/stored_match?field=version&value=1`);
+    results.steps.push({
+      step: "stored_match_after_load",
+      status: stored.status,
+      hits: stored.data?.data?.hits?.length ?? 0,
+    });
+    results.status = "ok";
+  } catch (e) {
+    results.status = "error";
+    results.error = e.message;
+    console.error("Snapshot test failed:", e);
+  } finally {
+    await stopServerProcess(proc);
+    const outPath = path.join(__dirname, "snapshot_results.json");
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, JSON.stringify(results, null, 2), "utf8");
+    console.log(`Snapshot test results written to ${outPath}`);
+  }
+}
+
 function promptMenu() {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -798,7 +880,8 @@ function promptMenu() {
     console.log("  3) Stress (bulk spam until limit)");
     console.log("  4) Query-values / non-searchable fields");
     console.log("  5) Full relations + images + query_values");
-    rl.question("Enter choice [1-5]: ", (answer) => {
+    console.log("  6) Snapshot save/load");
+    rl.question("Enter choice [1-6]: ", (answer) => {
       rl.close();
       resolve(answer.trim());
     });
@@ -835,6 +918,8 @@ async function main() {
     await runQueryValueTest();
   } else if (choice === "5") {
     await runFullFeatureTest();
+  } else if (choice === "6") {
+    await runSnapshotTest();
   } else {
     console.log("Invalid choice.");
     process.exit(1);
