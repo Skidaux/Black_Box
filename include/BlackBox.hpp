@@ -80,12 +80,13 @@ public:
     using DocId = uint32_t;
     using SearchHit = algo::SearchHit;
 
-    enum class FieldType { Text, ArrayString, Bool, Number, Vector, Image, Unknown };
+    enum class FieldType { Text, ArrayString, Bool, Number, Vector, Image, QueryValues, Unknown };
 
     struct IndexSchema {
         nlohmann::json schema;
         uint32_t vectorDim = 0; // optional vector dimension for vector field
         std::unordered_map<std::string, FieldType> fieldTypes;
+        std::unordered_map<std::string, bool> searchable;
         std::string vectorField;
         std::unordered_map<std::string, size_t> imageMaxKB;
         uint32_t schemaVersion = 1;
@@ -163,6 +164,7 @@ public:
     std::optional<nlohmann::json> getCustomApi(const std::string& name) const;
     nlohmann::json listCustomApis() const;
     nlohmann::json runCustomApi(const std::string& name, const nlohmann::json& params) const;
+    std::vector<DocId> scanStoredEquals(const std::string& index, const std::string& field, const nlohmann::json& value) const;
     bool shouldBackpressure(const std::string& index) const;
 
 private:
@@ -205,6 +207,9 @@ private:
         std::unordered_map<DocId, std::vector<DocId>> annGraph;
         uint32_t annM = 16;
         uint32_t annEfSearch = 64;
+        // query_values index
+        std::unordered_map<std::string, std::vector<std::pair<DocId, double>>> queryValueIndex;
+        std::unordered_map<DocId, std::vector<std::pair<std::string, double>>> queryValuesByDoc;
         std::vector<SegmentMetadata> segments;
         WalWriter wal;
         size_t opsSinceFlush = 0;
@@ -248,6 +253,9 @@ private:
     void indexJson(IndexState& idx, DocId id, const nlohmann::json& j);
     void indexJsonRecursive(IndexState& idx, DocId id, const nlohmann::json& node);
     void indexStructured(IndexState& idx, DocId id, const nlohmann::json& doc);
+    void indexQueryValues(IndexState& idx, DocId id, const std::string& field, const nlohmann::json& node);
+    void clearQueryValues(IndexState& idx, DocId id);
+    void rebuildQueryValues(IndexState& idx);
 
     // Remove indexed terms for a document
     void removeJson(IndexState& idx, DocId id, const nlohmann::json& j);
@@ -260,6 +268,7 @@ private:
     void rebuildAnn(IndexState& idx) const;
     void rebuildHnsw(IndexState& idx) const;
     std::vector<SearchHit> searchHnsw(IndexState& idx, const std::vector<float>& queryVec, size_t maxResults) const;
+    void applyQueryValueBoost(const std::string& query, const IndexState& idx, size_t maxResults, std::vector<SearchHit>& hits) const;
 
     bool validateDocument(const IndexState& idx, const nlohmann::json& doc) const;
 

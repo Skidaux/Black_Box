@@ -144,6 +144,24 @@ int main() {
     auto after = db.getDocument(indexName, newId)["_updated_at"].get<int64_t>();
     expect(after > before, "_updated_at should advance on update");
 
+    // Non-searchable and query_values fields
+    const std::string extraIndex = "meta_index";
+    BlackBox::IndexSchema extraSchema;
+    extraSchema.schema = {
+        {"fields", {
+            {"title", "text"},
+            {"version", {{"type","number"}, {"searchable", false}}},
+            {"queries", {{"type","query_values"}, {"searchable", true}}}
+        }}
+    };
+    expect(db.createIndex(extraIndex, extraSchema), "create meta index");
+    auto mid = db.indexDocument(extraIndex, R"({"title":"Versioned","version":1,"queries":[{"query":"yt","score":1.0}]})");
+    // version should be stored but not searchable; query_values should boost
+    auto hitsLex = db.search(extraIndex, "version", "bm25");
+    expect(hitsLex.empty(), "non-searchable field should not be indexed");
+    auto hitsBoost = db.search(extraIndex, "yt", "bm25");
+    expect(!hitsBoost.empty() && hitsBoost[0].id == mid, "query_values boost should surface doc");
+
     // Bulk indexing via HTTP client simulated: ensure uniqueness enforcement on doc_id
     const std::string uniqIndex = "uniq_index";
     BlackBox::IndexSchema uniqSchema;

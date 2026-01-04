@@ -30,6 +30,7 @@
 - Postings: term → sorted doc IDs; AND queries intersect; OR/phrase planned.
 - Schemas can declare `doc_id` (e.g., `{"field":"sku","type":"string","enforce_unique":true}`) to expose a stable document identifier. Operations accept auto IDs or custom IDs.
 - Optional `relation` config (`{"field":"parent","target_index":"orders","allow_cross_index":false}`) lets documents reference other docs; search can inline or hierarchy-group relations with depth limits.
+- Optional non-searchable fields (`searchable:false`) are stored but excluded from indexes; a stored-field scan endpoint exists for maintenance/migrations. A `query_values` field type stores arrays of `{query, score}` pairs (score 0..1) without affecting search.
 - `image` field type stores raw binary payloads (PNG/ICO/etc.) with `max_kb` enforcement; WAL/snapshot encode images separately to avoid base64 bloat.
 - Custom aggregation APIs compose multi-index views (e.g., page→site→favicon) with declarative projections and relation trees while reusing search/filter knobs.
 

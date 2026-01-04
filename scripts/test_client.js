@@ -364,6 +364,53 @@ async function runBenchmark() {
   }
 }
 
+async function runQueryValueTest() {
+  const index = `query_meta_${Date.now()}`;
+  const schema = {
+    fields: {
+      title: "text",
+      version: { type: "number", searchable: false },
+      queries: { type: "query_values", searchable: true },
+    },
+  };
+  const results = { index, status: "pending", steps: [] };
+  try {
+    let res = await ensureIndex(index, schema);
+    results.steps.push({ step: "create_index", status: res.status });
+
+    res = await indexDoc(index, {
+      title: "YouTube root",
+      version: 1,
+      queries: [{ query: "yt", score: 1.0 }, { query: "video", score: 0.6 }],
+    });
+    const ytId = res.data?.data?.id;
+    results.steps.push({ step: "index_doc", status: res.status, id: ytId });
+
+    res = await runSearch(index, { q: "version", mode: "bm25" });
+    const versionHits = res.data?.data?.hits ?? [];
+    results.steps.push({ step: "search_version", status: res.status, hits: versionHits.length });
+
+    res = await runSearch(index, { q: "yt", mode: "bm25" });
+    const ytHits = res.data?.data?.hits ?? [];
+    const topId = ytHits[0]?.id;
+    results.steps.push({ step: "search_yt", status: res.status, topId });
+
+    const sm = await axios.get(`/v1/${index}/stored_match?field=version&value=1`);
+    results.steps.push({ step: "stored_match_version", status: sm.status, hits: sm.data?.data?.hits?.length ?? 0 });
+
+    results.status = "ok";
+    console.log("Query-value test results:", results);
+  } catch (e) {
+    results.status = "error";
+    results.error = e.message;
+    console.error("Query-value test failed:", e);
+  } finally {
+    const outPath = path.join(__dirname, "query_value_results.json");
+    fs.writeFileSync(outPath, JSON.stringify(results, null, 2), "utf8");
+    console.log(`Query-value results written to ${outPath}`);
+  }
+}
+
 async function runDurability() {
   const testIndex = `durability_${Date.now()}`;
   const results = {
@@ -586,10 +633,11 @@ function promptMenu() {
   });
   return new Promise((resolve) => {
     console.log("Select a test to run:");
-    console.log("  1) Benchmark (multi-index, bulk, searches)");
-    console.log("  2) Durability (restart and verify persistence)");
-    console.log("  3) Stress (bulk spam until limit)");
-    rl.question("Enter choice [1-3]: ", (answer) => {
+  console.log("  1) Benchmark (multi-index, bulk, searches)");
+  console.log("  2) Durability (restart and verify persistence)");
+  console.log("  3) Stress (bulk spam until limit)");
+  console.log("  4) Query-values / non-searchable fields");
+  rl.question("Enter choice [1-4]: ", (answer) => {
       rl.close();
       resolve(answer.trim());
     });
@@ -622,6 +670,8 @@ async function main() {
     const concurrency = await promptNumber("Concurrency", 32);
     const batchSize = await promptNumber("Bulk batch size", 200);
     await runStress(maxDocs, concurrency, batchSize);
+  } else if (choice === "4") {
+    await runQueryValueTest();
   } else {
     console.log("Invalid choice.");
     process.exit(1);

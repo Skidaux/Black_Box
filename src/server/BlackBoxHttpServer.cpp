@@ -143,6 +143,40 @@ void BlackBoxHttpServer::setupRoutes() {
         addCors(res);
     });
 
+    // --- STORED FIELD MATCH (non-searchable fields) ---
+    server_.Get(R"(/v1/([^/]+)/stored_match)", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+        std::string index = req.matches[1];
+        auto field = req.get_param_value("field");
+        auto value = req.get_param_value("value");
+        if (field.empty()) {
+            res.status = 400;
+            res.set_content(err(400, "Missing 'field'").dump(), "application/json");
+            addCors(res);
+            return;
+        }
+        json parsedValue = json::parse(value, nullptr, false);
+        if (parsedValue.is_discarded()) {
+            parsedValue = value;
+        }
+        try {
+            auto ids = db_.scanStoredEquals(index, field, parsedValue);
+            json hits = json::array();
+            for (auto id : ids) {
+                try {
+                    auto doc = db_.getDocument(index, id);
+                    json d = {{"id", id}, {"doc", doc}};
+                    if (auto ext = db_.externalIdForDoc(index, id)) d["doc_id"] = *ext;
+                    hits.push_back(std::move(d));
+                } catch (...) {}
+            }
+            res.set_content(ok(json{{"total", hits.size()}, {"hits", hits}}).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(err(400, e.what()).dump(), "application/json");
+        }
+        addCors(res);
+    });
+
     // --- PROMETHEUS METRICS ---
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         auto now = std::chrono::steady_clock::now();

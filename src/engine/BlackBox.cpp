@@ -1243,17 +1243,23 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
     auto terms = tokenize(query);
     if (terms.empty()) return {};
     algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen, &idx.skipPointers};
-    if (mode == "lexical") return algo::searchLexical(ctx, terms);
-    if (mode == "or" || mode == "bm25_or") return algo::searchBm25Or(ctx, terms, maxResults);
-    if (mode == "fuzzy") return algo::searchFuzzy(ctx, terms, maxEditDistance, maxResults);
-    if (mode == "semantic" || mode == "vector" || mode == "tfidf") {
-        auto hits = algo::searchSemantic(ctx, terms, maxResults);
-        if (!hits.empty()) return hits;
-        return algo::searchBm25(ctx, terms, maxResults);
+    std::vector<SearchHit> hits;
+    if (mode == "lexical") {
+        hits = algo::searchLexical(ctx, terms);
+    } else if (mode == "or" || mode == "bm25_or") {
+        hits = algo::searchBm25Or(ctx, terms, maxResults);
+    } else if (mode == "fuzzy") {
+        hits = algo::searchFuzzy(ctx, terms, maxEditDistance, maxResults);
+    } else if (mode == "semantic" || mode == "vector" || mode == "tfidf") {
+        hits = algo::searchSemantic(ctx, terms, maxResults);
+        if (hits.empty()) hits = algo::searchBm25(ctx, terms, maxResults);
+    } else {
+        hits = algo::searchBm25(ctx, terms, maxResults);
+        if (hits.empty()) hits = algo::searchLexical(ctx, terms);
     }
-    auto hits = algo::searchBm25(ctx, terms, maxResults);
-    if (!hits.empty()) return hits;
-    return algo::searchLexical(ctx, terms);
+    applyQueryValueBoost(query, idx, maxResults, hits);
+    if (hits.size() > maxResults) hits.resize(maxResults);
+    return hits;
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index, const std::string& query, double wBm25, double wSemantic, double wLexical, size_t maxResults) const {
@@ -1284,6 +1290,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
         if (a.score == b.score) return a.id < b.id;
         return a.score > b.score;
     });
+    applyQueryValueBoost(query, idx, maxResults, out);
     if (out.size() > maxResults) out.resize(maxResults);
     return out;
 }
@@ -1376,6 +1383,49 @@ void BlackBox::refreshAverages(IndexState& idx) {
     idx.avgDocLen = static_cast<double>(total) / static_cast<double>(idx.docLengths.size());
 }
 
+void BlackBox::indexQueryValues(IndexState& idx, DocId id, const std::string& field, const nlohmann::json& node) {
+    clearQueryValues(idx, id);
+    if (!idx.schema.searchable.count(field) || !idx.schema.searchable.at(field)) return;
+    if (!node.is_array()) return;
+    for (const auto& entry : node) {
+        if (!entry.is_object()) continue;
+        auto q = entry.value("query", "");
+        double s = entry.value("score", 0.0);
+        if (q.empty()) continue;
+        idx.queryValueIndex[q].push_back({id, s});
+        idx.queryValuesByDoc[id].push_back({q, s});
+    }
+}
+
+void BlackBox::clearQueryValues(IndexState& idx, DocId id) {
+    auto it = idx.queryValuesByDoc.find(id);
+    if (it == idx.queryValuesByDoc.end()) return;
+    for (const auto& kv : it->second) {
+        const auto& q = kv.first;
+        auto mapIt = idx.queryValueIndex.find(q);
+        if (mapIt == idx.queryValueIndex.end()) continue;
+        auto& vec = mapIt->second;
+        vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const std::pair<DocId,double>& p){ return p.first == id; }), vec.end());
+        if (vec.empty()) idx.queryValueIndex.erase(mapIt);
+    }
+    idx.queryValuesByDoc.erase(it);
+}
+
+void BlackBox::rebuildQueryValues(IndexState& idx) {
+    idx.queryValueIndex.clear();
+    idx.queryValuesByDoc.clear();
+    for (const auto& docEntry : idx.documents) {
+        DocId id = docEntry.first;
+        const auto& doc = docEntry.second;
+        for (const auto& ft : idx.schema.fieldTypes) {
+            if (ft.second != FieldType::QueryValues) continue;
+            const auto& key = ft.first;
+            if (!doc.contains(key)) continue;
+            indexQueryValues(idx, id, key, doc[key]);
+        }
+    }
+}
+
 std::vector<std::string> BlackBox::tokenize(const std::string& text) const {
     return Analyzer::tokenize(text);
 }
@@ -1453,16 +1503,20 @@ void BlackBox::indexStructured(IndexState& idx, DocId id, const json& doc) {
         if (!doc.contains(key)) continue;
         const auto& val = doc[key];
         if (type == FieldType::Text && val.is_string()) {
-            auto terms = tokenize(val.get<std::string>());
-            idx.docLengths[id] += static_cast<uint32_t>(terms.size());
-            for (const auto& t : terms) addPosting(idx, t, id, 1);
+            if (idx.schema.searchable.at(key)) {
+                auto terms = tokenize(val.get<std::string>());
+                idx.docLengths[id] += static_cast<uint32_t>(terms.size());
+                for (const auto& t : terms) addPosting(idx, t, id, 1);
+            }
         } else if (type == FieldType::ArrayString && val.is_array()) {
             for (const auto& elem : val) {
                 if (elem.is_string()) {
-                    auto terms = tokenize(elem.get<std::string>());
-                    idx.docLengths[id] += static_cast<uint32_t>(terms.size());
-                    for (const auto& t : terms) addPosting(idx, t, id, 1);
-                    idx.stringLists[key][elem.get<std::string>()].push_back(id);
+                    if (idx.schema.searchable.at(key)) {
+                        auto terms = tokenize(elem.get<std::string>());
+                        idx.docLengths[id] += static_cast<uint32_t>(terms.size());
+                        for (const auto& t : terms) addPosting(idx, t, id, 1);
+                        idx.stringLists[key][elem.get<std::string>()].push_back(id);
+                    }
                 }
             }
         } else if (type == FieldType::Vector) {
@@ -1470,10 +1524,12 @@ void BlackBox::indexStructured(IndexState& idx, DocId id, const json& doc) {
             continue;
         } else if (type == FieldType::Image) {
             continue;
+        } else if (type == FieldType::QueryValues) {
+            indexQueryValues(idx, id, key, val);
         } else if (type == FieldType::Bool && val.is_boolean()) {
-            idx.boolValues[key][id] = val.get<bool>();
+            if (idx.schema.searchable.at(key)) idx.boolValues[key][id] = val.get<bool>();
         } else if (type == FieldType::Number && val.is_number()) {
-            idx.numericValues[key][id] = val.get<double>();
+            if (idx.schema.searchable.at(key)) idx.numericValues[key][id] = val.get<double>();
         }
     }
 }
@@ -1490,17 +1546,23 @@ void BlackBox::removeJson(IndexState& idx, DocId id, const json& j) {
         if (!j.contains(key)) continue;
         const auto& val = j[key];
         if (type == FieldType::Text && val.is_string()) {
-            auto terms = tokenize(val.get<std::string>());
-            for (const auto& t : terms) removePosting(idx, t, id);
+            if (idx.schema.searchable.at(key)) {
+                auto terms = tokenize(val.get<std::string>());
+                for (const auto& t : terms) removePosting(idx, t, id);
+            }
         } else if (type == FieldType::ArrayString && val.is_array()) {
             for (const auto& elem : val) {
                 if (elem.is_string()) {
-                    auto terms = tokenize(elem.get<std::string>());
-                    for (const auto& t : terms) removePosting(idx, t, id);
+                    if (idx.schema.searchable.at(key)) {
+                        auto terms = tokenize(elem.get<std::string>());
+                        for (const auto& t : terms) removePosting(idx, t, id);
+                    }
                 }
             }
         } else if (type == FieldType::Image) {
             continue;
+        } else if (type == FieldType::QueryValues) {
+            clearQueryValues(idx, id);
         }
     }
 }
@@ -1775,6 +1837,26 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHnsw(IndexState& idx, const std
     return hits;
 }
 
+void BlackBox::applyQueryValueBoost(const std::string& query, const IndexState& idx, size_t maxResults, std::vector<SearchHit>& hits) const {
+    if (query.empty()) return;
+    auto it = idx.queryValueIndex.find(query);
+    if (it == idx.queryValueIndex.end()) return;
+    const double kBoost = 10.0;
+    std::unordered_map<DocId, double> scoreMap;
+    for (const auto& h : hits) scoreMap[h.id] = h.score;
+    for (const auto& entry : it->second) {
+        scoreMap[entry.first] += entry.second * kBoost;
+    }
+    hits.clear();
+    hits.reserve(scoreMap.size());
+    for (const auto& kv : scoreMap) hits.push_back({kv.first, kv.second});
+    std::sort(hits.begin(), hits.end(), [](const SearchHit& a, const SearchHit& b) {
+        if (a.score == b.score) return a.id < b.id;
+        return a.score > b.score;
+    });
+    if (hits.size() > maxResults) hits.resize(maxResults);
+}
+
 bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc) const {
     for (const auto& ft : idx.schema.fieldTypes) {
         const auto& key = ft.first;
@@ -1804,6 +1886,16 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
         case FieldType::Image:
             if (!val.is_object()) return false;
             if (!val.contains("content") || !val["content"].is_string()) return false;
+            break;
+        case FieldType::QueryValues:
+            if (!val.is_array()) return false;
+            for (const auto& e : val) {
+                if (!e.is_object()) return false;
+                if (!e.contains("query") || !e["query"].is_string()) return false;
+                if (!e.contains("score") || !e["score"].is_number()) return false;
+                double s = e["score"].get<double>();
+                if (s < 0.0 || s > 1.0) return false;
+            }
             break;
         default:
             break;
@@ -2025,7 +2117,7 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
     auto it = idx.documents.find(id);
     if (it == idx.documents.end()) return false;
     removeJson(idx, id, it->second);
-    idx.documents.erase(it);
+        idx.documents.erase(it);
     auto extIt = idx.docIdToExternal.find(id);
     if (extIt != idx.docIdToExternal.end()) {
         idx.externalToDocId.erase(extIt->second);
@@ -2033,6 +2125,7 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
     }
     idx.docLengths.erase(id);
     idx.vectors.erase(id);
+    clearQueryValues(idx, id);
     for (auto& kv : idx.boolValues) kv.second.erase(id);
     for (auto& kv : idx.numericValues) kv.second.erase(id);
     for (auto& kv : idx.stringLists) {
@@ -2343,6 +2436,12 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
                 const_cast<BlackBox*>(this)->indexStructured(tmp, id, itDoc->second);
                 auto vecIt = idx.vectors.find(id);
                 if (vecIt != idx.vectors.end()) tmp.vectors[id] = vecIt->second;
+                // carry query_values index for searchable fields
+                for (const auto& field : idx.schema.fieldTypes) {
+                    if (field.second != FieldType::QueryValues) continue;
+                    if (!itDoc->second.contains(field.first)) continue;
+                    const_cast<BlackBox*>(this)->indexQueryValues(tmp, id, field.first, itDoc->second[field.first]);
+                }
                 // carry numeric/bool/string doc values
                 for (const auto& n : idx.numericValues) {
                     auto itv = n.second.find(id);
@@ -2606,6 +2705,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         }
 
         refreshAverages(state);
+        rebuildQueryValues(state);
         // init WAL
         if (!dataDir_.empty()) {
             state.wal.path = (fs::path(dataDir_) / (name + ".wal")).string();
@@ -2671,6 +2771,7 @@ void BlackBox::loadWalOnly() {
         state.annProbes = defaultAnnProbes_;
         state.annM = defaultAnnM_;
         state.annEfSearch = defaultAnnEfSearch_;
+        rebuildQueryValues(state);
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: built index " << name << " from WAL\n";
     }
@@ -2679,6 +2780,7 @@ void BlackBox::loadWalOnly() {
 
 void BlackBox::configureSchema(IndexState& state) {
     state.schema.fieldTypes.clear();
+    state.schema.searchable.clear();
     state.schema.vectorField.clear();
     state.schema.vectorDim = 0;
     state.schema.imageMaxKB.clear();
@@ -2686,22 +2788,32 @@ void BlackBox::configureSchema(IndexState& state) {
     state.schema.relation.reset();
     if (state.schema.schema.contains("fields") && state.schema.schema["fields"].is_object()) {
         for (auto it = state.schema.schema["fields"].begin(); it != state.schema.schema["fields"].end(); ++it) {
+            bool searchable = true;
+            std::string typeStr;
             if (it.value().is_string()) {
-                auto t = it.value().get<std::string>();
-                if (t == "text") state.schema.fieldTypes[it.key()] = FieldType::Text;
-                else if (t == "array") state.schema.fieldTypes[it.key()] = FieldType::ArrayString;
-                else if (t == "bool") state.schema.fieldTypes[it.key()] = FieldType::Bool;
-                else if (t == "number") state.schema.fieldTypes[it.key()] = FieldType::Number;
+                typeStr = it.value().get<std::string>();
             } else if (it.value().is_object()) {
-                auto type = it.value().value("type", "");
-                if (type == "vector") {
+                typeStr = it.value().value("type", "");
+                searchable = !(it.value().value("searchable", true) == false || it.value().value("index", true) == false);
+                if (typeStr == "vector") {
                     state.schema.vectorField = it.key();
                     state.schema.vectorDim = it.value().value("dim", 0);
                     state.schema.fieldTypes[it.key()] = FieldType::Vector;
-                } else if (type == "image") {
+                    searchable = true; // vectors always searchable
+                } else if (typeStr == "image") {
                     state.schema.fieldTypes[it.key()] = FieldType::Image;
                     state.schema.imageMaxKB[it.key()] = static_cast<size_t>(std::max<uint64_t>(1, it.value().value("max_kb", 256ull)));
                 }
+            }
+            if (!typeStr.empty()) {
+                if (typeStr == "text") state.schema.fieldTypes[it.key()] = FieldType::Text;
+                else if (typeStr == "array") state.schema.fieldTypes[it.key()] = FieldType::ArrayString;
+                else if (typeStr == "bool") state.schema.fieldTypes[it.key()] = FieldType::Bool;
+                else if (typeStr == "number") state.schema.fieldTypes[it.key()] = FieldType::Number;
+                else if (typeStr == "query_values") state.schema.fieldTypes[it.key()] = FieldType::QueryValues;
+            }
+            if (!typeStr.empty()) {
+                state.schema.searchable[it.key()] = searchable;
             }
         }
     }
@@ -2840,6 +2952,35 @@ json BlackBox::runCustomApi(const std::string& name, const json& params) const {
     auto spec = it->second;
     lk.unlock();
     return executeCustomApiInternal(name, spec, params);
+}
+
+std::vector<BlackBox::DocId> BlackBox::scanStoredEquals(const std::string& index, const std::string& field, const nlohmann::json& value) const {
+    std::vector<DocId> hits;
+    std::shared_lock<std::shared_mutex> lk(mutex_);
+    auto it = indexes_.find(index);
+    if (it == indexes_.end()) return hits;
+    const IndexState& idx = it->second;
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
+    for (const auto& kv : idx.documents) {
+        const auto& doc = kv.second;
+        if (!doc.contains(field)) continue;
+        const auto& node = doc[field];
+        if (node.type() != value.type()) {
+            continue;
+        }
+        if (node == value) {
+            hits.push_back(kv.first);
+        } else if (node.is_array()) {
+            // allow membership test for array fields
+            for (const auto& elem : node) {
+                if (elem.type() == value.type() && elem == value) {
+                    hits.push_back(kv.first);
+                    break;
+                }
+            }
+        }
+    }
+    return hits;
 }
 
 bool BlackBox::shouldBackpressure(const std::string& index) const {

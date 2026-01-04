@@ -43,6 +43,8 @@ Base URL: `http://127.0.0.1:8080`
 Schema extensions:
 - `doc_id`: `{ "field": "sku", "type": "string", "enforce_unique": true }` – designates the field that becomes the public document ID.
 - `relation`: `{ "field": "parent", "target_index": "orders", "allow_cross_index": true }` – stores a relation reference (object `{ "id": "...", "index": "..." }` or shorthand string/number). If `allow_cross_index` is false, relation targets must stay within the configured `target_index` (or the same index when empty).
+- Non-searchable fields: define fields with `{"type":"text|number|bool|array","searchable":false}` (or `index:false`) to store the value without adding it to the inverted index/doc-values. Use the stored-match endpoint to query them.
+- Query-values field: `{"type":"query_values","searchable":true|false}` accepts an array of objects `{ "query": "text", "score": <0..1> }`. When `searchable:true`, the query string is boosted during search (higher scores rank earlier even if content text is weak); when `false`, values are stored-only.
 
 ## Search
 - `GET /v1/{index}/search`
@@ -136,6 +138,9 @@ Environment variables:
 - `DELETE /v1/custom/{name}` – remove template.
 - `POST /v1/custom/{name}` – execute template. Body accepts the same search parameters as `/v1/{index}/search` (e.g., `q`, `mode`, `from`, `size`, `vec`, `distance`, `w_bm25`, etc.).
 - Responses mirror normal search hits but follow the template’s projection and nested relation definitions.
+
+## Stored-field lookup
+- `GET /v1/{index}/stored_match?field=...&value=...` – scans stored docs (including non-searchable fields) for exact matches; `value` can be JSON (numbers, bools) or string. Returns ids/docs; intended for migration/maintenance use.
 
 ## Notes for Library Authors
 - All endpoints return JSON with `{status:"ok",data:...}` or `{status:"error",error:{code,message}}`.
