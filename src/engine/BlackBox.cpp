@@ -21,6 +21,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "minielastic/Checksum.hpp"
 
 using json = nlohmann::json;
@@ -409,7 +415,12 @@ static bool writeSnapshotFile(const std::string& path,
 
 static void flushFilePath(const std::string& path) {
 #ifdef _WIN32
-    (void)path; // best-effort flush already done on stream; no portable fsync on Windows here.
+    // Best-effort Windows flush using FlushFileBuffers on the path
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
 #else
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd >= 0) {
@@ -977,7 +988,7 @@ BlackBox::~BlackBox() {
             kv.second.wal.maybeFlush(true);
         }
     }
-    writeManifest();
+    (void)writeManifest();
 }
 
 bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
@@ -989,6 +1000,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     indexes_[name].annClusters = defaultAnnClusters_;
     indexes_[name].annClusters = defaultAnnClusters_;
     configureSchema(indexes_[name]);
+    persistSchema(name, indexes_[name]);
     // init WAL
     if (!dataDir_.empty()) {
         indexes_[name].wal.path = (std::filesystem::path(dataDir_) / (name + ".wal")).string();
@@ -1602,6 +1614,17 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
                 const auto& rv = rel["id"];
                 if (!(rv.is_string() || rv.is_number_integer())) return false;
                 if (rel.contains("index") && !rel["index"].is_string()) return false;
+                if (!cfg.allowCrossIndex && rel.contains("index")) {
+                    std::string idxName = rel["index"].get<std::string>();
+                    std::string target = cfg.targetIndex;
+                    if (target.empty()) {
+                        if (!idxName.empty()) return false;
+                    } else {
+                        if (!idxName.empty() && idxName != target) return false;
+                    }
+                }
+            } else if (!cfg.allowCrossIndex && !cfg.targetIndex.empty()) {
+                // string/number refs are allowed but implicitly bound to targetIndex; nothing to validate here
             }
         }
     }
@@ -1689,7 +1712,9 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const Processed
         }
         auto dup = idx.externalToDocId.find(*newExternal);
         if (dup != idx.externalToDocId.end() && dup->second != assignId) {
-            throw std::runtime_error("document id already exists");
+            if (idx.schema.docId->enforceUnique) {
+                throw std::runtime_error("document id already exists");
+            }
         }
     }
     std::optional<std::string> previousExternal;
@@ -1866,39 +1891,59 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
     }();
 
     fs::path segFile = fs::path(dataDir_) / (index + "_seg" + std::to_string(idx.segments.size()) + ".skd");
-    if (writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
-        // remove old segments to avoid resurrecting deleted docs on restart
-        for (const auto& seg : idx.segments) {
-            fs::path p = fs::path(dataDir_) / seg.file;
-            std::error_code ec;
-            fs::remove(p, ec);
-        }
-        idx.segments.clear();
-        SegmentMetadata meta;
-        if (!idx.documents.empty()) {
-            auto minmax = std::minmax_element(idx.documents.begin(), idx.documents.end(),
-                [](const auto& a, const auto& b){ return a.first < b.first; });
-            meta.minId = minmax.first->first;
-            meta.maxId = minmax.second->first;
-        }
-        meta.file = segFile.filename().string();
-        meta.walPos = idx.wal.offset;
-        if (!chunk.tombstones.empty()) {
-            meta.deletes = chunk.tombstones;
-            std::sort(meta.deletes.begin(), meta.deletes.end());
-            meta.deletes.erase(std::unique(meta.deletes.begin(), meta.deletes.end()), meta.deletes.end());
-        }
-        idx.segments.push_back(meta);
-        // reset WAL
-        idx.wal.reset();
-        idx.wal.open();
-        idx.opsSinceFlush = 0;
-        idx.tombstones.clear();
-        writeManifest();
-        idx.manifestDirty = false;
-        manifestDirty_.store(false, std::memory_order_relaxed);
-        maybeMergeSegments(index, idx);
+    if (!writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
+        return;
     }
+
+    // Stage new segment metadata
+    auto oldSegments = idx.segments;
+    auto oldPersistedDeletes = idx.persistedDeletes;
+    SegmentMetadata meta;
+    if (!idx.documents.empty()) {
+        auto minmax = std::minmax_element(idx.documents.begin(), idx.documents.end(),
+            [](const auto& a, const auto& b){ return a.first < b.first; });
+        meta.minId = minmax.first->first;
+        meta.maxId = minmax.second->first;
+    }
+    meta.file = segFile.filename().string();
+    meta.walPos = idx.wal.offset;
+    if (!chunk.tombstones.empty()) {
+        meta.deletes = chunk.tombstones;
+        std::sort(meta.deletes.begin(), meta.deletes.end());
+        meta.deletes.erase(std::unique(meta.deletes.begin(), meta.deletes.end()), meta.deletes.end());
+    }
+
+    idx.segments.clear();
+    idx.segments.push_back(meta);
+    idx.persistedDeletes.clear();
+    idx.persistedDeletes.insert(meta.deletes.begin(), meta.deletes.end());
+    idx.tombstones.clear();
+    idx.opsSinceFlush = 0;
+    idx.manifestDirty = false;
+    manifestDirty_.store(false, std::memory_order_relaxed);
+
+    bool manifestOk = writeManifest();
+    if (!manifestOk) {
+        // revert to old state; keep WAL intact for recovery
+        idx.segments = std::move(oldSegments);
+        idx.persistedDeletes = std::move(oldPersistedDeletes);
+        idx.manifestDirty = true;
+        manifestDirty_.store(true, std::memory_order_relaxed);
+        idx.opsSinceFlush = flushEveryDocs_; // trigger retry on next maintenance cycle
+        return;
+    }
+
+    // reset WAL after manifest is durable
+    idx.wal.reset();
+    idx.wal.open();
+
+    // remove old segments to avoid resurrecting deleted docs on restart
+    for (const auto& seg : oldSegments) {
+        fs::path p = fs::path(dataDir_) / seg.file;
+        std::error_code ec;
+        fs::remove(p, ec);
+    }
+    maybeMergeSegments(index, idx);
 }
 
 void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
@@ -1935,13 +1980,7 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         std::cerr << "BlackBox: mergeSegments failed to write " << segFile << "\n";
         return;
     }
-    // delete old segment files
-    for (const auto& seg : idx.segments) {
-        fs::path p = fs::path(dataDir_) / seg.file;
-        std::error_code ec;
-        fs::remove(p, ec);
-    }
-    idx.segments.clear();
+    auto oldSegments = idx.segments;
     SegmentMetadata meta;
     if (!idx.documents.empty()) {
         auto minmax = std::minmax_element(idx.documents.begin(), idx.documents.end(),
@@ -1956,23 +1995,39 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         std::sort(meta.deletes.begin(), meta.deletes.end());
         meta.deletes.erase(std::unique(meta.deletes.begin(), meta.deletes.end()), meta.deletes.end());
     }
+    idx.segments.clear();
     idx.segments.push_back(meta);
-    idx.wal.reset();
-    idx.wal.open();
-    idx.opsSinceFlush = 0;
     idx.persistedDeletes.clear();
+    idx.persistedDeletes.insert(meta.deletes.begin(), meta.deletes.end());
     idx.tombstones.clear();
-    writeManifest();
+    idx.opsSinceFlush = 0;
     idx.manifestDirty = false;
     manifestDirty_.store(false, std::memory_order_relaxed);
+    bool manifestOk = writeManifest();
+    if (!manifestOk) {
+        idx.segments = std::move(oldSegments);
+        idx.manifestDirty = true;
+        manifestDirty_.store(true, std::memory_order_relaxed);
+        idx.opsSinceFlush = flushEveryDocs_;
+        return;
+    }
+    idx.wal.reset();
+    idx.wal.open();
+    // delete old segment files
+    for (const auto& seg : oldSegments) {
+        fs::path p = fs::path(dataDir_) / seg.file;
+        std::error_code ec;
+        fs::remove(p, ec);
+    }
 }
 
-void BlackBox::writeManifest() const {
+bool BlackBox::writeManifest() const {
     namespace fs = std::filesystem;
-    if (dataDir_.empty()) return;
+    if (dataDir_.empty()) return true;
     fs::path manifestPath = fs::path(dataDir_) / "index.manifest";
     json manifest = {{"version", 1}, {"indexes", json::array()}};
     for (const auto& entry : indexes_) {
+        persistSchema(entry.first, entry.second);
         json segs = json::array();
         for (const auto& seg : entry.second.segments) {
             json segObj = {{"file", seg.file}, {"min_id", seg.minId}, {"max_id", seg.maxId}, {"wal_pos", seg.walPos}};
@@ -2000,7 +2055,9 @@ void BlackBox::writeManifest() const {
     fs::rename(tmpPath, manifestPath, ec);
     if (ec) {
         std::cerr << "BlackBox: failed to replace manifest at " << manifestPath << " err=" << ec.message() << "\n";
+        return false;
     }
+    return true;
 }
 
 void BlackBox::replayWal(IndexState& idx, uint64_t startOffset) {
@@ -2320,9 +2377,12 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         for (auto id : state.tombstones) state.persistedDeletes.insert(id);
         for (auto id : state.tombstones) applyDelete(state, id, false);
     }
-    indexes_[name] = std::move(state);
-    std::cerr << "BlackBox: loaded index " << name << " segments=" << segments.size() << "\n";
-}
+        indexes_[name] = std::move(state);
+        std::cerr << "BlackBox: loaded index " << name << " segments=" << segments.size() << "\n";
+    }
+    for (const auto& kv : indexes_) {
+        persistSchema(kv.first, kv.second);
+    }
     return true;
 }
 
@@ -2338,6 +2398,18 @@ void BlackBox::loadWalOnly() {
         if (indexes_.count(name)) continue;
         IndexState state;
         state.annClusters = defaultAnnClusters_;
+        // best-effort load schema sidecar so WAL replay has correct field config
+        fs::path schemaPath = fs::path(dataDir_) / (name + ".schema.json");
+        if (fs::exists(schemaPath)) {
+            std::ifstream schemaIn(schemaPath);
+            if (schemaIn) {
+                auto parsed = json::parse(schemaIn, nullptr, false);
+                if (!parsed.is_discarded()) {
+                    state.schema.schema = parsed;
+                    configureSchema(state);
+                }
+            }
+        }
         state.wal.path = path.string();
         state.wal.flushThresholdBytes = walFlushBytes_;
         state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
@@ -2346,13 +2418,14 @@ void BlackBox::loadWalOnly() {
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: built index " << name << " from WAL\n";
     }
-    writeManifest();
+    (void)writeManifest();
 }
 
 void BlackBox::configureSchema(IndexState& state) {
     state.schema.fieldTypes.clear();
     state.schema.vectorField.clear();
     state.schema.vectorDim = 0;
+    state.schema.imageMaxKB.clear();
     state.schema.docId.reset();
     state.schema.relation.reset();
     if (state.schema.schema.contains("fields") && state.schema.schema["fields"].is_object()) {
@@ -2369,6 +2442,9 @@ void BlackBox::configureSchema(IndexState& state) {
                     state.schema.vectorField = it.key();
                     state.schema.vectorDim = it.value().value("dim", 0);
                     state.schema.fieldTypes[it.key()] = FieldType::Vector;
+                } else if (type == "image") {
+                    state.schema.fieldTypes[it.key()] = FieldType::Image;
+                    state.schema.imageMaxKB[it.key()] = static_cast<size_t>(std::max<uint64_t>(1, it.value().value("max_kb", 256ull)));
                 }
             }
         }
@@ -2396,6 +2472,22 @@ void BlackBox::configureSchema(IndexState& state) {
     } else {
         state.schema.schema["schema_version"] = state.schema.schemaVersion;
     }
+}
+
+void BlackBox::persistSchema(const std::string& name, const IndexState& state) const {
+    if (dataDir_.empty()) return;
+    namespace fs = std::filesystem;
+    fs::path schemaPath = fs::path(dataDir_) / (name + ".schema.json");
+    std::error_code ec;
+    fs::create_directories(schemaPath.parent_path(), ec);
+    std::ofstream out(schemaPath, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        std::cerr << "BlackBox: failed to persist schema for " << name << " at " << schemaPath << "\n";
+        return;
+    }
+    out << state.schema.schema.dump(2);
+    flushAndSync(out);
+    flushFilePath(schemaPath.string());
 }
 
 std::optional<std::string> BlackBox::extractCustomId(const IndexState& idx, const nlohmann::json& doc) const {
@@ -2549,10 +2641,10 @@ void BlackBox::startMaintenance() {
                     flushIfNeeded(name, it->second);
                     it->second.manifestDirty = false;
                 }
-            }
+        }
         if (needManifest) {
             std::unique_lock<std::shared_mutex> lk(mutex_);
-            writeManifest();
+            (void)writeManifest();
             manifestDirty_.store(false, std::memory_order_relaxed);
             for (auto& kv : indexes_) kv.second.manifestDirty = false;
         }

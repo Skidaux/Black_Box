@@ -542,6 +542,12 @@ void BlackBoxHttpServer::setupRoutes() {
     // --- SEARCH ---
     server_.Get(R"(/v1/([^/]+)/search)", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];
+        if (!db_.indexExists(index)) {
+            res.status = 404;
+            res.set_content(err(404, "Index not found").dump(), "application/json");
+            addCors(res);
+            return;
+        }
         auto q = req.get_param_value("q");
         auto mode = req.get_param_value("mode");
         if (mode.empty()) mode = "bm25";

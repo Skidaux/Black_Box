@@ -252,10 +252,11 @@ private:
     bool applyDelete(IndexState& idx, DocId id, bool logWal);
     void flushIfNeeded(const std::string& index, IndexState& idx);
     void maybeMergeSegments(const std::string& index, IndexState& idx);
-    void writeManifest() const;
+    bool writeManifest() const;
     void replayWal(IndexState& idx, uint64_t startOffset = 0);
     void loadWalOnly();
     void configureSchema(IndexState& state);
+    void persistSchema(const std::string& name, const IndexState& state) const;
     std::optional<std::string> extractCustomId(const IndexState& idx, const nlohmann::json& doc) const;
     std::optional<std::string> canonicalizeCustomIdInput(const IndexState& idx, const std::string& raw) const;
     std::optional<DocId> findDocIdUnlocked(const IndexState& idx, const std::string& providedId) const;
