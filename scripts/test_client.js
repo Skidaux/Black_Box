@@ -431,6 +431,13 @@ async function runDurability() {
     // Delete and ensure tombstone survives restart
     const del = await axios.delete(`/v1/${testIndex}/doc/${docId}`);
     results.steps.push({ step: "delete_doc", status: del.status });
+    // Persist snapshot with tombstone
+    try {
+      const snapDel = await axios.post("/v1/snapshot");
+      results.steps.push({ step: "snapshot_after_delete", status: snapDel.status });
+    } catch (e) {
+      results.steps.push({ step: "snapshot_after_delete", status: "failed", error: e.message });
+    }
     await stopServerProcess(proc);
     results.steps.push({ step: "shutdown_post_delete", status: "ok" });
     proc = startServerProcess();

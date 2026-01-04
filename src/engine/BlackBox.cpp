@@ -847,6 +847,7 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
     if (startOffset > 0) {
         in.seekg(static_cast<std::streamoff>(startOffset), std::ios::beg);
     }
+    uint64_t lastGoodOffset = startOffset;
     while (true) {
         WalOp op;
         if (!in.read(reinterpret_cast<char*>(&op), sizeof(op))) break;
@@ -868,10 +869,17 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
         if (!payload.empty()) buf.append(payload.data(), payload.size());
         uint32_t crcComputed = crc32(buf);
         if (crcComputed != crcRead) {
-            std::cerr << "WAL checksum mismatch at offset " << in.tellg() << " in " << path << ", stopping replay\n";
+            auto pos = in.tellg();
+            std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
+            std::error_code ec;
+            std::filesystem::resize_file(path, lastGoodOffset, ec);
+            if (ec) {
+                std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
+            }
             break;
         }
         out.push_back({op, docId, std::move(payload)});
+        lastGoodOffset = static_cast<uint64_t>(in.tellg());
     }
     return out;
 }

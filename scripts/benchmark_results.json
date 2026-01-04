@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-01-03T23:17:34.561Z",
+  "timestamp": "2026-01-04T01:04:42.057Z",
   "baseURL": "http://127.0.0.1:8080",
   "indexes": [
     "demo",
@@ -12,44 +12,44 @@
   "timings": [
     {
       "step": "create_primary",
-      "ms": 29.62270000576973,
+      "ms": 30.55560001730919,
       "status": 400
     },
     {
       "step": "create_related",
-      "ms": 2.6637000143527985,
+      "ms": 2.8615000247955322,
       "status": 400
     },
     {
       "step": "index_documents_total",
-      "ms": 3.8566000163555145,
+      "ms": 6.318800002336502,
       "status": "aggregate",
       "perDoc": [
         {
           "doc": "Doc1",
-          "ms": 1.527099996805191,
+          "ms": 2.359600007534027,
           "status": 201
         },
         {
           "doc": "Doc2",
-          "ms": 1.6448000073432922,
+          "ms": 2.6126999855041504,
           "status": 201
         },
         {
           "doc": "Doc3",
-          "ms": 0.6847000122070312,
+          "ms": 1.3465000092983246,
           "status": 201
         }
       ]
     },
     {
       "step": "patch_parent",
-      "ms": 0.8212999999523163,
+      "ms": 1.1958999931812286,
       "status": 200
     },
     {
       "step": "bulk_related",
-      "ms": 134.9060000181198,
+      "ms": 145.11329999566078,
       "status": "aggregate",
       "docs": 200
     }
@@ -62,10 +62,10 @@
         "q": "quick fox",
         "mode": "bm25"
       },
-      "ms": 5.5658000111579895,
+      "ms": 6.206099987030029,
       "status": 200,
-      "hits": 3,
-      "total": 3
+      "hits": 4,
+      "total": 4
     },
     {
       "targetIndex": "demo",
@@ -79,10 +79,10 @@
         "filter_priority_min": 1,
         "filter_priority_max": 6
       },
-      "ms": 0.523499995470047,
+      "ms": 0.5926999747753143,
       "status": 200,
-      "hits": 3,
-      "total": 3
+      "hits": 4,
+      "total": 4
     },
     {
       "targetIndex": "demo",
@@ -94,10 +94,10 @@
         "w_semantic": 1.2,
         "w_lexical": 0.4
       },
-      "ms": 0.8359000086784363,
+      "ms": 0.6547000110149384,
       "status": 200,
-      "hits": 6,
-      "total": 6
+      "hits": 8,
+      "total": 8
     },
     {
       "targetIndex": "demo",
@@ -108,7 +108,7 @@
         "vec": "1,0,0",
         "size": 3
       },
-      "ms": 0.3783000111579895,
+      "ms": 0.388700008392334,
       "status": 200,
       "hits": 3,
       "total": 3
@@ -121,7 +121,7 @@
         "mode": "bm25",
         "size": 5
       },
-      "ms": 0.5004999935626984,
+      "ms": 0.9006999731063843,
       "status": 200,
       "hits": 5,
       "total": 5
@@ -134,7 +134,7 @@
         "mode": "bm25",
         "size": 2
       },
-      "ms": 0.3452000021934509,
+      "ms": 0.4374000132083893,
       "status": 200,
       "hits": 2,
       "total": 2
