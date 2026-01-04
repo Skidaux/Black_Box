@@ -389,7 +389,13 @@ async function runDurability() {
     const inserted = await indexDoc(testIndex, doc);
     const docId =
       inserted.data && inserted.data.data ? inserted.data.data.id : undefined;
-    if (!docId) throw new Error("Durability doc missing id");
+    if (!docId || inserted.status !== 201) {
+      throw new Error(
+        `Durability doc missing id (status=${inserted.status}, body=${JSON.stringify(
+          inserted.data
+        )})`
+      );
+    }
     results.steps.push({
       step: "index_doc",
       id: docId,

@@ -386,6 +386,7 @@ void BlackBoxHttpServer::setupRoutes() {
             res.set_content(ok(response).dump(), "application/json");
         }
         catch (const std::exception& e) {
+            std::cerr << "Index doc failed index=" << index << " err=" << e.what() << "\n";
             res.status = 400;
             res.set_content(err(400, std::string("Invalid JSON or index: ") + e.what()).dump(), "application/json");
         }

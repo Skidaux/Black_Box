@@ -176,6 +176,7 @@ private:
         uint32_t minId = 0;
         uint32_t maxId = 0;
         uint64_t walPos = 0;
+        std::vector<uint32_t> deletes;
     };
 
     struct IndexState {
@@ -205,6 +206,7 @@ private:
         bool manifestDirty = false;
         std::unordered_set<DocId> tombstones;
         std::unordered_set<DocId> persistedDeletes; // delete bitmap persisted in segment
+        std::shared_ptr<std::mutex> mtx = std::make_shared<std::mutex>(); // per-index lock
     };
 
     std::string dataDir_;

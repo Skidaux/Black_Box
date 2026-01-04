@@ -17,6 +17,10 @@
 #include <iostream>
 #include <optional>
 #include <chrono>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include "minielastic/Checksum.hpp"
 
 using json = nlohmann::json;
@@ -403,6 +407,18 @@ static bool writeSnapshotFile(const std::string& path,
     return static_cast<bool>(out);
 }
 
+static void flushFilePath(const std::string& path) {
+#ifdef _WIN32
+    (void)path; // best-effort flush already done on stream; no portable fsync on Windows here.
+#else
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
+#endif
+}
+
 static bool readSnapshotFile(const std::string& path,
                              SnapshotChunk& outChunk,
                              uint32_t& nextId,
@@ -782,6 +798,7 @@ void WalWriter::maybeFlush(bool force) {
         }
     }
     stream.flush();
+    flushFilePath(path);
     pendingBytes = 0;
     lastFlush = now;
 }
@@ -836,6 +853,7 @@ void WalWriter::reset() {
         truncStream.open(path, std::ios::binary | std::ios::app);
         if (truncStream) {
             flushAndSync(truncStream);
+            flushFilePath(path);
         }
     }
 }
@@ -872,7 +890,11 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
             auto pos = in.tellg();
             std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
             std::error_code ec;
-            std::filesystem::resize_file(path, lastGoodOffset, ec);
+            try {
+                std::filesystem::resize_file(path, lastGoodOffset, ec);
+            } catch (const std::exception& e) {
+                std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
+            }
             if (ec) {
                 std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
             }
@@ -1014,10 +1036,12 @@ const std::unordered_map<std::string, std::unordered_map<std::string, std::vecto
 }
 
 BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::string& jsonStr) {
-    std::unique_lock<std::shared_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
     IndexState& idx = it->second;
+    lk.unlock();
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
 
     json j = json::parse(jsonStr);
     if (!validateDocument(idx, j)) {
@@ -1038,7 +1062,6 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
     idx.manifestDirty = true;
     manifestDirty_.store(true, std::memory_order_relaxed);
     bool doSnapshot = autoSnapshot_;
-    lk.unlock();
     if (doSnapshot) saveSnapshot();
     return id;
 }
@@ -1047,7 +1070,9 @@ nlohmann::json BlackBox::getDocument(const std::string& index, DocId id) const {
     std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
-    const auto& docs = it->second.documents;
+    const IndexState& idx = it->second;
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
+    const auto& docs = idx.documents;
     auto d = docs.find(id);
     if (d == docs.end()) throw std::runtime_error("Document ID not found");
     return d->second;
@@ -1057,6 +1082,7 @@ std::optional<BlackBox::DocId> BlackBox::lookupDocId(const std::string& index, c
     std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return std::nullopt;
+    std::lock_guard<std::mutex> lkIdx(*it->second.mtx);
     return findDocIdUnlocked(it->second, providedId);
 }
 
@@ -1064,6 +1090,7 @@ std::optional<std::string> BlackBox::externalIdForDoc(const std::string& index, 
     std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return std::nullopt;
+    std::lock_guard<std::mutex> lkIdx(*it->second.mtx);
     auto mapIt = it->second.docIdToExternal.find(id);
     if (mapIt == it->second.docIdToExternal.end()) return std::nullopt;
     return mapIt->second;
@@ -1073,6 +1100,7 @@ std::optional<std::string> BlackBox::getImageBase64(const std::string& index, Do
     std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return std::nullopt;
+    std::lock_guard<std::mutex> lkIdx(*it->second.mtx);
     auto fieldIt = it->second.imageValues.find(field);
     if (fieldIt == it->second.imageValues.end()) return std::nullopt;
     auto blobIt = fieldIt->second.find(id);
@@ -1081,10 +1109,11 @@ std::optional<std::string> BlackBox::getImageBase64(const std::string& index, Do
 }
 
 bool BlackBox::deleteDocument(const std::string& index, DocId id) {
-    std::unique_lock<std::shared_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return false;
     IndexState& idx = it->second;
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     bool ok = applyDelete(idx, id, true);
     if (ok) {
         refreshAverages(idx);
@@ -1098,10 +1127,11 @@ bool BlackBox::deleteDocument(const std::string& index, DocId id) {
 }
 
 bool BlackBox::updateDocument(const std::string& index, DocId id, const std::string& jsonStr, bool partial) {
-    std::unique_lock<std::shared_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return false;
     IndexState& idx = it->second;
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     auto existing = idx.documents.find(id);
     if (existing == idx.documents.end()) return false;
 
@@ -1143,6 +1173,7 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     const IndexState& idx = it->second;
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     auto terms = tokenize(query);
     if (terms.empty()) return {};
     algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen, &idx.skipPointers};
@@ -1163,6 +1194,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
     const IndexState& idx = it->second;
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     auto terms = tokenize(query);
     if (terms.empty()) return {};
     algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen, &idx.skipPointers};
@@ -1190,10 +1222,11 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
 }
 
 std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults) const {
-    std::unique_lock<std::shared_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
-    IndexState& idx = it->second;
+    IndexState& idx = const_cast<IndexState&>(it->second);
+    std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     if (idx.schema.vectorDim == 0 || queryVec.size() != idx.schema.vectorDim) return {};
     if (idx.annDirty) rebuildAnn(idx);
 
@@ -1274,6 +1307,7 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
     out.reserve(indexes_.size());
     for (const auto& kv : indexes_) {
         const auto& st = kv.second;
+        std::lock_guard<std::mutex> lkIdx(*st.mtx);
         IndexStats s;
         s.name = kv.first;
         s.documents = st.documents.size();
@@ -1849,6 +1883,11 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         }
         meta.file = segFile.filename().string();
         meta.walPos = idx.wal.offset;
+        if (!chunk.tombstones.empty()) {
+            meta.deletes = chunk.tombstones;
+            std::sort(meta.deletes.begin(), meta.deletes.end());
+            meta.deletes.erase(std::unique(meta.deletes.begin(), meta.deletes.end()), meta.deletes.end());
+        }
         idx.segments.push_back(meta);
         // reset WAL
         idx.wal.reset();
@@ -1912,6 +1951,11 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     }
     meta.file = segFile.filename().string();
     meta.walPos = 0;
+    if (!chunk.tombstones.empty()) {
+        meta.deletes = chunk.tombstones;
+        std::sort(meta.deletes.begin(), meta.deletes.end());
+        meta.deletes.erase(std::unique(meta.deletes.begin(), meta.deletes.end()), meta.deletes.end());
+    }
     idx.segments.push_back(meta);
     idx.wal.reset();
     idx.wal.open();
@@ -1931,7 +1975,11 @@ void BlackBox::writeManifest() const {
     for (const auto& entry : indexes_) {
         json segs = json::array();
         for (const auto& seg : entry.second.segments) {
-            segs.push_back({{"file", seg.file}, {"min_id", seg.minId}, {"max_id", seg.maxId}, {"wal_pos", seg.walPos}});
+            json segObj = {{"file", seg.file}, {"min_id", seg.minId}, {"max_id", seg.maxId}, {"wal_pos", seg.walPos}};
+            if (!seg.deletes.empty()) {
+                segObj["deletes"] = seg.deletes;
+            }
+            segs.push_back(std::move(segObj));
         }
         manifest["indexes"].push_back({
             {"name", entry.first},
@@ -2117,6 +2165,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             uint32_t minId = 0;
             uint32_t maxId = 0;
             uint64_t walPos = 0;
+            std::vector<uint32_t> deletes;
             if (seg.is_string()) {
                 file = seg.get<std::string>();
             } else if (seg.is_object()) {
@@ -2124,6 +2173,11 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                 minId = seg.value("min_id", 0u);
                 maxId = seg.value("max_id", 0u);
                 walPos = seg.value("wal_pos", 0ull);
+                if (seg.contains("deletes") && seg["deletes"].is_array()) {
+                    for (const auto& d : seg["deletes"]) {
+                        if (d.is_number_unsigned()) deletes.push_back(d.get<uint32_t>());
+                    }
+                }
             } else {
                 continue;
             }
@@ -2220,6 +2274,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             meta.minId = minId;
             meta.maxId = maxId;
             meta.walPos = walPos;
+            meta.deletes = std::move(deletes);
             state.segments.push_back(meta);
             maxWalPos = std::max(maxWalPos, walPos);
         }
@@ -2227,6 +2282,13 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         // Apply tombstones to remove any resurrected docs/postings
         if (!state.tombstones.empty()) {
             for (auto id : state.tombstones) {
+                applyDelete(state, id, false);
+            }
+        }
+        // Apply manifest-level deletes if present
+        for (const auto& seg : state.segments) {
+            for (auto id : seg.deletes) {
+                state.persistedDeletes.insert(id);
                 applyDelete(state, id, false);
             }
         }
@@ -2483,16 +2545,17 @@ void BlackBox::startMaintenance() {
                 std::unique_lock<std::shared_mutex> lk(mutex_);
                 auto it = indexes_.find(name);
                 if (it != indexes_.end()) {
+                    std::lock_guard<std::mutex> lkIdx(*it->second.mtx);
                     flushIfNeeded(name, it->second);
                     it->second.manifestDirty = false;
                 }
             }
-    if (needManifest) {
-        std::unique_lock<std::shared_mutex> lk(mutex_);
-        writeManifest();
-        manifestDirty_.store(false, std::memory_order_relaxed);
-        for (auto& kv : indexes_) kv.second.manifestDirty = false;
-    }
+        if (needManifest) {
+            std::unique_lock<std::shared_mutex> lk(mutex_);
+            writeManifest();
+            manifestDirty_.store(false, std::memory_order_relaxed);
+            for (auto& kv : indexes_) kv.second.manifestDirty = false;
+        }
             {
                 std::shared_lock<std::shared_mutex> lk(mutex_);
                 for (auto& kv : indexes_) {
