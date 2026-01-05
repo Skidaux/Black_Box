@@ -130,14 +130,14 @@ public:
     // Update a document (partial merge if partial=true, else replace).
     bool updateDocument(const std::string& index, DocId id, const std::string& jsonStr, bool partial);
 
-    // Search with selectable algorithm: "lexical", "bm25", "fuzzy", "semantic"
+    // Search with selectable algorithm: "lexical", "bm25", "bm25_or", "fuzzy", "semantic", "phrase"
     std::vector<SearchHit> search(const std::string& index, const std::string& query, const std::string& mode = "bm25", size_t maxResults = 10, int maxEditDistance = 1) const;
 
     // Hybrid search: blend bm25 + semantic + lexical with weights
     std::vector<SearchHit> searchHybrid(const std::string& index, const std::string& query, double wBm25, double wSemantic, double wLexical, size_t maxResults) const;
 
     // Vector search (cosine similarity)
-    std::vector<SearchHit> searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults) const;
+    std::vector<SearchHit> searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults, uint32_t probesOverride = 0, uint32_t efOverride = 0) const;
 
     // Retrieve a single document.
     nlohmann::json getDocument(const std::string& index, DocId id) const;
@@ -174,6 +174,7 @@ public:
 
     std::vector<IndexStats> stats() const;
     nlohmann::json config() const;
+    nlohmann::json shippingPlan() const;
     std::string dataDir() const { return dataDir_; }
     bool createOrUpdateCustomApi(const std::string& name, const nlohmann::json& spec);
     bool removeCustomApi(const std::string& name);
@@ -240,11 +241,18 @@ private:
     };
 
     std::string dataDir_;
+    std::string shardId_;
+    std::string replicaId_;
+    std::string shipEndpoint_;
+    std::string shipMethod_ = "http";
     mutable std::shared_mutex mutex_; // protects indexes_ map and custom APIs
     size_t flushEveryDocs_ = 5000;
     uint64_t flushEveryMs_ = 0;
     uint64_t flushWalBytesThreshold_ = 8 * 1024 * 1024;
     size_t mergeSegmentsAt_ = 10;
+    uint64_t mergeThrottleMs_ = 0;
+    uint64_t mergeMaxMB_ = 0;
+    size_t snapshotCacheCapacity_ = 8;
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;

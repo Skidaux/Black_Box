@@ -11,6 +11,7 @@
 #include <queue>
 #include <cstdlib>
 #include <stdexcept>
+#include <list>
 #include <string_view>
 #include <sstream>
 #include <iomanip>
@@ -19,6 +20,7 @@
 #include <iostream>
 #include <optional>
 #include <chrono>
+#include <thread>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
@@ -98,6 +100,62 @@ static void flushAndSync(std::ofstream& stream) {
     if (!stream.is_open()) return;
     stream.flush();
 }
+
+// Simple LRU cache for snapshot chunks to reduce disk IO when loading/reloading segments.
+class SnapshotCache {
+public:
+    explicit SnapshotCache(size_t cap = 8) : capacity_(cap) {}
+
+    bool get(const std::string& path, SnapshotChunk& chunk, uint32_t& nextId, double& avgDocLen) {
+        auto it = map_.find(path);
+        if (it == map_.end()) return false;
+        touch(it);
+        chunk = it->second.data;
+        nextId = it->second.nextId;
+        avgDocLen = it->second.avgDocLen;
+        return true;
+    }
+
+    void put(const std::string& path, const SnapshotChunk& chunk, uint32_t nextId, double avgDocLen) {
+        if (capacity_ == 0) return;
+        auto it = map_.find(path);
+        if (it != map_.end()) {
+            it->second.data = chunk;
+            it->second.nextId = nextId;
+            it->second.avgDocLen = avgDocLen;
+            touch(it);
+            return;
+        }
+        if (order_.size() >= capacity_) {
+            auto evict = order_.back();
+            order_.pop_back();
+            map_.erase(evict);
+        }
+        order_.push_front(path);
+        map_[path] = {chunk, nextId, avgDocLen, order_.begin()};
+    }
+
+    void setCapacity(size_t cap) { capacity_ = cap; }
+
+private:
+    struct Entry {
+        SnapshotChunk data;
+        uint32_t nextId = 0;
+        double avgDocLen = 0.0;
+        std::list<std::string>::iterator it;
+    };
+    size_t capacity_;
+    std::list<std::string> order_;
+    std::unordered_map<std::string, Entry> map_;
+
+    void touch(std::unordered_map<std::string, Entry>::iterator it) {
+        order_.erase(it->second.it);
+        order_.push_front(it->first);
+        it->second.it = order_.begin();
+    }
+};
+
+static SnapshotCache gSnapshotCache;
 
 constexpr char kWalMagic[] = "BBWAL";
 constexpr uint16_t kWalVersion = 2;
@@ -536,6 +594,15 @@ static bool readSnapshotFile(const std::string& path,
                              SnapshotChunk& outChunk,
                              uint32_t& nextId,
                              double& avgDocLen) {
+    SnapshotChunk cached;
+    uint32_t cachedNext = 0;
+    double cachedAvg = 0.0;
+    if (gSnapshotCache.get(path, cached, cachedNext, cachedAvg)) {
+        outChunk = std::move(cached);
+        nextId = cachedNext;
+        avgDocLen = cachedAvg;
+        return true;
+    }
     std::ifstream in(path, std::ios::binary);
     if (!in) return false;
     std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -887,6 +954,7 @@ static bool readSnapshotFile(const std::string& path,
         }
     }
 
+    gSnapshotCache.put(path, outChunk, nextId, avgDocLen);
     return true;
 }
 
@@ -1192,6 +1260,12 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envMerge = std::getenv("BLACKBOX_MERGE_SEGMENTS")) {
         try { mergeSegmentsAt_ = std::max<size_t>(1, static_cast<size_t>(std::stoull(envMerge))); } catch (...) {}
     }
+    if (const char* envMergeThrottle = std::getenv("BLACKBOX_MERGE_THROTTLE_MS")) {
+        try { mergeThrottleMs_ = std::stoull(envMergeThrottle); } catch (...) {}
+    }
+    if (const char* envMergeBudget = std::getenv("BLACKBOX_MERGE_MAX_MB")) {
+        try { mergeMaxMB_ = std::stoull(envMergeBudget); } catch (...) {}
+    }
     if (const char* envWalBytes = std::getenv("BLACKBOX_WAL_FLUSH_BYTES")) {
         try { walFlushBytes_ = std::max<uint64_t>(4096, std::stoull(envWalBytes)); } catch (...) {}
     }
@@ -1214,6 +1288,22 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envFlushWal = std::getenv("BLACKBOX_FLUSH_WAL_BYTES")) {
         try { flushWalBytesThreshold_ = std::max<uint64_t>(1024 * 1024, std::stoull(envFlushWal)); } catch (...) {}
     }
+    if (const char* envSnapCache = std::getenv("BLACKBOX_SNAPSHOT_CACHE")) {
+        try { snapshotCacheCapacity_ = static_cast<size_t>(std::stoull(envSnapCache)); } catch (...) {}
+    }
+    if (const char* envShard = std::getenv("BLACKBOX_SHARD_ID")) {
+        shardId_ = envShard;
+    }
+    if (const char* envReplica = std::getenv("BLACKBOX_REPLICA_ID")) {
+        replicaId_ = envReplica;
+    }
+    if (const char* envShip = std::getenv("BLACKBOX_SHIP_ENDPOINT")) {
+        shipEndpoint_ = envShip;
+    }
+    if (const char* envShipMethod = std::getenv("BLACKBOX_SHIP_METHOD")) {
+        shipMethod_ = envShipMethod;
+    }
+    gSnapshotCache.setCapacity(snapshotCacheCapacity_);
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -1484,6 +1574,38 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
         hits = algo::searchBm25Or(ctx, terms, maxResults);
     } else if (mode == "fuzzy") {
         hits = algo::searchFuzzy(ctx, terms, maxEditDistance, maxResults);
+    } else if (mode == "phrase") {
+        // simple phrase scan over stored text fields
+        std::vector<SearchHit> phraseHits;
+        std::string qLower = query;
+        std::transform(qLower.begin(), qLower.end(), qLower.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+        for (const auto& docPair : idx.documents) {
+            const auto& doc = docPair.second;
+            std::string text;
+            for (const auto& ft : idx.schema.fieldTypes) {
+                if (ft.second == FieldType::Text) {
+                    if (doc.contains(ft.first) && doc[ft.first].is_string()) {
+                        text += doc[ft.first].get<std::string>() + " ";
+                    }
+                } else if (ft.second == FieldType::ArrayString) {
+                    if (doc.contains(ft.first) && doc[ft.first].is_array()) {
+                        for (const auto& v : doc[ft.first]) {
+                            if (v.is_string()) text += v.get<std::string>() + " ";
+                        }
+                    }
+                }
+            }
+            std::string textLower = text;
+            std::transform(textLower.begin(), textLower.end(), textLower.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+            if (!textLower.empty() && textLower.find(qLower) != std::string::npos) {
+                phraseHits.push_back({docPair.first, 1.0});
+            }
+        }
+        std::sort(phraseHits.begin(), phraseHits.end(), [](const SearchHit& a, const SearchHit& b){
+            if (a.score == b.score) return a.id < b.id;
+            return a.score > b.score;
+        });
+        hits = std::move(phraseHits);
     } else if (mode == "semantic" || mode == "vector" || mode == "tfidf") {
         hits = algo::searchSemantic(ctx, terms, maxResults);
         if (hits.empty()) hits = algo::searchBm25(ctx, terms, maxResults);
@@ -1529,7 +1651,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchHybrid(const std::string& index
     return out;
 }
 
-std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults) const {
+std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index, const std::vector<float>& queryVec, size_t maxResults, uint32_t probesOverride, uint32_t efOverride) const {
     std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) return {};
@@ -1565,8 +1687,12 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
     }
 
     // ANN: probe multiple closest centroids then fallback to brute if needed
+    uint32_t probes = probesOverride ? probesOverride : idx.annProbes;
+    uint32_t ef = efOverride ? efOverride : idx.annEfSearch;
+    probes = std::min<uint32_t>(std::max<uint32_t>(1, probes), 256);
+    ef = std::min<uint32_t>(std::max<uint32_t>(8, ef), 1024);
     if (!idx.annCentroids.empty() && !idx.annBuckets.empty()) {
-        size_t probes = std::max<size_t>(1, std::min<size_t>(idx.annCentroids.size(), idx.annProbes));
+        size_t probesUse = std::max<size_t>(1, std::min<size_t>(idx.annCentroids.size(), probes));
         std::vector<std::pair<size_t, double>> scored;
         scored.reserve(idx.annCentroids.size());
         for (size_t c = 0; c < idx.annCentroids.size(); ++c) {
@@ -1578,7 +1704,7 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
             return a.second > b.second;
         });
         std::unordered_set<uint32_t> visited;
-        for (size_t i = 0; i < probes && i < scored.size(); ++i) {
+        for (size_t i = 0; i < probesUse && i < scored.size(); ++i) {
             size_t bucketIdx = scored[i].first;
             if (bucketIdx >= idx.annBuckets.size()) continue;
             for (auto docId : idx.annBuckets[bucketIdx]) {
@@ -1697,14 +1823,68 @@ nlohmann::json BlackBox::config() const {
         {"flush_every_ms", flushEveryMs_},
         {"flush_wal_bytes", flushWalBytesThreshold_},
         {"merge_segments_at", mergeSegmentsAt_},
+        {"merge_throttle_ms", mergeThrottleMs_},
+        {"merge_max_mb", mergeMaxMB_},
+        {"snapshot_cache", snapshotCacheCapacity_},
         {"compress_snapshots", compressSnapshots_},
         {"auto_snapshot", autoSnapshot_},
         {"default_ann_clusters", defaultAnnClusters_},
         {"default_ann_probes", defaultAnnProbes_},
         {"default_ann_m", defaultAnnM_},
-        {"default_ann_ef_search", defaultAnnEfSearch_}
+        {"default_ann_ef_search", defaultAnnEfSearch_},
+        {"shard_id", shardId_},
+        {"replica_id", replicaId_},
+        {"ship_endpoint", shipEndpoint_},
+        {"ship_method", shipMethod_}
     };
     return j;
+}
+
+nlohmann::json BlackBox::shippingPlan() const {
+    namespace fs = std::filesystem;
+    std::shared_lock<std::shared_mutex> lk(mutex_);
+    json plan{
+        {"cluster", {
+            {"shard_id", shardId_},
+            {"replica_id", replicaId_},
+            {"ship_endpoint", shipEndpoint_},
+            {"ship_method", shipMethod_}
+        }},
+        {"data_dir", dataDir_},
+        {"manifest_path", (fs::path(dataDir_) / "index.manifest").string()},
+        {"formats", {
+            {"manifest", {{"format", "blackbox_manifest"}, {"version", 2}}},
+            {"segment", {{"format", "skd"}, {"version", 1}}},
+            {"wal", {{"magic", kWalMagic}, {"version", kWalVersion}}}
+        }},
+        {"indexes", json::array()}
+    };
+    for (const auto& kv : indexes_) {
+        const auto& st = kv.second;
+        std::lock_guard<std::mutex> lkIdx(*st.mtx);
+        json segs = json::array();
+        for (const auto& seg : st.segments) {
+            json segEntry = {
+                {"path", (fs::path(dataDir_) / seg.file).string()},
+                {"format", "skd"},
+                {"version", 1},
+                {"min_id", seg.minId},
+                {"max_id", seg.maxId},
+                {"wal_pos", seg.walPos}
+            };
+            if (!seg.deletes.empty()) segEntry["deletes"] = seg.deletes;
+            segs.push_back(std::move(segEntry));
+        }
+        plan["indexes"].push_back({
+            {"name", kv.first},
+            {"schema_id", st.schema.schemaId},
+            {"schema_version", st.schema.schemaVersion},
+            {"wal_path", st.wal.path},
+            {"wal_bytes", st.wal.offset},
+            {"segments", segs}
+        });
+    }
+    return plan;
 }
 
 void BlackBox::indexJson(IndexState& idx, DocId id, const json& j) {
@@ -2449,6 +2629,7 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
     if (!writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
         return;
     }
+    gSnapshotCache.put(segFile.string(), chunk, idx.nextId, avg);
 
     // Stage new segment metadata
     auto oldSegments = idx.segments;
@@ -2507,6 +2688,21 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     if (mergeSegmentsAt_ == 0) return;
     if (idx.segments.size() < mergeSegmentsAt_) return;
     namespace fs = std::filesystem;
+    uint64_t mergeBudgetBytes = mergeMaxMB_ > 0 ? mergeMaxMB_ * 1024ull * 1024ull : 0;
+    if (mergeBudgetBytes > 0) {
+        uint64_t inputBytes = 0;
+        bool sizeKnown = true;
+        for (const auto& seg : idx.segments) {
+            std::error_code ec;
+            auto sz = fs::file_size(fs::path(dataDir_) / seg.file, ec);
+            if (ec) { sizeKnown = false; break; }
+            inputBytes += sz;
+        }
+        if (sizeKnown && inputBytes > mergeBudgetBytes) {
+            std::cerr << "BlackBox: skipping merge for " << index << " input_bytes=" << inputBytes << " budget=" << mergeBudgetBytes << "\n";
+            return;
+        }
+    }
     SnapshotChunk chunk;
     chunk.vectorDim = idx.schema.vectorDim;
     chunk.docs.insert(chunk.docs.end(), idx.documents.begin(), idx.documents.end());
@@ -2540,6 +2736,7 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         std::cerr << "BlackBox: mergeSegments failed to write " << segFile << "\n";
         return;
     }
+    gSnapshotCache.put(segFile.string(), chunk, idx.nextId, avg);
     auto oldSegments = idx.segments;
     SegmentMetadata meta;
     if (!idx.documents.empty()) {
@@ -2581,18 +2778,38 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         std::error_code ec;
         fs::remove(p, ec);
     }
+    if (mergeThrottleMs_ > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(mergeThrottleMs_));
+    }
 }
 
 bool BlackBox::writeManifest() const {
     namespace fs = std::filesystem;
     if (dataDir_.empty()) return true;
     fs::path manifestPath = fs::path(dataDir_) / "index.manifest";
-    json manifest = {{"format", "blackbox_manifest"}, {"version", 2}, {"indexes", json::array()}};
+    json manifest = {
+        {"format", "blackbox_manifest"},
+        {"version", 2},
+        {"cluster", {
+            {"shard_id", shardId_},
+            {"replica_id", replicaId_},
+            {"ship_endpoint", shipEndpoint_},
+            {"ship_method", shipMethod_}
+        }},
+        {"indexes", json::array()}
+    };
     for (const auto& entry : indexes_) {
         persistSchema(entry.first, entry.second);
         json segs = json::array();
         for (const auto& seg : entry.second.segments) {
-            json segObj = {{"file", seg.file}, {"min_id", seg.minId}, {"max_id", seg.maxId}, {"wal_pos", seg.walPos}};
+            json segObj = {
+                {"file", seg.file},
+                {"min_id", seg.minId},
+                {"max_id", seg.maxId},
+                {"wal_pos", seg.walPos},
+                {"format", "skd"},
+                {"version", 1}
+            };
             if (!seg.deletes.empty()) {
                 segObj["deletes"] = seg.deletes;
             }
@@ -2657,7 +2874,17 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
     fs::path manifestPath = path.empty() ? fs::path(dataDir_) / "index.manifest" : fs::path(path);
     fs::create_directories(manifestPath.parent_path());
 
-    json manifest = {{"format", "blackbox_manifest"}, {"version", 2}, {"indexes", json::array()}};
+    json manifest = {
+        {"format", "blackbox_manifest"},
+        {"version", 2},
+        {"cluster", {
+            {"shard_id", shardId_},
+            {"replica_id", replicaId_},
+            {"ship_endpoint", shipEndpoint_},
+            {"ship_method", shipMethod_}
+        }},
+        {"indexes", json::array()}
+    };
     for (const auto& entry : indexes_) {
         const auto& name = entry.first;
         const auto& idx = entry.second;
@@ -2741,7 +2968,9 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
                 {"file", shardFile.filename().string()},
                 {"min_id", segMin},
                 {"max_id", segMax},
-                {"wal_pos", 0}
+                {"wal_pos", 0},
+                {"format", "skd"},
+                {"version", 1}
             });
         }
         manifest["indexes"].push_back({
@@ -2789,6 +3018,13 @@ bool BlackBox::loadSnapshot(const std::string& path) {
     bool legacyManifest = manifestVersion < 2;
     auto arr = manifest.value("indexes", json::array());
     if (!arr.is_array()) return false;
+    if (manifest.contains("cluster") && manifest["cluster"].is_object()) {
+        auto cl = manifest["cluster"];
+        if (cl.contains("shard_id") && cl["shard_id"].is_string()) shardId_ = cl["shard_id"].get<std::string>();
+        if (cl.contains("replica_id") && cl["replica_id"].is_string()) replicaId_ = cl["replica_id"].get<std::string>();
+        if (cl.contains("ship_endpoint") && cl["ship_endpoint"].is_string()) shipEndpoint_ = cl["ship_endpoint"].get<std::string>();
+        if (cl.contains("ship_method") && cl["ship_method"].is_string()) shipMethod_ = cl["ship_method"].get<std::string>();
+    }
 
     indexes_.clear();
 
@@ -2839,6 +3075,16 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                 minId = seg.value("min_id", 0u);
                 maxId = seg.value("max_id", 0u);
                 walPos = seg.value("wal_pos", 0ull);
+                std::string fmt = seg.value("format", "");
+                uint32_t ver = seg.value("version", 1u);
+                if (!fmt.empty() && fmt != "skd") {
+                    std::cerr << "BlackBox: unknown segment format " << fmt << " for " << file << "\n";
+                    return false;
+                }
+                if (ver > 1) {
+                    std::cerr << "BlackBox: unsupported segment version " << ver << " for " << file << "\n";
+                    return false;
+                }
                 if (seg.contains("deletes") && seg["deletes"].is_array()) {
                     for (const auto& d : seg["deletes"]) {
                         if (d.is_number_unsigned()) deletes.push_back(d.get<uint32_t>());

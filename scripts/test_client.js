@@ -870,6 +870,98 @@ async function runSnapshotTest() {
   }
 }
 
+async function runCoverageTest() {
+  process.env.BLACKBOX_SHARD_ID = "shard-js";
+  process.env.BLACKBOX_REPLICA_ID = "replica-js";
+  process.env.BLACKBOX_SHIP_ENDPOINT = "http://ship-js";
+  process.env.BLACKBOX_SHIP_METHOD = "http";
+  const index = `coverage_${Date.now()}`;
+  const results = { timestamp: new Date().toISOString(), index, steps: [] };
+  let proc = null;
+  try {
+    proc = startServerProcess();
+    await waitForServer();
+    results.steps.push({ step: "server_start", status: "ok" });
+
+    const createRes = await ensureIndex(index, {
+      fields: {
+        title: "text",
+        body: "text",
+        priority: { type: "number", searchable: false },
+        vec: { type: "vector", dim: 2 },
+      },
+    });
+    results.steps.push({ step: "create_index", status: createRes.status });
+
+    const docA = await indexDoc(index, {
+      title: "DocA",
+      body: "quick red fox",
+      priority: 5,
+      vec: [1, 0],
+    });
+    const docAId = docA.data?.data?.id;
+    results.steps.push({ step: "index_doc_a", status: docA.status, id: docAId });
+
+    const docB = await indexDoc(index, {
+      title: "DocB",
+      body: "slow dog",
+      priority: 1,
+      vec: [0, 1],
+    });
+    const docBId = docB.data?.data?.id;
+    results.steps.push({ step: "index_doc_b", status: docB.status, id: docBId });
+
+    const phrase = await runSearch(index, { q: "quick red", mode: "phrase", size: 2 });
+    const phraseHits = phrase.data?.data?.hits ?? [];
+    results.steps.push({ step: "phrase_search", status: phrase.status, hits: phraseHits.length, topId: phraseHits[0]?.id });
+
+    const range = await runSearch(index, {
+      q: "fox",
+      mode: "bm25",
+      range_field: "priority",
+      range_min: 4,
+      range_max: 6,
+      size: 2,
+    });
+    const rangeHits = range.data?.data?.hits ?? [];
+    results.steps.push({ step: "range_filter", status: range.status, hits: rangeHits.length, topId: rangeHits[0]?.id });
+
+    const vec = await axios.get(
+      `/v1/${index}/search?mode=vector&vec=1,0&ann_probes=5&ef_search=32&size=1`
+    );
+    const vecHits = vec.data?.data?.hits ?? [];
+    results.steps.push({ step: "vector_search_override", status: vec.status, topId: vecHits[0]?.id });
+
+    const cfg = await axios.get("/v1/config");
+    results.steps.push({
+      step: "config",
+      status: cfg.status,
+      shard: cfg.data?.data?.shard_id,
+      merge_throttle_ms: cfg.data?.data?.merge_throttle_ms,
+    });
+
+    const ship = await axios.get("/v1/ship");
+    results.steps.push({
+      step: "ship_plan",
+      status: ship.status,
+      shard: ship.data?.data?.cluster?.shard_id,
+      replica: ship.data?.data?.cluster?.replica_id,
+      indexes: (ship.data?.data?.indexes || []).length,
+    });
+
+    results.status = "ok";
+  } catch (e) {
+    results.status = "error";
+    results.error = e.message;
+    console.error("Coverage test failed:", e);
+  } finally {
+    await stopServerProcess(proc);
+    const outPath = path.join(__dirname, "coverage_results.json");
+    fs.writeFileSync(outPath, JSON.stringify(results, null, 2), "utf8");
+    console.log(`Coverage results written to ${outPath}`);
+  }
+}
+
 function promptMenu() {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -883,7 +975,8 @@ function promptMenu() {
     console.log("  4) Query-values / non-searchable fields");
     console.log("  5) Full relations + images + query_values");
     console.log("  6) Snapshot save/load");
-    rl.question("Enter choice [1-6]: ", (answer) => {
+    console.log("  7) Config/ship plan + phrase/range/vector coverage");
+    rl.question("Enter choice [1-7]: ", (answer) => {
       rl.close();
       resolve(answer.trim());
     });
@@ -922,6 +1015,8 @@ async function main() {
     await runFullFeatureTest();
   } else if (choice === "6") {
     await runSnapshotTest();
+  } else if (choice === "7") {
+    await runCoverageTest();
   } else {
     console.log("Invalid choice.");
     process.exit(1);

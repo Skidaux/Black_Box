@@ -1,6 +1,7 @@
 #include "BlackBox.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,8 +19,20 @@ static void expect(bool cond, const std::string& msg) {
     }
 }
 
+static void setEnv(const std::string& k, const std::string& v) {
+#ifdef _WIN32
+    _putenv_s(k.c_str(), v.c_str());
+#else
+    setenv(k.c_str(), v.c_str(), 1);
+#endif
+}
+
 int main() {
 try {
+    setEnv("BLACKBOX_SHARD_ID", "shard-local");
+    setEnv("BLACKBOX_REPLICA_ID", "replica-1");
+    setEnv("BLACKBOX_SHIP_ENDPOINT", "http://shipper");
+    setEnv("BLACKBOX_SHIP_METHOD", "http");
     const std::string dataDir = "testdata";
     std::filesystem::remove_all(dataDir);
     BlackBox db(dataDir);
@@ -50,6 +63,10 @@ try {
     // Fuzzy
     auto fuzzy = db.search(indexName, "quik", "fuzzy", 10, 2);
     expect(!fuzzy.empty() && fuzzy[0].id == id, "fuzzy should find doc");
+
+    // Phrase (substring) search
+    auto phrase = db.search(indexName, "quick brown", "phrase");
+    expect(!phrase.empty() && phrase[0].id == id, "phrase search should find doc");
 
     // Semantic / tfidf
     auto sem = db.search(indexName, "quick brown fox", "semantic");
@@ -116,6 +133,20 @@ try {
     expect(parentDoc.contains("favicon"), "favicon metadata missing");
     expect(db.deleteDocument(relIndex, *childLookup), "delete child");
     expect(!db.lookupDocId(relIndex, "sku-2").has_value(), "child lookup should be cleared");
+
+    // Vector index with ANN overrides
+    const std::string vecIndex = "vec_index";
+    BlackBox::IndexSchema vecSchema;
+    vecSchema.schema = {
+        {"fields", {
+            {"title", "text"},
+            {"vec", {{"type","vector"}, {"dim", 3}}}
+        }}
+    };
+    expect(db.createIndex(vecIndex, vecSchema), "failed to create vector index");
+    auto vid = db.indexDocument(vecIndex, R"({"title":"v1","vec":[1,0,0]})");
+    auto vHits = db.searchVector(vecIndex, {1.0f, 0.0f, 0.0f}, 5, 8, 64);
+    expect(!vHits.empty() && vHits[0].id == vid, "vector search with overrides should find doc");
 
     // Delete durability: index + delete + restart should not resurrect
     const std::string delIndex = "del_index";
@@ -184,6 +215,9 @@ try {
         expect(!manifest.is_discarded(), "manifest parse");
         expect(manifest.value("format", "") == "blackbox_manifest", "manifest format tag");
         expect(manifest.value("version", 0) >= 2, "manifest version >=2");
+        expect(manifest.contains("cluster"), "manifest cluster block present");
+        expect(manifest["cluster"].value("shard_id", "") == "shard-local", "manifest cluster shard id");
+        expect(manifest["cluster"].value("replica_id", "") == "replica-1", "manifest cluster replica id");
         bool found = false;
         for (const auto& idx : manifest.value("indexes", json::array())) {
             if (!idx.is_object()) continue;
@@ -257,6 +291,10 @@ try {
     auto qvsStored = db.scanStoredEquals(qvStoredIndex, "queries", json::object({{"query","boostme"},{"score",1.0}}));
     expect(qvsStored.size() == 1 && qvsStored[0] == qvsId, "stored-match should find query_values payload");
 
+    // Range filter doc-values reachable via API (numeric storage already validated by stored-match)
+    auto extraStored = db.scanStoredEquals(extraIndex, "version", 1);
+    expect(!extraStored.empty(), "doc-values numeric stored");
+
     // Doc_id uniqueness: updating same doc_id should be allowed
     auto uid1b = db.lookupDocId(uniqIndex, "ABC");
     expect(uid1b.has_value(), "doc_id should be present");
@@ -308,6 +346,28 @@ try {
         expect(!st.walSchemaMismatch, "wal schema mismatch should be false");
         expect(!st.walUpgraded, "wal upgraded should be false");
     }
+
+    // Config should expose new tuning knobs and cluster IDs
+    auto cfg = db.config();
+    expect(cfg.contains("merge_throttle_ms"), "config merge_throttle_ms present");
+    expect(cfg.contains("merge_max_mb"), "config merge_max_mb present");
+    expect(cfg.contains("snapshot_cache"), "config snapshot_cache present");
+    expect(cfg.value("shard_id", "") == "shard-local", "config shard id");
+    expect(cfg.value("replica_id", "") == "replica-1", "config replica id");
+
+    // Shipping plan should list cluster info and segment/WAL paths
+    auto ship = db.shippingPlan();
+    expect(ship.contains("cluster"), "shipping plan cluster block");
+    expect(ship["cluster"].value("shard_id", "") == "shard-local", "shipping shard id");
+    expect(ship["cluster"].value("replica_id", "") == "replica-1", "shipping replica id");
+    expect(ship.contains("indexes"), "shipping plan indexes");
+    bool shipHasIndex = false;
+    for (const auto& idx : ship["indexes"]) {
+        if (!idx.is_object()) continue;
+        if (idx.value("name", "") == extraIndex) shipHasIndex = true;
+        expect(idx.contains("wal_path"), "shipping wal_path present");
+    }
+    expect(shipHasIndex, "shipping includes extraIndex");
 
     std::cout << "All tests passed." << std::endl;
     return 0;

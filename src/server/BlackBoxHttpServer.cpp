@@ -6,9 +6,11 @@
 #include <sstream>
 #include <functional>
 #include <thread>
+#include <atomic>
 #include <unordered_set>
 #include <unordered_map>
 #include <optional>
+#include <limits>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -27,6 +29,9 @@ BlackBoxHttpServer::BlackBoxHttpServer(std::string host, int port, std::string d
         try { maxBodyKB = std::max<size_t>(1, static_cast<size_t>(std::stoull(env))); } catch (...) {}
     }
     server_.set_payload_max_length(maxBodyKB * 1024);
+    if (const char* env = std::getenv("BLACKBOX_RATE_LIMIT_QPS")) {
+        try { rateLimitQps_ = std::max(0, std::stoi(env)); } catch (...) {}
+    }
     setupRoutes();
 }
 
@@ -83,6 +88,9 @@ void BlackBoxHttpServer::setupRoutes() {
         uint64_t id = reqCounter.fetch_add(1, std::memory_order_relaxed);
         return std::string("req-") + std::to_string(id);
     };
+    auto logReq = [](const std::string& rid, const std::string& msg) {
+        std::cerr << "req_id=" << rid << " " << msg << "\n";
+    };
 
     // CORS helper to add to ALL responses
     auto addCors = [](httplib::Response& res) {
@@ -94,9 +102,34 @@ void BlackBoxHttpServer::setupRoutes() {
         std::string rid = req.get_header_value("X-Request-Id");
         if (rid.empty()) rid = requestId();
         res.set_header("X-Request-Id", rid);
+        return rid;
     };
     auto resolveDocId = [this](const std::string& index, const std::string& raw) -> std::optional<minielastic::BlackBox::DocId> {
         return db_.lookupDocId(index, raw);
+    };
+
+    auto rateLimit = [&](const httplib::Request& req, httplib::Response& res) -> bool {
+        if (rateLimitQps_ <= 0) return false;
+        const std::string key = req.remote_addr.empty() ? "unknown" : req.remote_addr;
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::lock_guard<std::mutex> lk(rateMutex_);
+        auto& window = rateWindow_[key];
+        int64_t windowStart = window.first;
+        int count = window.second;
+        if (nowMs - windowStart >= 1000) {
+            windowStart = nowMs;
+            count = 0;
+        }
+        if (count >= rateLimitQps_) {
+            metrics_.rateLimited.fetch_add(1, std::memory_order_relaxed);
+            res.status = 429;
+            res.set_content(err(429, "Rate limit exceeded").dump(), "application/json");
+            addCors(res);
+            return true;
+        }
+        window = {windowStart, count + 1};
+        return false;
     };
 
     // Handle preflight OPTIONS requests for ANY route
@@ -112,6 +145,58 @@ void BlackBoxHttpServer::setupRoutes() {
         res.set_content(ok(json{}).dump(), "application/json");
         addCors(res);
         attachRequestId(req, res);
+    });
+
+    // --- PROM METRICS ---
+    server_.Get("/metrics", [this, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        auto now = std::chrono::steady_clock::now();
+        double uptime = std::chrono::duration<double>(now - startTime_).count();
+        auto stats = db_.stats();
+        uint64_t schemaMismatch = 0;
+        uint64_t walUpgraded = 0;
+        std::ostringstream oss;
+        oss << "# TYPE blackbox_uptime_seconds gauge\n";
+        oss << "blackbox_uptime_seconds " << uptime << "\n";
+        oss << "# TYPE blackbox_rate_limited_total counter\n";
+        oss << "blackbox_rate_limited_total " << metrics_.rateLimited.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_schema_mismatch_total gauge\n";
+        oss << "# TYPE blackbox_wal_upgraded_total gauge\n";
+        oss << "# TYPE blackbox_search_requests_total counter\n";
+        oss << "blackbox_search_requests_total " << metrics_.searchCount.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_search_latency_ms_sum counter\n";
+        oss << "blackbox_search_latency_ms_sum " << metrics_.searchLatencyMs.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_search_latency_ms_count counter\n";
+        oss << "blackbox_search_latency_ms_count " << metrics_.searchCount.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_ann_query_latency_ms_sum counter\n";
+        oss << "blackbox_ann_query_latency_ms_sum " << metrics_.annLatencyMs.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_ann_query_latency_ms_count counter\n";
+        oss << "blackbox_ann_query_latency_ms_count " << metrics_.annCount.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_snapshot_duration_ms_sum counter\n";
+        oss << "blackbox_snapshot_duration_ms_sum " << metrics_.snapshotLatencyMs.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_snapshot_duration_ms_count counter\n";
+        oss << "blackbox_snapshot_duration_ms_count " << metrics_.snapshotCount.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_replay_errors_total counter\n";
+        oss << "blackbox_replay_errors_total " << metrics_.replayErrors.load(std::memory_order_relaxed) << "\n";
+        for (const auto& s : stats) {
+            if (s.walSchemaMismatch) schemaMismatch++;
+            if (s.walUpgraded) walUpgraded++;
+            oss << "# TYPE blackbox_documents gauge\n";
+            oss << "blackbox_documents{index=\"" << s.name << "\"} " << s.documents << "\n";
+            oss << "# TYPE blackbox_segments gauge\n";
+            oss << "blackbox_segments{index=\"" << s.name << "\"} " << s.segments << "\n";
+            oss << "# TYPE blackbox_vectors gauge\n";
+            oss << "blackbox_vectors{index=\"" << s.name << "\"} " << s.vectors << "\n";
+            oss << "# TYPE blackbox_wal_bytes_total counter\n";
+            oss << "blackbox_wal_bytes_total{index=\"" << s.name << "\"} " << s.walBytes << "\n";
+            oss << "# TYPE blackbox_pending_ops gauge\n";
+            oss << "blackbox_pending_ops{index=\"" << s.name << "\"} " << s.pendingOps << "\n";
+        }
+        metrics_.schemaMismatches.store(schemaMismatch, std::memory_order_relaxed);
+        oss << "blackbox_schema_mismatch_total " << schemaMismatch << "\n";
+        oss << "blackbox_wal_upgraded_total " << walUpgraded << "\n";
+        res.set_content(oss.str(), "text/plain");
+        addCors(res);
     });
 
     // --- METRICS/STATS ---
@@ -151,6 +236,33 @@ void BlackBoxHttpServer::setupRoutes() {
         };
         data["indexes"] = jstats;
         res.set_content(ok(data).dump(), "application/json");
+        addCors(res);
+        attachRequestId(req, res);
+    });
+
+    // --- COMPAT/MIGRATE ---
+    server_.Post("/v1/migrate", [this, ok, err, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
+        std::string overridePath = req.get_param_value("path");
+        try {
+            auto report = db_.migrateCompatibility(overridePath);
+            res.set_content(ok(report).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(err(500, e.what()).dump(), "application/json");
+        }
+        addCors(res);
+        attachRequestId(req, res);
+    });
+
+    // --- SHIPPING PLAN (WAL/snapshot paths + cluster ids) ---
+    server_.Get("/v1/ship", [this, ok, err, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto plan = db_.shippingPlan();
+            res.set_content(ok(plan).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(err(500, e.what()).dump(), "application/json");
+        }
         addCors(res);
         attachRequestId(req, res);
     });
@@ -254,9 +366,10 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- CONFIG ---
-    server_.Get("/v1/config", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
+    server_.Get("/v1/config", [this, ok, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
         res.set_content(ok(db_.config()).dump(), "application/json");
         addCors(res);
+        attachRequestId(req, res);
     });
 
     // --- CREATE INDEX ---
@@ -386,42 +499,71 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- SNAPSHOT SAVE ---
-    server_.Post("/v1/snapshot", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Post("/v1/snapshot", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/snapshot");
+            return;
+        }
         std::string overridePath = req.get_param_value("path");
         std::filesystem::path snapshotPath = overridePath.empty()
             ? (std::filesystem::path(dataDir_).empty() ? std::filesystem::path("index.manifest") : std::filesystem::path(dataDir_) / "index.manifest")
             : std::filesystem::path(overridePath);
 
+        auto start = std::chrono::steady_clock::now();
         bool saved = db_.saveSnapshot(snapshotPath.string());
+        auto end = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        metrics_.snapshotCount.fetch_add(1, std::memory_order_relaxed);
+        metrics_.snapshotLatencyMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
         if (saved) {
             json data = { {"path", snapshotPath.string()} };
             res.set_content(ok(data).dump(), "application/json");
+            logReq(rid, "ok path=/v1/snapshot");
         } else {
             res.status = 500;
             res.set_content(err(500, "Failed to write snapshot").dump(), "application/json");
+            logReq(rid, "error path=/v1/snapshot");
         }
         addCors(res);
     });
 
     // --- SNAPSHOT LOAD ---
-    server_.Post("/v1/snapshot/load", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Post("/v1/snapshot/load", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/snapshot/load");
+            return;
+        }
         std::string overridePath = req.get_param_value("path");
         std::filesystem::path snapshotPath = overridePath.empty()
             ? (std::filesystem::path(dataDir_).empty() ? std::filesystem::path("index.manifest") : std::filesystem::path(dataDir_) / "index.manifest")
             : std::filesystem::path(overridePath);
 
+        auto start = std::chrono::steady_clock::now();
         bool loaded = db_.loadSnapshot(snapshotPath.string());
+        auto end = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        metrics_.snapshotCount.fetch_add(1, std::memory_order_relaxed);
+        metrics_.snapshotLatencyMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
         if (loaded) {
             res.set_content(ok(json{{"path", snapshotPath.string()}}).dump(), "application/json");
+            logReq(rid, "ok path=/v1/snapshot/load");
         } else {
             res.status = 500;
             res.set_content(err(500, "Failed to load snapshot").dump(), "application/json");
+            logReq(rid, "error path=/v1/snapshot/load");
         }
         addCors(res);
     });
 
     // --- INDEX DOCUMENT ---
-    server_.Post(R"(/v1/([^/]+)/doc)", [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Post(R"(/v1/([^/]+)/doc)", [this, ok, err, isJsonContent, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/doc");
+            return;
+        }
         std::string index = req.matches[1];
         if (!isJsonContent(req)) {
             res.status = 415;
@@ -606,12 +748,18 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- SEARCH ---
-    server_.Get(R"(/v1/([^/]+)/search)", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Get(R"(/v1/([^/]+)/search)", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/search");
+            return;
+        }
         std::string index = req.matches[1];
         if (!db_.indexExists(index)) {
             res.status = 404;
             res.set_content(err(404, "Index not found").dump(), "application/json");
             addCors(res);
+            logReq(rid, "index_not_found path=/search index=" + index);
             return;
         }
         auto q = req.get_param_value("q");
@@ -621,6 +769,7 @@ void BlackBoxHttpServer::setupRoutes() {
             res.status = 400;
             res.set_content(err(400, "Missing query parameter 'q'").dump(), "application/json");
             addCors(res);
+            logReq(rid, "bad_request path=/search missing_q index=" + index);
             return;
         }
 
@@ -636,6 +785,8 @@ void BlackBoxHttpServer::setupRoutes() {
         int from = parseBounded(req.get_param_value("from"), 0, 0, 1'000'000);
         int size = parseBounded(req.get_param_value("size"), 10, 1, 500);
         int maxDist = parseBounded(req.get_param_value("distance"), 1, 0, 3);
+        int annProbes = parseBounded(req.get_param_value("ann_probes"), 0, 0, 256);
+        int annEf = parseBounded(req.get_param_value("ef_search"), 0, 0, 1024);
 
         // Hybrid weights
         auto parseDouble = [](const std::string& v, double def) {
@@ -648,13 +799,27 @@ void BlackBoxHttpServer::setupRoutes() {
 
         size_t need = static_cast<size_t>(from + size);
         std::vector<minielastic::BlackBox::SearchHit> results;
+        // Optional numeric range filter
+        std::string rangeField = req.get_param_value("range_field");
+        auto rangeMinStr = req.get_param_value("range_min");
+        auto rangeMaxStr = req.get_param_value("range_max");
+        double rangeMin = std::numeric_limits<double>::lowest();
+        double rangeMax = std::numeric_limits<double>::max();
+        bool hasRange = false;
+        if (!rangeField.empty()) {
+            try { rangeMin = rangeMinStr.empty() ? rangeMin : std::stod(rangeMinStr); } catch (...) {}
+            try { rangeMax = rangeMaxStr.empty() ? rangeMax : std::stod(rangeMaxStr); } catch (...) {}
+            hasRange = true;
+        }
         try {
             if (mode == "vector") {
+                auto start = std::chrono::steady_clock::now();
                 auto vecStr = req.get_param_value("vec");
                 if (vecStr.empty()) {
                     res.status = 400;
                     res.set_content(err(400, "Missing vector 'vec' parameter").dump(), "application/json");
                     addCors(res);
+                    logReq(rid, "bad_request path=/search missing_vec index=" + index);
                     return;
                 }
                 std::vector<float> qvec;
@@ -663,27 +828,63 @@ void BlackBoxHttpServer::setupRoutes() {
                 while (std::getline(ss, item, ',')) {
                     try { qvec.push_back(static_cast<float>(std::stof(item))); } catch (...) {}
                 }
-                results = db_.searchVector(index, qvec, need);
+                results = db_.searchVector(index, qvec, need, static_cast<uint32_t>(annProbes), static_cast<uint32_t>(annEf));
+                auto end = std::chrono::steady_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+                metrics_.searchCount.fetch_add(1, std::memory_order_relaxed);
+                metrics_.searchLatencyMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
+                metrics_.annCount.fetch_add(1, std::memory_order_relaxed);
+                metrics_.annLatencyMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
             } else if (mode == "hybrid") {
+                auto start = std::chrono::steady_clock::now();
                 results = db_.searchHybrid(index, q, wBm25, wSem, wLex, need);
+                auto end = std::chrono::steady_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+                metrics_.searchCount.fetch_add(1, std::memory_order_relaxed);
+                metrics_.searchLatencyMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
             } else {
                 if (q.empty()) {
                     res.status = 400;
                     res.set_content(err(400, "Missing query parameter 'q'").dump(), "application/json");
                     addCors(res);
+                    logReq(rid, "bad_request path=/search missing_q index=" + index);
                     return;
                 }
+                auto start = std::chrono::steady_clock::now();
                 results = db_.search(index, q, mode, need, maxDist);
+                auto end = std::chrono::steady_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+                metrics_.searchCount.fetch_add(1, std::memory_order_relaxed);
+                metrics_.searchLatencyMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
+            }
+            // Apply numeric range filter if requested
+            if (hasRange) {
+                const auto* nums = db_.getNumericValues(index);
+                std::vector<minielastic::BlackBox::SearchHit> filtered;
+                if (nums && nums->count(rangeField)) {
+                    const auto& fieldMap = nums->at(rangeField);
+                    for (const auto& h : results) {
+                        auto itv = fieldMap.find(h.id);
+                        if (itv == fieldMap.end()) continue;
+                        double v = itv->second;
+                        if (v >= rangeMin && v <= rangeMax) filtered.push_back(h);
+                    }
+                    results.swap(filtered);
+                } else {
+                    results.clear();
+                }
             }
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(err(500, std::string("search failed: ") + e.what()).dump(), "application/json");
             addCors(res);
+            logReq(rid, std::string("error path=/search err=") + e.what());
             return;
         } catch (...) {
             res.status = 500;
             res.set_content(err(500, "search failed").dump(), "application/json");
             addCors(res);
+            logReq(rid, "error path=/search err=unknown");
             return;
         }
 
@@ -987,5 +1188,6 @@ void BlackBoxHttpServer::setupRoutes() {
 
         res.set_content(ok(response).dump(), "application/json");
         addCors(res);
+        logReq(rid, "ok path=/search index=" + index + " mode=" + mode + " total=" + std::to_string(total));
     });
 }
