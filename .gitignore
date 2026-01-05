@@ -3,3 +3,4 @@
 /data
 /scripts/node_modules
 /scripts/*results.json
+scripts/snapshots/

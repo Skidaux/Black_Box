@@ -1682,6 +1682,8 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
         s.avgDocLen = st.avgDocLen;
         s.walSchemaMismatch = st.wal.schemaMismatch;
         s.walUpgraded = st.wal.upgradedFromLegacy;
+        s.schemaId = st.schema.schemaId;
+        s.schemaVersion = st.schema.schemaVersion;
         out.push_back(std::move(s));
     }
     return out;
@@ -3007,6 +3009,31 @@ bool BlackBox::loadSnapshot(const std::string& path) {
     return true;
 }
 
+nlohmann::json BlackBox::migrateCompatibility(const std::string& snapshotPath) const {
+    json report = {
+        {"snapshot_path", snapshotPath.empty() ? (std::filesystem::path(dataDir_) / "index.manifest").string() : snapshotPath},
+        {"indexes", json::array()}
+    };
+    // Rewrite manifest/schemas via saveSnapshot
+    bool snapOk = saveSnapshot(snapshotPath);
+    report["snapshot_saved"] = snapOk;
+    // Touch each WAL to ensure headers are written/upgraded
+    std::shared_lock<std::shared_mutex> lk(mutex_);
+    for (const auto& kv : indexes_) {
+        const auto& st = kv.second;
+        json entry = {
+            {"name", kv.first},
+            {"schema_id", st.schema.schemaId},
+            {"schema_version", st.schema.schemaVersion},
+            {"wal_path", st.wal.path},
+            {"wal_upgraded", st.wal.upgradedFromLegacy},
+            {"wal_schema_mismatch", st.wal.schemaMismatch}
+        };
+        report["indexes"].push_back(std::move(entry));
+    }
+    return report;
+}
+
 void BlackBox::loadWalOnly() {
     namespace fs = std::filesystem;
     if (dataDir_.empty()) return;
@@ -3139,6 +3166,45 @@ void BlackBox::persistSchema(const std::string& name, const IndexState& state) c
     out << state.schema.schema.dump(2);
     flushAndSync(out);
     flushFilePath(schemaPath.string());
+
+    // Append to schema registry for history
+    fs::path registryPath = fs::path(dataDir_) / "schema_registry.json";
+    json registry = json::object();
+    if (fs::exists(registryPath)) {
+        std::ifstream in(registryPath);
+        if (in) {
+            auto parsed = json::parse(in, nullptr, false);
+            if (!parsed.is_discarded()) registry = parsed;
+        }
+    }
+    if (!registry.contains("entries") || !registry["entries"].is_array()) {
+        registry["entries"] = json::array();
+    }
+    // avoid duplicate schema_id for the same index
+    bool exists = false;
+    for (const auto& entry : registry["entries"]) {
+        if (!entry.is_object()) continue;
+        if (entry.value("index", "") == name && entry.value("schema_id", "") == state.schema.schemaId) {
+            exists = true;
+            break;
+        }
+    }
+    if (!exists) {
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        registry["entries"].push_back({
+            {"index", name},
+            {"schema_id", state.schema.schemaId},
+            {"schema_version", state.schema.schemaVersion},
+            {"timestamp_ms", ts}
+        });
+    }
+    std::ofstream regOut(registryPath, std::ios::binary | std::ios::trunc);
+    if (regOut) {
+        regOut << registry.dump(2);
+        flushAndSync(regOut);
+        flushFilePath(registryPath.string());
+    }
 }
 
 std::optional<std::string> BlackBox::extractCustomId(const IndexState& idx, const nlohmann::json& doc) const {

@@ -788,8 +788,8 @@ async function runStress(maxDocs, concurrency, batchSize = 200) {
 
 async function runSnapshotTest() {
   const name = `snapshot_${Date.now()}`;
-  const snapshotDir = path.join(serverCwd, "data", `${name}_snap`);
-  const snapshotPath = path.join(snapshotDir, "index.manifest");
+  const snapshotDir = path.join(__dirname, "snapshots");
+  const snapshotPath = path.join(snapshotDir, `${name}.manifest`);
   const results = {
     timestamp: new Date().toISOString(),
     index: name,
@@ -817,6 +817,7 @@ async function runSnapshotTest() {
     results.steps.push({ step: "index_doc", status: docRes.status, id: docId });
 
     // Save snapshot to a custom path
+    fs.mkdirSync(snapshotDir, { recursive: true });
     const snapRes = await axios.post(`/v1/snapshot?path=${encodeURIComponent(snapshotPath)}`);
     results.steps.push({ step: "snapshot_save", status: snapRes.status });
 
@@ -863,6 +864,7 @@ async function runSnapshotTest() {
     await stopServerProcess(proc);
     const outPath = path.join(__dirname, "snapshot_results.json");
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.mkdirSync(snapshotDir, { recursive: true });
     fs.writeFileSync(outPath, JSON.stringify(results, null, 2), "utf8");
     console.log(`Snapshot test results written to ${outPath}`);
   }

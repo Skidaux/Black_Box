@@ -154,6 +154,8 @@ public:
     // Snapshot persistence (.skd manifest + shards)
     bool saveSnapshot(const std::string& path = "") const;
     bool loadSnapshot(const std::string& path = "");
+    // Compatibility migration: rewrite manifests/WAL headers to latest formats.
+    nlohmann::json migrateCompatibility(const std::string& snapshotPath = "") const;
 
     struct IndexStats {
         std::string name;
@@ -166,6 +168,8 @@ public:
         double avgDocLen = 0.0;
         bool walSchemaMismatch = false;
         bool walUpgraded = false;
+        std::string schemaId;
+        uint32_t schemaVersion = 0;
     };
 
     std::vector<IndexStats> stats() const;

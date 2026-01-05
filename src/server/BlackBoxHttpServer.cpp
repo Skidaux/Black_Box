@@ -78,7 +78,11 @@ void BlackBoxHttpServer::setupRoutes() {
         return ct.find("application/json") != std::string::npos;
     };
 
-
+    static std::atomic<uint64_t> reqCounter{1};
+    auto requestId = [&]() {
+        uint64_t id = reqCounter.fetch_add(1, std::memory_order_relaxed);
+        return std::string("req-") + std::to_string(id);
+    };
 
     // CORS helper to add to ALL responses
     auto addCors = [](httplib::Response& res) {
@@ -86,25 +90,32 @@ void BlackBoxHttpServer::setupRoutes() {
         res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
     };
+    auto attachRequestId = [&](const httplib::Request& req, httplib::Response& res) {
+        std::string rid = req.get_header_value("X-Request-Id");
+        if (rid.empty()) rid = requestId();
+        res.set_header("X-Request-Id", rid);
+    };
     auto resolveDocId = [this](const std::string& index, const std::string& raw) -> std::optional<minielastic::BlackBox::DocId> {
         return db_.lookupDocId(index, raw);
     };
 
     // Handle preflight OPTIONS requests for ANY route
-    server_.Options(R"(.*)", [addCors](const httplib::Request&, httplib::Response& res) {
+    server_.Options(R"(.*)", [addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
         addCors(res);
+        attachRequestId(req, res);
         res.status = 200;
         res.set_content("", "text/plain");
     });
 
     // --- HEALTH ---
-    server_.Get("/v1/health", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
+    server_.Get("/v1/health", [this, ok, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
         res.set_content(ok(json{}).dump(), "application/json");
         addCors(res);
+        attachRequestId(req, res);
     });
 
     // --- METRICS/STATS ---
-    server_.Get("/v1/metrics", [this, ok, addCors](const httplib::Request&, httplib::Response& res) {
+    server_.Get("/v1/metrics", [this, ok, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
         auto now = std::chrono::steady_clock::now();
         double uptimeSec = std::chrono::duration<double>(now - startTime_).count();
         json data;
@@ -141,10 +152,11 @@ void BlackBoxHttpServer::setupRoutes() {
         data["indexes"] = jstats;
         res.set_content(ok(data).dump(), "application/json");
         addCors(res);
+        attachRequestId(req, res);
     });
 
     // --- STORED FIELD MATCH (non-searchable fields) ---
-    server_.Get(R"(/v1/([^/]+)/stored_match)", [this, ok, err, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Get(R"(/v1/([^/]+)/stored_match)", [this, ok, err, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
         std::string index = req.matches[1];
         auto field = req.get_param_value("field");
         auto value = req.get_param_value("value");
@@ -152,6 +164,7 @@ void BlackBoxHttpServer::setupRoutes() {
             res.status = 400;
             res.set_content(err(400, "Missing 'field'").dump(), "application/json");
             addCors(res);
+            attachRequestId(req, res);
             return;
         }
         json parsedValue = json::parse(value, nullptr, false);
@@ -175,6 +188,7 @@ void BlackBoxHttpServer::setupRoutes() {
             res.set_content(err(400, e.what()).dump(), "application/json");
         }
         addCors(res);
+        attachRequestId(req, res);
     });
 
     // --- PROMETHEUS METRICS ---
