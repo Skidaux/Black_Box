@@ -128,6 +128,7 @@ public:
     const std::unordered_map<std::string, std::unordered_map<DocId, double>>* getNumericValues(const std::string& name) const;
     const std::unordered_map<std::string, std::unordered_map<DocId, bool>>* getBoolValues(const std::string& name) const;
     const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<DocId>>>* getStringLists(const std::string& name) const;
+    const std::unordered_map<DocId, double>* getNumericFieldCached(const std::string& name, const std::string& field) const;
 
     // Index a document from a JSON string and return its ID in the given index.
     DocId indexDocument(const std::string& index, const std::string& jsonStr);
@@ -179,6 +180,8 @@ public:
         uint64_t annRecallHits = 0;
         uint64_t termCacheHits = 0;
         uint64_t termCacheMisses = 0;
+        uint64_t fieldCacheHits = 0;
+        uint64_t fieldCacheMisses = 0;
     };
 
     std::vector<IndexStats> stats() const;
@@ -285,7 +288,7 @@ private:
     class TermCache {
     public:
         TermCache(size_t cap = 1024, uint64_t maxBytes = 0) : capacityEntries_(cap), maxBytes_(maxBytes) {}
-        bool get(const std::string& key, const std::vector<algo::Posting>*& out) const {
+        bool get(const std::string& key, const void*& out) const {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = map_.find(key);
             if (it == map_.end()) {
@@ -297,10 +300,10 @@ private:
             out = it->second.ptr;
             return true;
         }
-        void put(const std::string& key, const std::vector<algo::Posting>* ptr) const {
+        void put(const std::string& key, const void* ptr, size_t bytesEstimate) const {
             if (capacityEntries_ == 0 || ptr == nullptr) return;
             std::lock_guard<std::mutex> lk(mtx_);
-            size_t sz = ptr->size() * sizeof(algo::Posting);
+            size_t sz = bytesEstimate;
             auto it = map_.find(key);
             if (it != map_.end()) {
                 totalBytes_ = totalBytes_ - it->second.bytes + sz;
@@ -328,7 +331,7 @@ private:
         }
     private:
         struct Entry {
-            const std::vector<algo::Posting>* ptr;
+            const void* ptr;
             size_t bytes;
             std::list<std::string>::iterator it;
         };
@@ -411,6 +414,8 @@ private:
         uint64_t annRecallHits = 0;
         uint64_t termCacheHits = 0;
         uint64_t termCacheMisses = 0;
+        uint64_t fieldCacheHits = 0;
+        uint64_t fieldCacheMisses = 0;
     };
 
     std::string dataDir_;
@@ -426,12 +431,15 @@ private:
     uint64_t mergeThrottleMs_ = 0;
     uint64_t mergeMaxMB_ = 0;
     double mergeMBps_ = 0.0;
+    uint64_t mergeIoBudgetBytes_ = 0;
     size_t snapshotCacheCapacity_ = 8;
     uint64_t snapshotCacheMaxBytes_ = 0; // 0 = unlimited
     size_t docCacheCapacity_ = 256;
     uint64_t docCacheMaxBytes_ = 0;
     size_t termCacheCapacity_ = 1024;
     uint64_t termCacheMaxBytes_ = 0;
+    size_t fieldCacheCapacity_ = 512;
+    uint64_t fieldCacheMaxBytes_ = 0;
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
@@ -452,11 +460,16 @@ private:
     mutable std::atomic<uint64_t> annRecallHits_{0};
     mutable DocumentCache docCache_;
     mutable TermCache termCache_;
+    mutable TermCache fieldCache_; // reused structure for doc-values maps
     std::deque<std::string> mergeQueue_;
     std::unordered_set<std::string> mergePending_;
-    std::mutex mergeMtx_;
+    mutable std::mutex mergeMtx_;
+    mutable std::mutex mergeIoMtx_;
+    mutable std::condition_variable mergeCv_;
+    uint64_t mergeOutstandingBytes_ = 0;
 
     void refreshAverages(IndexState& idx);
+    uint64_t estimateMergeBytes(const IndexState& idx) const;
 
     // Tokenizer used for index + query
     std::vector<std::string> tokenize(const std::string& text) const;

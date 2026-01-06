@@ -227,6 +227,14 @@ void BlackBoxHttpServer::setupRoutes() {
         oss << "blackbox_term_cache_hits " << cfg.value("term_cache_hits", 0) << "\n";
         oss << "# TYPE blackbox_term_cache_misses counter\n";
         oss << "blackbox_term_cache_misses " << cfg.value("term_cache_misses", 0) << "\n";
+        oss << "# TYPE blackbox_field_cache_hits counter\n";
+        oss << "blackbox_field_cache_hits " << cfg.value("field_cache_hits", 0) << "\n";
+        oss << "# TYPE blackbox_field_cache_misses counter\n";
+        oss << "blackbox_field_cache_misses " << cfg.value("field_cache_misses", 0) << "\n";
+        oss << "# TYPE blackbox_merge_queue_depth gauge\n";
+        oss << "blackbox_merge_queue_depth " << cfg.value("merge_queue_depth", 0) << "\n";
+        oss << "# TYPE blackbox_merge_outstanding_bytes gauge\n";
+        oss << "blackbox_merge_outstanding_bytes " << cfg.value("merge_outstanding_bytes", 0) << "\n";
         for (const auto& s : stats) {
             if (s.walSchemaMismatch) schemaMismatch++;
             if (s.walUpgraded) walUpgraded++;
@@ -250,6 +258,10 @@ void BlackBoxHttpServer::setupRoutes() {
             oss << "blackbox_term_cache_hits_index{index=\"" << s.name << "\"} " << s.termCacheHits << "\n";
             oss << "# TYPE blackbox_term_cache_misses_index counter\n";
             oss << "blackbox_term_cache_misses_index{index=\"" << s.name << "\"} " << s.termCacheMisses << "\n";
+            oss << "# TYPE blackbox_field_cache_hits_index counter\n";
+            oss << "blackbox_field_cache_hits_index{index=\"" << s.name << "\"} " << s.fieldCacheHits << "\n";
+            oss << "# TYPE blackbox_field_cache_misses_index counter\n";
+            oss << "blackbox_field_cache_misses_index{index=\"" << s.name << "\"} " << s.fieldCacheMisses << "\n";
         }
         metrics_.schemaMismatches.store(schemaMismatch, std::memory_order_relaxed);
         oss << "blackbox_schema_mismatch_total " << schemaMismatch << "\n";
@@ -308,30 +320,42 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- COMPAT/MIGRATE ---
-    server_.Post("/v1/migrate", [this, ok, err, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
+    server_.Post("/v1/migrate", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/migrate");
+            return;
+        }
         std::string overridePath = req.get_param_value("path");
         try {
             auto report = db_.migrateCompatibility(overridePath);
             res.set_content(ok(report).dump(), "application/json");
+            logReq(rid, "ok path=/v1/migrate");
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(err(500, e.what()).dump(), "application/json");
+            logReq(rid, std::string("error path=/v1/migrate err=") + e.what());
         }
         addCors(res);
-        attachRequestId(req, res);
     });
 
     // --- SHIPPING PLAN (WAL/snapshot paths + cluster ids) ---
-    server_.Get("/v1/ship", [this, ok, err, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
+    server_.Get("/v1/ship", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/ship");
+            return;
+        }
         try {
             auto plan = db_.shippingPlan();
             res.set_content(ok(plan).dump(), "application/json");
+            logReq(rid, "ok path=/v1/ship");
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(err(500, e.what()).dump(), "application/json");
+            logReq(rid, std::string("error path=/v1/ship err=") + e.what());
         }
         addCors(res);
-        attachRequestId(req, res);
     });
 
     // --- SHIPPING APPLY (load snapshot/schemas from provided path) ---
@@ -802,7 +826,12 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- BULK INDEX ---
-    server_.Post(R"(/v1/([^/]+)/_bulk)", [this, ok, err, isJsonContent, addCors](const httplib::Request& req, httplib::Response& res) {
+    server_.Post(R"(/v1/([^/]+)/_bulk)", [this, ok, err, isJsonContent, addCors, attachRequestId, rateLimit, indexLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/bulk");
+            return;
+        }
         std::string index = req.matches[1];
         if (!db_.indexExists(index)) {
             res.status = 404;
@@ -810,17 +839,33 @@ void BlackBoxHttpServer::setupRoutes() {
             addCors(res);
             return;
         }
+        if (indexLimit(index, req, res)) {
+            logReq(rid, "rate_limited path=/bulk index=" + index);
+            return;
+        }
         if (db_.shouldBackpressure(index)) {
             res.status = 429;
             res.set_content(err(429, "Backpressure: flush backlog, retry later").dump(), "application/json");
             addCors(res);
+            logReq(rid, "backpressure path=/bulk index=" + index);
             return;
         }
         if (!isJsonContent(req)) {
             res.status = 415;
             res.set_content(err(415, "Content-Type must be application/json").dump(), "application/json");
             addCors(res);
+            logReq(rid, "bad_request path=/bulk content_type index=" + index);
             return;
+        }
+        if (indexMaxBodyKB_.count(index) || indexMaxBodyKB_.count("__default__")) {
+            size_t limitKb = indexMaxBodyKB_.count(index) ? indexMaxBodyKB_.at(index) : indexMaxBodyKB_.at("__default__");
+            if (limitKb > 0 && req.body.size() > limitKb * 1024) {
+                res.status = 413;
+                res.set_content(err(413, "Payload too large for index").dump(), "application/json");
+                addCors(res);
+                logReq(rid, "payload_too_large path=/bulk index=" + index);
+                return;
+            }
         }
         bool continueOnError = req.get_param_value("continue_on_error") != "false";
         json body;
@@ -830,6 +875,7 @@ void BlackBoxHttpServer::setupRoutes() {
             res.status = 400;
             res.set_content(err(400, std::string("Invalid JSON: ") + e.what()).dump(), "application/json");
             addCors(res);
+            logReq(rid, std::string("bad_request path=/bulk index=") + index + " err=" + e.what());
             return;
         }
         const json* docsNode = nullptr;
@@ -864,6 +910,7 @@ void BlackBoxHttpServer::setupRoutes() {
         res.status = errors.empty() ? 201 : 207;
         res.set_content(ok(payload).dump(), "application/json");
         addCors(res);
+        logReq(rid, "ok path=/bulk index=" + index + " indexed=" + std::to_string(ids.size()) + " errors=" + std::to_string(errors.size()));
     });
 
     // --- GET DOCUMENT ---
@@ -934,13 +981,23 @@ void BlackBoxHttpServer::setupRoutes() {
     server_.Patch(R"(/v1/([^/]+)/doc/([^/]+))", [updateDoc](const httplib::Request& req, httplib::Response& res){ updateDoc(req, res, true); });
 
     // --- DELETE DOCUMENT ---
-    server_.Delete(R"(/v1/([^/]+)/doc/([^/]+))", [this, ok, err, addCors, resolveDocId](const httplib::Request& req, httplib::Response& res) {
+    server_.Delete(R"(/v1/([^/]+)/doc/([^/]+))", [this, ok, err, addCors, resolveDocId, attachRequestId, rateLimit, indexLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/doc/delete");
+            return;
+        }
         std::string index = req.matches[1];
+        if (indexLimit(index, req, res)) {
+            logReq(rid, "rate_limited path=/doc/delete index=" + index);
+            return;
+        }
         auto docIdOpt = resolveDocId(index, req.matches[2]);
         if (!docIdOpt) {
             res.status = 404;
             res.set_content(err(404, "Document not found").dump(), "application/json");
             addCors(res);
+            logReq(rid, "not_found path=/doc/delete index=" + index);
             return;
         }
 
@@ -951,10 +1008,12 @@ void BlackBoxHttpServer::setupRoutes() {
                 data["doc_id"] = *existingExternal;
             }
             res.set_content(ok(data).dump(), "application/json");
+            logReq(rid, "ok path=/doc/delete index=" + index);
         }
         else {
             res.status = 404;
             res.set_content(err(404, "Document not found").dump(), "application/json");
+            logReq(rid, "not_found path=/doc/delete index=" + index);
         }
         addCors(res);
     });
@@ -1073,23 +1132,22 @@ void BlackBoxHttpServer::setupRoutes() {
                 metrics_.searchCount.fetch_add(1, std::memory_order_relaxed);
                 metrics_.searchLatencyMs.fetch_add(static_cast<uint64_t>(ms), std::memory_order_relaxed);
             }
-            // Apply numeric range filter if requested
-            if (hasRange) {
-                const auto* nums = db_.getNumericValues(index);
-                std::vector<minielastic::BlackBox::SearchHit> filtered;
-                if (nums && nums->count(rangeField)) {
-                    const auto& fieldMap = nums->at(rangeField);
-                    for (const auto& h : results) {
-                        auto itv = fieldMap.find(h.id);
-                        if (itv == fieldMap.end()) continue;
-                        double v = itv->second;
-                        if (v >= rangeMin && v <= rangeMax) filtered.push_back(h);
-                    }
-                    results.swap(filtered);
-                } else {
-                    results.clear();
+        // Apply numeric range filter if requested
+        if (hasRange) {
+            const auto* fieldMap = db_.getNumericFieldCached(index, rangeField);
+            std::vector<minielastic::BlackBox::SearchHit> filtered;
+            if (fieldMap) {
+                for (const auto& h : results) {
+                    auto itv = fieldMap->find(h.id);
+                    if (itv == fieldMap->end()) continue;
+                    double v = itv->second;
+                    if (v >= rangeMin && v <= rangeMax) filtered.push_back(h);
                 }
+                results.swap(filtered);
+            } else {
+                results.clear();
             }
+        }
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(err(500, std::string("search failed: ") + e.what()).dump(), "application/json");
@@ -1112,9 +1170,16 @@ void BlackBoxHttpServer::setupRoutes() {
         bool flagValue = flagParam == "true" || flagParam == "1";
         // schema-driven filters: filter_<field>=value, filter_<field>_min/_max for numbers, filter_<field>_bool
         const auto* schema = db_.getSchema(index);
-        const auto* numVals = db_.getNumericValues(index);
         const auto* boolVals = db_.getBoolValues(index);
         const auto* strLists = db_.getStringLists(index);
+        std::unordered_map<std::string, const std::unordered_map<minielastic::BlackBox::DocId, double>*> requestNumCache;
+        auto getNumField = [&](const std::string& field) -> const std::unordered_map<minielastic::BlackBox::DocId, double>* {
+            auto it = requestNumCache.find(field);
+            if (it != requestNumCache.end()) return it->second;
+            const auto* ptr = db_.getNumericFieldCached(index, field);
+            requestNumCache[field] = ptr;
+            return ptr;
+        };
 
         auto inStringList = [&](const std::string& field, const std::string& value, uint32_t docId)->bool {
             if (!strLists) return false;
@@ -1191,12 +1256,12 @@ void BlackBoxHttpServer::setupRoutes() {
                             bool target = eqParam == "true" || eqParam == "1";
                             auto itField = boolVals->find(field);
                             if (itField == boolVals->end() || itField->second.find(hit.id) == itField->second.end() || itField->second.at(hit.id) != target) { passed = false; break; }
-                        } else if (type == minielastic::BlackBox::FieldType::Number && numVals) {
+                        } else if (type == minielastic::BlackBox::FieldType::Number) {
                             double target = std::stod(eqParam);
-                            auto itField = numVals->find(field);
-                            if (itField == numVals->end()) { passed = false; break; }
-                            auto itVal = itField->second.find(hit.id);
-                            if (itVal == itField->second.end() || itVal->second != target) { passed = false; break; }
+                            const auto* fieldMap = getNumField(field);
+                            if (!fieldMap) { passed = false; break; }
+                            auto itVal = fieldMap->find(hit.id);
+                            if (itVal == fieldMap->end() || itVal->second != target) { passed = false; break; }
                         } else if (type == minielastic::BlackBox::FieldType::ArrayString && strLists) {
                             auto itField = strLists->find(field);
                             bool found = false;
@@ -1219,11 +1284,10 @@ void BlackBoxHttpServer::setupRoutes() {
                         auto maxParam = req.get_param_value("filter_" + field + "_max");
                         if (!minParam.empty() || !maxParam.empty()) {
                             double v = 0.0;
-                            if (numVals) {
-                                auto itField = numVals->find(field);
-                                if (itField == numVals->end()) { passed = false; break; }
-                                auto itVal = itField->second.find(hit.id);
-                                if (itVal == itField->second.end()) { passed = false; break; }
+                            const auto* fieldMap = getNumField(field);
+                            if (fieldMap) {
+                                auto itVal = fieldMap->find(hit.id);
+                                if (itVal == fieldMap->end()) { passed = false; break; }
                                 v = itVal->second;
                             } else {
                                 if (!ensureDoc(true)) { passed = false; break; }

@@ -1326,6 +1326,9 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envMergeMbps = std::getenv("BLACKBOX_MERGE_MBPS")) {
         try { mergeMBps_ = std::stod(envMergeMbps); } catch (...) {}
     }
+    if (const char* envMergeIoBudget = std::getenv("BLACKBOX_MERGE_IO_BUDGET_MB")) {
+        try { mergeIoBudgetBytes_ = std::stoull(envMergeIoBudget) * 1024ull * 1024ull; } catch (...) {}
+    }
     if (const char* envWalBytes = std::getenv("BLACKBOX_WAL_FLUSH_BYTES")) {
         try { walFlushBytes_ = std::max<uint64_t>(4096, std::stoull(envWalBytes)); } catch (...) {}
     }
@@ -1366,6 +1369,12 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envTermCacheMb = std::getenv("BLACKBOX_TERM_CACHE_MB")) {
         try { termCacheMaxBytes_ = std::stoull(envTermCacheMb) * 1024ull * 1024ull; } catch (...) {}
     }
+    if (const char* envFieldCache = std::getenv("BLACKBOX_FIELD_CACHE")) {
+        try { fieldCacheCapacity_ = static_cast<size_t>(std::stoull(envFieldCache)); } catch (...) {}
+    }
+    if (const char* envFieldCacheMb = std::getenv("BLACKBOX_FIELD_CACHE_MB")) {
+        try { fieldCacheMaxBytes_ = std::stoull(envFieldCacheMb) * 1024ull * 1024ull; } catch (...) {}
+    }
     if (const char* envShard = std::getenv("BLACKBOX_SHARD_ID")) {
         shardId_ = envShard;
     }
@@ -1384,6 +1393,8 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     docCache_.setMaxBytes(docCacheMaxBytes_);
     termCache_.setCapacity(termCacheCapacity_);
     termCache_.setMaxBytes(termCacheMaxBytes_);
+    fieldCache_.setCapacity(fieldCacheCapacity_);
+    fieldCache_.setMaxBytes(fieldCacheMaxBytes_);
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -1490,6 +1501,29 @@ const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, double
     auto it = indexes_.find(name);
     if (it == indexes_.end()) return nullptr;
     return &it->second.numericValues;
+}
+
+const std::unordered_map<BlackBox::DocId, double>* BlackBox::getNumericFieldCached(const std::string& name, const std::string& field) const {
+    std::shared_lock<std::shared_mutex> lk(mutex_);
+    auto it = indexes_.find(name);
+    if (it == indexes_.end()) return nullptr;
+    const IndexState& idxConst = it->second;
+    std::lock_guard<std::mutex> lkIdx(*idxConst.mtx);
+    IndexState& idx = const_cast<IndexState&>(idxConst);
+    const std::string cacheKey = idx.name + ":num:" + field;
+    const void* ptr = nullptr;
+    if (fieldCache_.get(cacheKey, ptr)) {
+        idx.fieldCacheHits++;
+        return static_cast<const std::unordered_map<DocId, double>*>(ptr);
+    }
+    idx.fieldCacheMisses++;
+    auto itField = idx.numericValues.find(field);
+    if (itField == idx.numericValues.end()) return nullptr;
+    const auto* mapPtr = &itField->second;
+    // Rough size estimate: docId + double per entry
+    size_t estBytes = std::max<size_t>(1, itField->second.size()) * (sizeof(DocId) + sizeof(double));
+    fieldCache_.put(cacheKey, mapPtr, estBytes);
+    return mapPtr;
 }
 
 const std::unordered_map<std::string, std::unordered_map<BlackBox::DocId, bool>>* BlackBox::getBoolValues(const std::string& name) const {
@@ -1651,14 +1685,14 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
     std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     auto terms = tokenize(query);
     for (const auto& t : terms) {
-        const std::vector<algo::Posting>* ptr = nullptr;
+        const void* ptr = nullptr;
         if (termCache_.get(idx.name + ":" + t, ptr)) {
             const_cast<IndexState&>(idx).termCacheHits++;
         } else {
             const_cast<IndexState&>(idx).termCacheMisses++;
             auto itp = idx.invertedIndex.find(t);
             if (itp != idx.invertedIndex.end()) {
-                termCache_.put(idx.name + ":" + t, &itp->second);
+                termCache_.put(idx.name + ":" + t, &itp->second, itp->second.size() * sizeof(algo::Posting));
             }
         }
     }
@@ -1883,6 +1917,18 @@ void BlackBox::refreshAverages(IndexState& idx) {
     idx.avgDocLen = static_cast<double>(total) / static_cast<double>(idx.docLengths.size());
 }
 
+uint64_t BlackBox::estimateMergeBytes(const IndexState& idx) const {
+    namespace fs = std::filesystem;
+    uint64_t total = 0;
+    for (const auto& seg : idx.segments) {
+        std::error_code ec;
+        auto sz = fs::file_size(fs::path(dataDir_) / seg.file, ec);
+        if (ec) return 0;
+        total += sz;
+    }
+    return total;
+}
+
 void BlackBox::indexQueryValues(IndexState& idx, DocId id, const std::string& field, const nlohmann::json& node) {
     clearQueryValues(idx, id);
     if (!idx.schema.searchable.count(field) || !idx.schema.searchable.at(field)) return;
@@ -1955,6 +2001,8 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
         s.annRecallHits = st.annRecallHits;
         s.termCacheHits = st.termCacheHits;
         s.termCacheMisses = st.termCacheMisses;
+        s.fieldCacheHits = st.fieldCacheHits;
+        s.fieldCacheMisses = st.fieldCacheMisses;
         out.push_back(std::move(s));
     }
     return out;
@@ -1962,6 +2010,16 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
 
 nlohmann::json BlackBox::config() const {
     std::shared_lock<std::shared_mutex> lk(mutex_);
+    size_t mergeQueueDepth = 0;
+    uint64_t mergeOutstanding = 0;
+    {
+        std::lock_guard<std::mutex> lkM(mergeMtx_);
+        mergeQueueDepth = mergeQueue_.size();
+    }
+    {
+        std::lock_guard<std::mutex> lkIo(mergeIoMtx_);
+        mergeOutstanding = mergeOutstandingBytes_;
+    }
     json j{
         {"data_dir", dataDir_},
         {"flush_every_docs", flushEveryDocs_},
@@ -1971,12 +2029,19 @@ nlohmann::json BlackBox::config() const {
         {"merge_throttle_ms", mergeThrottleMs_},
         {"merge_max_mb", mergeMaxMB_},
         {"merge_mbps", mergeMBps_},
+        {"merge_io_budget_mb", mergeIoBudgetBytes_ / (1024.0 * 1024.0)},
+        {"merge_outstanding_bytes", mergeOutstanding},
+        {"merge_queue_depth", mergeQueueDepth},
         {"snapshot_cache", snapshotCacheCapacity_},
         {"snapshot_cache_mb", snapshotCacheMaxBytes_ / (1024.0 * 1024.0)},
         {"term_cache", termCacheCapacity_},
         {"term_cache_mb", termCacheMaxBytes_ / (1024.0 * 1024.0)},
         {"term_cache_hits", termCache_.hits()},
         {"term_cache_misses", termCache_.misses()},
+        {"field_cache", fieldCacheCapacity_},
+        {"field_cache_mb", fieldCacheMaxBytes_ / (1024.0 * 1024.0)},
+        {"field_cache_hits", fieldCache_.hits()},
+        {"field_cache_misses", fieldCache_.misses()},
         {"compress_snapshots", compressSnapshots_},
         {"auto_snapshot", autoSnapshot_},
         {"default_ann_clusters", defaultAnnClusters_},
@@ -3892,11 +3957,31 @@ void BlackBox::processMergeQueue() {
         mergeQueue_.pop_front();
         mergePending_.erase(job);
     }
-    std::unique_lock<std::shared_mutex> lk(mutex_);
+    std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(job);
     if (it == indexes_.end()) return;
-    std::lock_guard<std::mutex> lkIdx(*it->second.mtx);
-    performMerge(job, it->second);
+    IndexState* idxPtr = &it->second;
+    // Estimate bytes for budget
+    uint64_t estBytes = estimateMergeBytes(*idxPtr);
+    if (mergeIoBudgetBytes_ > 0 && estBytes > 0) {
+        std::unique_lock<std::mutex> lkIo(mergeIoMtx_);
+        mergeCv_.wait(lkIo, [&]() {
+            return stopMaintenance_.load(std::memory_order_relaxed) || mergeOutstandingBytes_ + estBytes <= mergeIoBudgetBytes_;
+        });
+        if (stopMaintenance_.load(std::memory_order_relaxed)) return;
+        mergeOutstandingBytes_ += estBytes;
+    }
+    // perform merge under per-index lock
+    {
+        std::lock_guard<std::mutex> lkIdx(*idxPtr->mtx);
+        performMerge(job, *idxPtr);
+    }
+    if (mergeIoBudgetBytes_ > 0 && estBytes > 0) {
+        std::lock_guard<std::mutex> lkIo(mergeIoMtx_);
+        if (mergeOutstandingBytes_ >= estBytes) mergeOutstandingBytes_ -= estBytes;
+        else mergeOutstandingBytes_ = 0;
+        mergeCv_.notify_all();
+    }
 }
 
 bool BlackBox::validateCustomApi(const std::string& name, const json& spec) const {
