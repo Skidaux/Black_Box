@@ -876,6 +876,8 @@ async function runCoverageTest() {
   process.env.BLACKBOX_SHIP_ENDPOINT = "http://ship-js";
   process.env.BLACKBOX_SHIP_METHOD = "http";
   const index = `coverage_${Date.now()}`;
+  const snapshotDir = path.join(__dirname, "snapshots");
+  const snapshotPath = path.join(snapshotDir, `${index}.manifest`);
   const results = { timestamp: new Date().toISOString(), index, steps: [] };
   let proc = null;
   try {
@@ -931,6 +933,19 @@ async function runCoverageTest() {
     );
     const vecHits = vec.data?.data?.hits ?? [];
     results.steps.push({ step: "vector_search_override", status: vec.status, topId: vecHits[0]?.id });
+
+    // Save snapshot and apply via ship/apply
+    fs.mkdirSync(snapshotDir, { recursive: true });
+    const snapSave = await axios.post(`/v1/snapshot?path=${encodeURIComponent(snapshotPath)}`);
+    results.steps.push({ step: "snapshot_save", status: snapSave.status });
+    const shipApply = await axios.post(`/v1/ship/apply?path=${encodeURIComponent(snapshotPath)}`);
+    results.steps.push({ step: "ship_apply", status: shipApply.status });
+
+    // Fetch metrics to ensure new counters are exposed
+    const metrics = await axios.get("/metrics");
+    const hasDocCache = metrics.data.includes("blackbox_doc_cache_hits");
+    const hasAnnRecall = metrics.data.includes("blackbox_ann_recall_samples");
+    results.steps.push({ step: "metrics", status: metrics.status, docCacheMetric: hasDocCache, annRecallMetric: hasAnnRecall });
 
     const cfg = await axios.get("/v1/config");
     results.steps.push({

@@ -176,6 +176,9 @@ try {
     expect(db.updateDocument(indexName, newId, R"({"body":"foo baz"})", true), "partial update");
     auto after = db.getDocument(indexName, newId)["_updated_at"].get<int64_t>();
     expect(after > before, "_updated_at should advance on update");
+    // exercise doc cache hits
+    (void)db.getDocument(indexName, newId);
+    (void)db.getDocument(indexName, newId);
 
     // Non-searchable and query_values fields
     const std::string extraIndex = "meta_index";
@@ -354,6 +357,10 @@ try {
     expect(cfg.contains("snapshot_cache"), "config snapshot_cache present");
     expect(cfg.value("shard_id", "") == "shard-local", "config shard id");
     expect(cfg.value("replica_id", "") == "replica-1", "config replica id");
+    expect(cfg.value("doc_cache_hits", 0ULL) > 0, "doc cache hits should increment");
+    expect(cfg.value("ann_recall_samples", 0ULL) > 0, "ann recall samples recorded");
+    expect(cfg.value("ann_recall_hits", 0ULL) <= cfg.value("ann_recall_samples", 0ULL), "ann recall hits bounded");
+    expect(cfg.value("replay_errors", 0ULL) == 0, "replay errors should be zero");
 
     // Shipping plan should list cluster info and segment/WAL paths
     auto ship = db.shippingPlan();

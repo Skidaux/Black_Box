@@ -14,6 +14,7 @@
 #include <optional>
 #include <unordered_set>
 #include <atomic>
+#include <list>
 #include <thread>
 #include <chrono>
 #include <nlohmann/json.hpp>
@@ -175,6 +176,9 @@ public:
     std::vector<IndexStats> stats() const;
     nlohmann::json config() const;
     nlohmann::json shippingPlan() const;
+    uint64_t replayErrors() const;
+    uint64_t annRecallSamples() const;
+    uint64_t annRecallHits() const;
     std::string dataDir() const { return dataDir_; }
     bool createOrUpdateCustomApi(const std::string& name, const nlohmann::json& spec);
     bool removeCustomApi(const std::string& name);
@@ -191,6 +195,86 @@ private:
         std::unordered_map<std::string, ImageBlob> images;
     };
 
+    class DocumentCache {
+    public:
+        DocumentCache(size_t cap = 256, uint64_t maxBytes = 0) : capacityEntries_(cap), maxBytes_(maxBytes) {}
+        bool get(const std::string& key, nlohmann::json& out) const {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = map_.find(key);
+            if (it == map_.end()) {
+                misses_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            hits_.fetch_add(1, std::memory_order_relaxed);
+            touch(it);
+            out = it->second.doc;
+            return true;
+        }
+        void put(const std::string& key, const nlohmann::json& doc) const {
+            if (capacityEntries_ == 0) return;
+            std::lock_guard<std::mutex> lk(mtx_);
+            std::string dumped = doc.dump();
+            size_t sz = dumped.size();
+            auto it = map_.find(key);
+            if (it != map_.end()) {
+                totalBytes_ = totalBytes_ - it->second.bytes + sz;
+                it->second.bytes = sz;
+                it->second.doc = doc;
+                touch(it);
+                evictIfNeeded(0);
+                return;
+            }
+            evictIfNeeded(sz);
+            order_.push_front(key);
+            map_[key] = {doc, sz, order_.begin()};
+            totalBytes_ += sz;
+        }
+        void setCapacity(size_t cap) const { capacityEntries_ = cap; evictIfNeeded(0); }
+        void setMaxBytes(uint64_t bytes) const { maxBytes_ = bytes; evictIfNeeded(0); }
+        uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
+        uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
+        uint64_t totalBytes() const { return totalBytes_; }
+        void erase(const std::string& key) const {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = map_.find(key);
+            if (it == map_.end()) return;
+            if (totalBytes_ >= it->second.bytes) totalBytes_ -= it->second.bytes;
+            order_.erase(it->second.it);
+            map_.erase(it);
+        }
+    private:
+        struct Entry {
+            nlohmann::json doc;
+            size_t bytes = 0;
+            std::list<std::string>::iterator it;
+        };
+        mutable size_t capacityEntries_;
+        mutable uint64_t maxBytes_;
+        mutable uint64_t totalBytes_ = 0;
+        mutable std::list<std::string> order_;
+        mutable std::unordered_map<std::string, Entry> map_;
+        mutable std::atomic<uint64_t> hits_{0};
+        mutable std::atomic<uint64_t> misses_{0};
+        mutable std::mutex mtx_;
+
+        void evictIfNeeded(size_t incoming) const {
+            while ((!order_.empty()) && (order_.size() >= capacityEntries_ || (maxBytes_ > 0 && totalBytes_ + incoming > maxBytes_))) {
+                auto evict = order_.back();
+                auto it = map_.find(evict);
+                if (it != map_.end()) {
+                    if (totalBytes_ >= it->second.bytes) totalBytes_ -= it->second.bytes;
+                }
+                order_.pop_back();
+                map_.erase(evict);
+            }
+        }
+        void touch(std::unordered_map<std::string, Entry>::iterator it) const {
+            order_.erase(it->second.it);
+            order_.push_front(it->first);
+            it->second.it = order_.begin();
+        }
+    };
+
     // Per-index state
     struct SegmentMetadata {
         std::string file;
@@ -202,6 +286,7 @@ private:
 
     struct IndexState {
         DocId nextId = 1;
+        std::string name;
         std::unordered_map<DocId, nlohmann::json> documents;
         std::unordered_map<std::string, std::vector<algo::Posting>> invertedIndex;
         std::unordered_map<DocId, uint32_t> docLengths;
@@ -254,6 +339,8 @@ private:
     uint64_t mergeMaxMB_ = 0;
     size_t snapshotCacheCapacity_ = 8;
     uint64_t snapshotCacheMaxBytes_ = 0; // 0 = unlimited
+    size_t docCacheCapacity_ = 256;
+    uint64_t docCacheMaxBytes_ = 0;
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
@@ -269,6 +356,10 @@ private:
     mutable std::unordered_map<std::string, IndexState> indexes_;
     std::unordered_map<std::string, nlohmann::json> customApis_;
     std::string customApiPath_;
+    mutable std::atomic<uint64_t> replayErrors_{0};
+    mutable std::atomic<uint64_t> annRecallSamples_{0};
+    mutable std::atomic<uint64_t> annRecallHits_{0};
+    mutable DocumentCache docCache_;
 
     void refreshAverages(IndexState& idx);
 

@@ -1351,6 +1351,12 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envSnapCacheMb = std::getenv("BLACKBOX_SNAPSHOT_CACHE_MB")) {
         try { snapshotCacheMaxBytes_ = std::stoull(envSnapCacheMb) * 1024ull * 1024ull; } catch (...) {}
     }
+    if (const char* envDocCache = std::getenv("BLACKBOX_DOC_CACHE")) {
+        try { docCacheCapacity_ = static_cast<size_t>(std::stoull(envDocCache)); } catch (...) {}
+    }
+    if (const char* envDocCacheMb = std::getenv("BLACKBOX_DOC_CACHE_MB")) {
+        try { docCacheMaxBytes_ = std::stoull(envDocCacheMb) * 1024ull * 1024ull; } catch (...) {}
+    }
     if (const char* envShard = std::getenv("BLACKBOX_SHARD_ID")) {
         shardId_ = envShard;
     }
@@ -1365,6 +1371,8 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     }
     gSnapshotCache.setCapacity(snapshotCacheCapacity_);
     gSnapshotCache.setMaxBytes(snapshotCacheMaxBytes_);
+    docCache_.setCapacity(docCacheCapacity_);
+    docCache_.setMaxBytes(docCacheMaxBytes_);
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -1425,6 +1433,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
     if (name.empty()) return false;
     if (indexes_.count(name)) return false;
     indexes_[name] = IndexState{};
+    indexes_[name].name = name;
     indexes_[name].schema = schema;
     indexes_[name].annClusters = defaultAnnClusters_;
     indexes_[name].annClusters = defaultAnnClusters_;
@@ -1522,10 +1531,14 @@ nlohmann::json BlackBox::getDocument(const std::string& index, DocId id) const {
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
     const IndexState& idx = it->second;
+    std::string key = index + ":" + std::to_string(id);
+    nlohmann::json cached;
+    if (docCache_.get(key, cached)) return cached;
     std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     const auto& docs = idx.documents;
     auto d = docs.find(id);
     if (d == docs.end()) throw std::runtime_error("Document ID not found");
+    docCache_.put(key, d->second);
     return d->second;
 }
 
@@ -1741,9 +1754,35 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
         hits.push_back({docId, score});
     };
 
+    auto computeRecall = [&](const std::vector<SearchHit>& approx) {
+        const size_t maxExact = 2000;
+        if (approx.empty()) return;
+        if (idx.vectors.size() > maxExact) return;
+        std::vector<SearchHit> exact;
+        exact.reserve(idx.vectors.size());
+        for (const auto& kv : idx.vectors) {
+            double score = dot(queryVec, kv.second) / (qn * norm(kv.second) + 1e-9);
+            exact.push_back({kv.first, score});
+        }
+        std::sort(exact.begin(), exact.end(), [](const SearchHit& a, const SearchHit& b){
+            if (a.score == b.score) return a.id < b.id;
+            return a.score > b.score;
+        });
+        size_t k = std::min(approx.size(), exact.size());
+        std::unordered_set<uint32_t> approxSet;
+        for (size_t i = 0; i < k; ++i) approxSet.insert(approx[i].id);
+        size_t overlap = 0;
+        for (size_t i = 0; i < k; ++i) {
+            if (approxSet.count(exact[i].id)) ++overlap;
+        }
+        annRecallSamples_.fetch_add(1, std::memory_order_relaxed);
+        annRecallHits_.fetch_add(overlap, std::memory_order_relaxed);
+    };
+
     // Prefer HNSW graph when available
     if (!idx.annGraph.empty()) {
         auto graphHits = searchHnsw(idx, queryVec, maxResults);
+        computeRecall(graphHits);
         if (!graphHits.empty()) return graphHits;
     }
 
@@ -1902,6 +1941,12 @@ nlohmann::json BlackBox::config() const {
     j["snapshot_cache_hits"] = gSnapshotCache.hits();
     j["snapshot_cache_misses"] = gSnapshotCache.misses();
     j["snapshot_cache_bytes"] = gSnapshotCache.totalBytes();
+    j["doc_cache_hits"] = docCache_.hits();
+    j["doc_cache_misses"] = docCache_.misses();
+    j["doc_cache_bytes"] = docCache_.totalBytes();
+    j["ann_recall_samples"] = annRecallSamples_.load(std::memory_order_relaxed);
+    j["ann_recall_hits"] = annRecallHits_.load(std::memory_order_relaxed);
+    j["replay_errors"] = replayErrors_.load(std::memory_order_relaxed);
     return j;
 }
 
@@ -1950,6 +1995,16 @@ nlohmann::json BlackBox::shippingPlan() const {
         });
     }
     return plan;
+}
+
+uint64_t BlackBox::replayErrors() const {
+    return replayErrors_.load(std::memory_order_relaxed);
+}
+uint64_t BlackBox::annRecallSamples() const {
+    return annRecallSamples_.load(std::memory_order_relaxed);
+}
+uint64_t BlackBox::annRecallHits() const {
+    return annRecallHits_.load(std::memory_order_relaxed);
 }
 
 void BlackBox::indexJson(IndexState& idx, DocId id, const json& j) {
@@ -2548,6 +2603,7 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const Processed
     }
 
     idx.documents[assignId] = doc;
+    docCache_.put(idx.name + ":" + std::to_string(assignId), doc);
     if (newExternal) {
         if (previousExternal && *previousExternal != *newExternal) {
             idx.externalToDocId.erase(*previousExternal);
@@ -2622,6 +2678,7 @@ bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
         imgField.second.erase(id);
     }
     idx.tombstones.insert(id);
+    docCache_.erase(idx.name + ":" + std::to_string(id));
     if (logWal) {
         if (!idx.wal.stream.is_open() && !idx.wal.path.empty()) {
             idx.wal.open();
@@ -2928,11 +2985,19 @@ void BlackBox::replayWal(IndexState& idx, uint64_t startOffset) {
         if (rec.op == WalOp::Upsert) {
             auto j = json::from_cbor(rec.payload, true, false);
             if (j.is_discarded()) continue;
-            auto processed = preprocessWalDocument(idx, j);
-            idx.nextId = std::max<DocId>(idx.nextId, rec.docId + 1);
-            applyUpsert(idx, rec.docId, processed, false);
+            try {
+                auto processed = preprocessWalDocument(idx, j);
+                idx.nextId = std::max<DocId>(idx.nextId, rec.docId + 1);
+                applyUpsert(idx, rec.docId, processed, false);
+            } catch (...) {
+                replayErrors_.fetch_add(1, std::memory_order_relaxed);
+            }
         } else if (rec.op == WalOp::Delete) {
-            applyDelete(idx, rec.docId, false);
+            try {
+                applyDelete(idx, rec.docId, false);
+            } catch (...) {
+                replayErrors_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 }
@@ -3111,6 +3176,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
         }
 
         IndexState state;
+        state.name = name;
         state.annClusters = idxJson.value("ann_clusters", defaultAnnClusters_);
         state.annProbes = idxJson.value("ann_probes", defaultAnnProbes_);
         state.annM = idxJson.value("ann_m", defaultAnnM_);
@@ -3360,6 +3426,7 @@ void BlackBox::loadWalOnly() {
         std::string name = path.stem().string();
         if (indexes_.count(name)) continue;
         IndexState state;
+        state.name = name;
         state.annClusters = defaultAnnClusters_;
         state.annM = defaultAnnM_;
         state.annEfSearch = defaultAnnEfSearch_;

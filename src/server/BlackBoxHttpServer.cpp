@@ -185,6 +185,12 @@ void BlackBoxHttpServer::setupRoutes() {
         oss << "blackbox_snapshot_cache_hits " << cfg.value("snapshot_cache_hits", 0) << "\n";
         oss << "# TYPE blackbox_snapshot_cache_misses counter\n";
         oss << "blackbox_snapshot_cache_misses " << cfg.value("snapshot_cache_misses", 0) << "\n";
+        oss << "# TYPE blackbox_doc_cache_bytes gauge\n";
+        oss << "blackbox_doc_cache_bytes " << cfg.value("doc_cache_bytes", 0) << "\n";
+        oss << "# TYPE blackbox_doc_cache_hits counter\n";
+        oss << "blackbox_doc_cache_hits " << cfg.value("doc_cache_hits", 0) << "\n";
+        oss << "# TYPE blackbox_doc_cache_misses counter\n";
+        oss << "blackbox_doc_cache_misses " << cfg.value("doc_cache_misses", 0) << "\n";
         for (const auto& s : stats) {
             if (s.walSchemaMismatch) schemaMismatch++;
             if (s.walUpgraded) walUpgraded++;
@@ -202,6 +208,14 @@ void BlackBoxHttpServer::setupRoutes() {
         metrics_.schemaMismatches.store(schemaMismatch, std::memory_order_relaxed);
         oss << "blackbox_schema_mismatch_total " << schemaMismatch << "\n";
         oss << "blackbox_wal_upgraded_total " << walUpgraded << "\n";
+        oss << "# TYPE blackbox_replay_errors_total counter\n";
+        oss << "blackbox_replay_errors_total " << db_.replayErrors() << "\n";
+        auto recallSamples = db_.annRecallSamples();
+        auto recallHits = db_.annRecallHits();
+        oss << "# TYPE blackbox_ann_recall_samples counter\n";
+        oss << "blackbox_ann_recall_samples " << recallSamples << "\n";
+        oss << "# TYPE blackbox_ann_recall_hits counter\n";
+        oss << "blackbox_ann_recall_hits " << recallHits << "\n";
         res.set_content(oss.str(), "text/plain");
         addCors(res);
     });
@@ -289,6 +303,55 @@ void BlackBoxHttpServer::setupRoutes() {
             logReq(rid, "bad_request path=/v1/ship/apply missing path");
             return;
         }
+        // Quick manifest verification before load
+        try {
+            std::ifstream in(path);
+            if (!in) {
+                res.status = 400;
+                res.set_content(err(400, "Manifest not readable").dump(), "application/json");
+                addCors(res);
+                logReq(rid, "bad_request path=/v1/ship/apply unreadable");
+                return;
+            }
+            auto manifest = json::parse(in, nullptr, false);
+            if (manifest.is_discarded() || manifest.value("format", "") != "blackbox_manifest") {
+                res.status = 400;
+                res.set_content(err(400, "Invalid manifest format").dump(), "application/json");
+                addCors(res);
+                logReq(rid, "bad_request path=/v1/ship/apply invalid manifest");
+                return;
+            }
+            if (manifest.value("version", 1) > 2) {
+                res.status = 400;
+                res.set_content(err(400, "Unsupported manifest version").dump(), "application/json");
+                addCors(res);
+                logReq(rid, "bad_request path=/v1/ship/apply version");
+                return;
+            }
+            for (const auto& idx : manifest.value("indexes", json::array())) {
+                if (!idx.is_object()) continue;
+                for (const auto& seg : idx.value("segments", json::array())) {
+                    if (seg.is_object()) {
+                        auto fmt = seg.value("format", "skd");
+                        auto ver = seg.value("version", 1);
+                        if (fmt != "skd" || ver > 1) {
+                            res.status = 400;
+                            res.set_content(err(400, "Unsupported segment format/version").dump(), "application/json");
+                            addCors(res);
+                            logReq(rid, "bad_request path=/v1/ship/apply segfmt");
+                            return;
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(err(400, std::string("Manifest parse failed: ") + e.what()).dump(), "application/json");
+            addCors(res);
+            logReq(rid, std::string("bad_request path=/v1/ship/apply err=") + e.what());
+            return;
+        }
+
         bool okLoad = false;
         try {
             okLoad = db_.loadSnapshot(path);
