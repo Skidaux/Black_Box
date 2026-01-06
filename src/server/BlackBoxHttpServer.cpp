@@ -223,6 +223,10 @@ void BlackBoxHttpServer::setupRoutes() {
         oss << "blackbox_doc_cache_hits " << cfg.value("doc_cache_hits", 0) << "\n";
         oss << "# TYPE blackbox_doc_cache_misses counter\n";
         oss << "blackbox_doc_cache_misses " << cfg.value("doc_cache_misses", 0) << "\n";
+        oss << "# TYPE blackbox_term_cache_hits counter\n";
+        oss << "blackbox_term_cache_hits " << cfg.value("term_cache_hits", 0) << "\n";
+        oss << "# TYPE blackbox_term_cache_misses counter\n";
+        oss << "blackbox_term_cache_misses " << cfg.value("term_cache_misses", 0) << "\n";
         for (const auto& s : stats) {
             if (s.walSchemaMismatch) schemaMismatch++;
             if (s.walUpgraded) walUpgraded++;
@@ -242,6 +246,10 @@ void BlackBoxHttpServer::setupRoutes() {
             oss << "blackbox_ann_recall_samples_index{index=\"" << s.name << "\"} " << s.annRecallSamples << "\n";
             oss << "# TYPE blackbox_ann_recall_hits_index counter\n";
             oss << "blackbox_ann_recall_hits_index{index=\"" << s.name << "\"} " << s.annRecallHits << "\n";
+            oss << "# TYPE blackbox_term_cache_hits_index counter\n";
+            oss << "blackbox_term_cache_hits_index{index=\"" << s.name << "\"} " << s.termCacheHits << "\n";
+            oss << "# TYPE blackbox_term_cache_misses_index counter\n";
+            oss << "blackbox_term_cache_misses_index{index=\"" << s.name << "\"} " << s.termCacheMisses << "\n";
         }
         metrics_.schemaMismatches.store(schemaMismatch, std::memory_order_relaxed);
         oss << "blackbox_schema_mismatch_total " << schemaMismatch << "\n";

@@ -4,9 +4,9 @@ Base URL: `http://127.0.0.1:8080`
 
 ## Health & Metrics
 - `GET /v1/health` – returns `{status:"ok"}` when the server is up.
-- `GET /v1/metrics` – JSON with uptime, config, totals, and per-index stats (docs, segments, vectors, WAL bytes, pending ops).
-- `GET /metrics` – Prometheus exposition format (uptime, documents, segments, WAL bytes, pending ops).
-- `GET /v1/config` – current runtime config (data_dir, flush thresholds, compression, ANN clusters).
+- `GET /v1/metrics` – JSON with uptime, config, totals, and per-index stats (docs, segments, vectors, WAL bytes, pending ops, replay_errors, ANN recall samples/hits).
+- `GET /metrics` – Prometheus exposition format: uptime, documents/segments/vectors/WAL bytes, pending ops, cache stats (snapshot/doc cache hits/misses/bytes), replay error counters, ANN recall counters (global + per-index), rate-limit counters.
+- `GET /v1/config` – current runtime config (data_dir, flush thresholds, compression, ANN clusters, caches, merge/throughput settings, cluster/shipping IDs).
 
 ## Index Management
 - `POST /v1/indexes` – create an index. Body:
@@ -27,14 +27,18 @@ Base URL: `http://127.0.0.1:8080`
 }
 ```
 - `GET /v1/indexes` – list indexes with basic stats.
-- Snapshots:
+- Snapshots/Shipping:
   - `POST /v1/snapshot` (optional `?path=...`) – write manifest/snapshots.
   - `POST /v1/snapshot/load` (optional `?path=...`) – load a manifest/snapshots.
+  - `GET /v1/ship` – export a shipping plan (shard/replica IDs, segment/WAL paths, schema IDs).
+  - `POST /v1/ship/apply?path=...` – validate manifest/segment formats and load a shipped snapshot.
+  - `POST /v1/ship/fetch_apply?base=...` – convenience to load a manifest at `base/index.manifest` after validation.
+  - Merge backpressure now uses a queue processed by maintenance; merges are not run inline on flush triggers.
 - Durability/compatibility: WAL files include a `BBWAL` magic header with version + `schema_id`, and versioned records carry `op_id`; manifests are versioned (`format=blackbox_manifest`, `version=2`) and persist `schema_id`/`schema_version` and `next_op_id` for forward-compatible upgrades.
   - Legacy WALs are auto-rewritten to the new format (backup as .legacy) when opened with a known schema; schema_id mismatches emit warnings and are surfaced in stats; legacy manifests are rewritten to the latest format during load.
 
 ## Documents
-- `POST /v1/{index}/doc` – index a document (Content-Type: application/json). Returns `id` and, when configured, `doc_id` (custom identifier derived from schema). Image fields use `{ "content": "<base64>", "format": "png", "encoding": "base64" }`; the server stores raw binary and enforces `max_kb` limits.
+- `POST /v1/{index}/doc` – index a document (Content-Type: application/json). Returns `id` and, when configured, `doc_id` (custom identifier derived from schema). Image fields use `{ "content": "<base64>", "format": "png", "encoding": "base64" }`; the server stores raw binary and enforces `max_kb` limits. Per-index rate/body limits return 429 when exceeded (see tunables).
 - `POST /v1/{index}/_bulk` – bulk index; body is an array or `{ "docs": [...] }`. Supports `continue_on_error=true|false` (default true). Returns `indexed`, `ids`, and `errors`.
   - May return `429 Backpressure` when in-memory backlog exceeds flush thresholds; retry after a short delay.
 - `GET /v1/{index}/doc/{id}` – fetch a document by auto-increment ID or custom ID.
@@ -98,15 +102,22 @@ Environment variables:
 - `BLACKBOX_FLUSH_MS` – max time between segment flushes (0 disables).
 - `BLACKBOX_FLUSH_WAL_BYTES` – WAL growth that triggers a segment flush (default 8 MB).
 - `BLACKBOX_MERGE_SEGMENTS` – max segments before auto-merge into one (default 10).
+- `BLACKBOX_MERGE_THROTTLE_MS` – base sleep after merge (scaled by input size and budget).
+- `BLACKBOX_MERGE_MAX_MB` – skip/sleep if merge input exceeds this many MB (best-effort).
+- `BLACKBOX_MERGE_MBPS` – optional throughput cap for merges; computes minimum sleep based on input size.
 - `BLACKBOX_COMPRESS` – `1/true/on` to compress snapshot sections (default on).
 - `BLACKBOX_AUTO_SNAPSHOT` – `1/true/on` to snapshot after each write (default off).
 - `BLACKBOX_ANN_CLUSTERS` – default coarse vector clusters (default 8).
 - `BLACKBOX_ANN_PROBES` – number of ANN centroids to probe per query (default 2).
 - `BLACKBOX_ANN_M` – HNSW max neighbors per node (default 16).
 - `BLACKBOX_ANN_EF_SEARCH` – HNSW search breadth (default 64).
+- `BLACKBOX_SNAPSHOT_CACHE` / `BLACKBOX_SNAPSHOT_CACHE_MB` – snapshot cache entry/MB caps.
+- `BLACKBOX_DOC_CACHE` / `BLACKBOX_DOC_CACHE_MB` – document cache entry/MB caps.
 - `BLACKBOX_WAL_FLUSH_BYTES` / `BLACKBOX_WAL_FLUSH_MS` – thresholds for WAL flush (defaults 64KB / 200ms).
 - `BLACKBOX_WAL_FSYNC` – `1/true/on` to fsync WAL on flush (default on).
 - `BLACKBOX_MAX_BODY_KB` – max HTTP request body size (default 1024 KB).
+- `BLACKBOX_INDEX_QPS_DEFAULT` – per-index QPS limit (overrides global), can be overridden per index via config file/env (not yet persisted).
+- `BLACKBOX_INDEX_MAX_BODY_KB` – per-index body limit in KB (default none, falls back to global `BLACKBOX_MAX_BODY_KB`).
 - `BLACKBOX_SERVER_THREADS` – override request thread pool size.
 
 ## Custom Aggregation APIs

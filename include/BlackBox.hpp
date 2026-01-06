@@ -15,6 +15,9 @@
 #include <unordered_set>
 #include <atomic>
 #include <list>
+#include <deque>
+#include <unordered_set>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <nlohmann/json.hpp>
@@ -174,6 +177,8 @@ public:
         uint64_t replayErrors = 0;
         uint64_t annRecallSamples = 0;
         uint64_t annRecallHits = 0;
+        uint64_t termCacheHits = 0;
+        uint64_t termCacheMisses = 0;
     };
 
     std::vector<IndexStats> stats() const;
@@ -277,6 +282,81 @@ private:
             it->second.it = order_.begin();
         }
     };
+    class TermCache {
+    public:
+        TermCache(size_t cap = 1024, uint64_t maxBytes = 0) : capacityEntries_(cap), maxBytes_(maxBytes) {}
+        bool get(const std::string& key, const std::vector<algo::Posting>*& out) const {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = map_.find(key);
+            if (it == map_.end()) {
+                misses_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            hits_.fetch_add(1, std::memory_order_relaxed);
+            touch(it);
+            out = it->second.ptr;
+            return true;
+        }
+        void put(const std::string& key, const std::vector<algo::Posting>* ptr) const {
+            if (capacityEntries_ == 0 || ptr == nullptr) return;
+            std::lock_guard<std::mutex> lk(mtx_);
+            size_t sz = ptr->size() * sizeof(algo::Posting);
+            auto it = map_.find(key);
+            if (it != map_.end()) {
+                totalBytes_ = totalBytes_ - it->second.bytes + sz;
+                it->second.bytes = sz;
+                it->second.ptr = ptr;
+                touch(it);
+                evictIfNeeded(0);
+                return;
+            }
+            evictIfNeeded(sz);
+            order_.push_front(key);
+            map_[key] = {ptr, sz, order_.begin()};
+            totalBytes_ += sz;
+        }
+        void setCapacity(size_t cap) const { capacityEntries_ = cap; evictIfNeeded(0); }
+        void setMaxBytes(uint64_t bytes) const { maxBytes_ = bytes; evictIfNeeded(0); }
+        uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
+        uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
+        uint64_t totalBytes() const { return totalBytes_; }
+        void clear() const {
+            std::lock_guard<std::mutex> lk(mtx_);
+            order_.clear();
+            map_.clear();
+            totalBytes_ = 0;
+        }
+    private:
+        struct Entry {
+            const std::vector<algo::Posting>* ptr;
+            size_t bytes;
+            std::list<std::string>::iterator it;
+        };
+        mutable size_t capacityEntries_;
+        mutable uint64_t maxBytes_;
+        mutable uint64_t totalBytes_ = 0;
+        mutable std::list<std::string> order_;
+        mutable std::unordered_map<std::string, Entry> map_;
+        mutable std::atomic<uint64_t> hits_{0};
+        mutable std::atomic<uint64_t> misses_{0};
+        mutable std::mutex mtx_;
+        void evictIfNeeded(size_t incoming) const {
+            while ((!order_.empty()) && (order_.size() >= capacityEntries_ || (maxBytes_ > 0 && totalBytes_ + incoming > maxBytes_))) {
+                auto evict = order_.back();
+                auto it = map_.find(evict);
+                if (it != map_.end()) {
+                    if (totalBytes_ >= it->second.bytes) totalBytes_ -= it->second.bytes;
+                }
+                order_.pop_back();
+                map_.erase(evict);
+            }
+        }
+        void touch(std::unordered_map<std::string, Entry>::iterator it) const {
+            order_.erase(it->second.it);
+            order_.push_front(it->first);
+            it->second.it = order_.begin();
+        }
+    };
 
     // Per-index state
     struct SegmentMetadata {
@@ -329,6 +409,8 @@ private:
         uint64_t replayErrors = 0;
         uint64_t annRecallSamples = 0;
         uint64_t annRecallHits = 0;
+        uint64_t termCacheHits = 0;
+        uint64_t termCacheMisses = 0;
     };
 
     std::string dataDir_;
@@ -348,6 +430,8 @@ private:
     uint64_t snapshotCacheMaxBytes_ = 0; // 0 = unlimited
     size_t docCacheCapacity_ = 256;
     uint64_t docCacheMaxBytes_ = 0;
+    size_t termCacheCapacity_ = 1024;
+    uint64_t termCacheMaxBytes_ = 0;
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;
@@ -367,6 +451,10 @@ private:
     mutable std::atomic<uint64_t> annRecallSamples_{0};
     mutable std::atomic<uint64_t> annRecallHits_{0};
     mutable DocumentCache docCache_;
+    mutable TermCache termCache_;
+    std::deque<std::string> mergeQueue_;
+    std::unordered_set<std::string> mergePending_;
+    std::mutex mergeMtx_;
 
     void refreshAverages(IndexState& idx);
 
@@ -401,6 +489,9 @@ private:
     bool applyDelete(IndexState& idx, DocId id, bool logWal);
     void flushIfNeeded(const std::string& index, IndexState& idx);
     void maybeMergeSegments(const std::string& index, IndexState& idx);
+    void enqueueMerge(const std::string& index);
+    void processMergeQueue();
+    bool performMerge(const std::string& index, IndexState& idx);
     bool writeManifest() const;
     void replayWal(IndexState& idx, uint64_t startOffset = 0);
     void loadWalOnly();

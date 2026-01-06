@@ -1360,6 +1360,12 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envDocCacheMb = std::getenv("BLACKBOX_DOC_CACHE_MB")) {
         try { docCacheMaxBytes_ = std::stoull(envDocCacheMb) * 1024ull * 1024ull; } catch (...) {}
     }
+    if (const char* envTermCache = std::getenv("BLACKBOX_TERM_CACHE")) {
+        try { termCacheCapacity_ = static_cast<size_t>(std::stoull(envTermCache)); } catch (...) {}
+    }
+    if (const char* envTermCacheMb = std::getenv("BLACKBOX_TERM_CACHE_MB")) {
+        try { termCacheMaxBytes_ = std::stoull(envTermCacheMb) * 1024ull * 1024ull; } catch (...) {}
+    }
     if (const char* envShard = std::getenv("BLACKBOX_SHARD_ID")) {
         shardId_ = envShard;
     }
@@ -1376,6 +1382,8 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     gSnapshotCache.setMaxBytes(snapshotCacheMaxBytes_);
     docCache_.setCapacity(docCacheCapacity_);
     docCache_.setMaxBytes(docCacheMaxBytes_);
+    termCache_.setCapacity(termCacheCapacity_);
+    termCache_.setMaxBytes(termCacheMaxBytes_);
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -1642,6 +1650,18 @@ std::vector<BlackBox::SearchHit> BlackBox::search(const std::string& index, cons
     const IndexState& idx = it->second;
     std::lock_guard<std::mutex> lkIdx(*idx.mtx);
     auto terms = tokenize(query);
+    for (const auto& t : terms) {
+        const std::vector<algo::Posting>* ptr = nullptr;
+        if (termCache_.get(idx.name + ":" + t, ptr)) {
+            const_cast<IndexState&>(idx).termCacheHits++;
+        } else {
+            const_cast<IndexState&>(idx).termCacheMisses++;
+            auto itp = idx.invertedIndex.find(t);
+            if (itp != idx.invertedIndex.end()) {
+                termCache_.put(idx.name + ":" + t, &itp->second);
+            }
+        }
+    }
     if (terms.empty()) return {};
     algo::SearchContext ctx{idx.documents, idx.invertedIndex, idx.docLengths, idx.avgDocLen, &idx.skipPointers};
     std::vector<SearchHit> hits;
@@ -1933,6 +1953,8 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
         s.replayErrors = st.replayErrors;
         s.annRecallSamples = st.annRecallSamples;
         s.annRecallHits = st.annRecallHits;
+        s.termCacheHits = st.termCacheHits;
+        s.termCacheMisses = st.termCacheMisses;
         out.push_back(std::move(s));
     }
     return out;
@@ -1951,6 +1973,10 @@ nlohmann::json BlackBox::config() const {
         {"merge_mbps", mergeMBps_},
         {"snapshot_cache", snapshotCacheCapacity_},
         {"snapshot_cache_mb", snapshotCacheMaxBytes_ / (1024.0 * 1024.0)},
+        {"term_cache", termCacheCapacity_},
+        {"term_cache_mb", termCacheMaxBytes_ / (1024.0 * 1024.0)},
+        {"term_cache_hits", termCache_.hits()},
+        {"term_cache_misses", termCache_.misses()},
         {"compress_snapshots", compressSnapshots_},
         {"auto_snapshot", autoSnapshot_},
         {"default_ann_clusters", defaultAnnClusters_},
@@ -2833,17 +2859,28 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
 void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     if (mergeSegmentsAt_ == 0) return;
     if (idx.segments.size() < mergeSegmentsAt_) return;
+    enqueueMerge(index);
+}
+
+void BlackBox::enqueueMerge(const std::string& index) {
+    std::lock_guard<std::mutex> lk(mergeMtx_);
+    if (mergePending_.count(index)) return;
+    mergePending_.insert(index);
+    mergeQueue_.push_back(index);
+}
+
+bool BlackBox::performMerge(const std::string& index, IndexState& idx) {
+    if (mergeSegmentsAt_ == 0) return false;
+    if (idx.segments.size() < mergeSegmentsAt_) return false;
     namespace fs = std::filesystem;
     uint64_t mergeBudgetBytes = mergeMaxMB_ > 0 ? mergeMaxMB_ * 1024ull * 1024ull : 0;
     uint64_t inputBytes = 0;
     bool sizeKnown = true;
-    if (mergeBudgetBytes > 0) {
-        for (const auto& seg : idx.segments) {
-            std::error_code ec;
-            auto sz = fs::file_size(fs::path(dataDir_) / seg.file, ec);
-            if (ec) { sizeKnown = false; break; }
-            inputBytes += sz;
-        }
+    for (const auto& seg : idx.segments) {
+        std::error_code ec;
+        auto sz = fs::file_size(fs::path(dataDir_) / seg.file, ec);
+        if (ec) { sizeKnown = false; break; }
+        inputBytes += sz;
     }
     SnapshotChunk chunk;
     chunk.vectorDim = idx.schema.vectorDim;
@@ -2876,7 +2913,7 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     fs::path segFile = fs::path(dataDir_) / (index + "_merge" + std::to_string(idx.segments.size()) + ".skd");
     if (!writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
         std::cerr << "BlackBox: mergeSegments failed to write " << segFile << "\n";
-        return;
+        return false;
     }
     gSnapshotCache.put(segFile.string(), chunk, idx.nextId, avg);
     auto oldSegments = idx.segments;
@@ -2908,13 +2945,12 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         idx.manifestDirty = true;
         manifestDirty_.store(true, std::memory_order_relaxed);
         idx.opsSinceFlush = flushEveryDocs_;
-        return;
+        return false;
     }
     idx.wal.reset();
     idx.wal.open();
     idx.lastFlushedWalOffset = idx.wal.offset;
     idx.lastFlushAt = std::chrono::steady_clock::now();
-    // delete old segment files
     for (const auto& seg : oldSegments) {
         fs::path p = fs::path(dataDir_) / seg.file;
         std::error_code ec;
@@ -2924,8 +2960,8 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     uint64_t sleepMs = 0;
     if (mergeThrottleMs_ > 0) {
         sleepMs += mergeThrottleMs_;
-        if (mergeBudgetBytes > 0 && sizeKnown && inputBytes > mergeBudgetBytes) {
-            uint64_t overMb = (inputBytes - mergeBudgetBytes + 1024ull * 1024ull - 1) / (1024ull * 1024ull);
+        if (mergeMaxMB_ > 0 && sizeKnown && inputBytes > mergeMaxMB_ * 1024ull * 1024ull) {
+            uint64_t overMb = (inputBytes - mergeMaxMB_ * 1024ull * 1024ull + 1024ull * 1024ull - 1) / (1024ull * 1024ull);
             sleepMs += overMb * mergeThrottleMs_;
         } else {
             sleepMs += sizeMb * mergeThrottleMs_;
@@ -2938,6 +2974,7 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     if (sleepMs > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
     }
+    return true;
 }
 
 bool BlackBox::writeManifest() const {
@@ -3830,12 +3867,13 @@ void BlackBox::startMaintenance() {
             manifestDirty_.store(false, std::memory_order_relaxed);
             for (auto& kv : indexes_) kv.second.manifestDirty = false;
         }
-            {
-                std::shared_lock<std::shared_mutex> lk(mutex_);
-                for (auto& kv : indexes_) {
-                    kv.second.wal.maybeFlush(false);
-                }
+        {
+            std::shared_lock<std::shared_mutex> lk(mutex_);
+            for (auto& kv : indexes_) {
+                kv.second.wal.maybeFlush(false);
             }
+        }
+            processMergeQueue();
         }
     });
 }
@@ -3843,6 +3881,22 @@ void BlackBox::startMaintenance() {
 void BlackBox::stopMaintenance() {
     stopMaintenance_.store(true);
     if (maintenanceThread_.joinable()) maintenanceThread_.join();
+}
+
+void BlackBox::processMergeQueue() {
+    std::string job;
+    {
+        std::lock_guard<std::mutex> lk(mergeMtx_);
+        if (mergeQueue_.empty()) return;
+        job = mergeQueue_.front();
+        mergeQueue_.pop_front();
+        mergePending_.erase(job);
+    }
+    std::unique_lock<std::shared_mutex> lk(mutex_);
+    auto it = indexes_.find(job);
+    if (it == indexes_.end()) return;
+    std::lock_guard<std::mutex> lkIdx(*it->second.mtx);
+    performMerge(job, it->second);
 }
 
 bool BlackBox::validateCustomApi(const std::string& name, const json& spec) const {

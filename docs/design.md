@@ -11,7 +11,8 @@
   - Search: `GET /v1/{index}/search` with hybrid/vector/fuzzy + filters (404 on missing index).
   - Custom aggregations: CRUD + execute under `/v1/custom`.
 - Pagination guardrails: clamp `from`/`size` to sane limits; default `size=10`.
-- Observability: add request IDs and per-endpoint counters/latency histograms (still to be built out).
+- Observability: request IDs on core routes; Prometheus `/metrics` exports uptime, docs/segments/vectors/WAL bytes, pending ops, cache stats (snapshot/doc), replay errors, ANN recall counters; per-index metrics included.
+- Merge queue: flush triggers enqueue merges; maintenance thread processes merge jobs with size-aware throttling and optional MBps cap instead of blocking inline.
 
 ## Storage Direction
 
@@ -21,7 +22,7 @@
 - Segment files (`*.skd`) contain docs, postings, doc-values, vectors, images, ANN metadata (centroids + HNSW graph with M/ef_search), and tombstones; sections are checksummed and optionally compressed.
 - Schema sidecars (`<index>.schema.json`) are persisted so WAL-only recovery retains field settings (doc_id/relation/vector/image).
 - Tombstones recorded in WAL and segment tombstone lists; applied at query time and cleared during merge.
-- Background merge compacts multiple segments into one to keep posting lists short and reclaim deletes.
+- Background merge compacts multiple segments into one to keep posting lists short and reclaim deletes; merge backpressure uses size-aware sleep with optional throughput cap (`BLACKBOX_MERGE_MBPS`) and budget/throttle settings.
 - Crash safety: WAL supports fsync-on-flush, manifest/segments are fsynced on write; WAL truncates on checksum failure.
 
 ## Indexing Semantics
@@ -31,13 +32,17 @@
 - Postings: term → sorted doc IDs; AND queries intersect; OR/phrase planned.
 - Schemas can declare `doc_id` (e.g., `{"field":"sku","type":"string","enforce_unique":true}`) to expose a stable document identifier. Operations accept auto IDs or custom IDs.
 - Optional `relation` config (`{"field":"parent","target_index":"orders","allow_cross_index":false}`) lets documents reference other docs; search can inline or hierarchy-group relations with depth limits.
-- Optional non-searchable fields (`searchable:false`) are stored but excluded from indexes; a stored-field scan endpoint exists for maintenance/migrations. A `query_values` field type stores arrays of `{query, score}` pairs (score 0..1) without affecting search.
+- Optional non-searchable fields (`searchable:false`) are stored but excluded from indexes; a stored-field scan endpoint exists for maintenance/migrations. A `query_values` field type stores arrays of `{query, score}` pairs (score 0..1) that can be stored-only or boost search when `searchable:true`.
 - `image` field type stores raw binary payloads (PNG/ICO/etc.) with `max_kb` enforcement; WAL/snapshot encode images separately to avoid base64 bloat.
 - Custom aggregation APIs compose multi-index views (e.g., page→site→favicon) with declarative projections and relation trees while reusing search/filter knobs.
+- Caching: snapshot chunk cache and document cache use LRU with entry/MB caps; hit/miss/bytes surfaced via config and Prometheus.
+- Rate/body guards: global and per-index QPS/body limits on search and writes return 429s when exceeded.
+- Shipping: `/v1/ship` exports shipping plan; `/v1/ship/apply` and `/v1/ship/fetch_apply` validate manifest/segment formats then load snapshots (basis for future WAL shipping).
 
-## Near-Term Implementation Steps
+## Remaining Work
 
-- Extend queries: OR/phrase search, safer fuzzy expansion, stronger ANN (e.g., HNSW), richer doc-value filters.
-- Ops hardening: request IDs, structured logs, per-endpoint metrics, rate/body-size guards.
-- Resource controls: add time/size-based flush triggers, backpressure on bulk ingest, and eviction/caching for segment reads.
-- Tooling: durability/chaos tests around WAL flush + manifest rewrite; benchmark pipelines.
+- Segment reader cache for postings/doc-values with memory budget and hit metrics.
+- Merge IO scheduler/backpressure beyond sleep-based throttling.
+- Broader structured logging and per-index quotas on all routes.
+- WAL/shipping streaming for replicas; shard/replica coordination metadata.
+- Additional chaos/benchmark coverage for shipping and recovery paths.
