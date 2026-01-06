@@ -171,6 +171,9 @@ public:
         bool walUpgraded = false;
         std::string schemaId;
         uint32_t schemaVersion = 0;
+        uint64_t replayErrors = 0;
+        uint64_t annRecallSamples = 0;
+        uint64_t annRecallHits = 0;
     };
 
     std::vector<IndexStats> stats() const;
@@ -323,6 +326,9 @@ private:
         uint32_t annProbes = 2;
         uint64_t lastFlushedWalOffset = 0;
         std::chrono::steady_clock::time_point lastFlushAt = std::chrono::steady_clock::now();
+        uint64_t replayErrors = 0;
+        uint64_t annRecallSamples = 0;
+        uint64_t annRecallHits = 0;
     };
 
     std::string dataDir_;
@@ -337,6 +343,7 @@ private:
     size_t mergeSegmentsAt_ = 10;
     uint64_t mergeThrottleMs_ = 0;
     uint64_t mergeMaxMB_ = 0;
+    double mergeMBps_ = 0.0;
     size_t snapshotCacheCapacity_ = 8;
     uint64_t snapshotCacheMaxBytes_ = 0; // 0 = unlimited
     size_t docCacheCapacity_ = 256;

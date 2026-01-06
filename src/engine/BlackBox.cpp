@@ -1323,6 +1323,9 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envMergeBudget = std::getenv("BLACKBOX_MERGE_MAX_MB")) {
         try { mergeMaxMB_ = std::stoull(envMergeBudget); } catch (...) {}
     }
+    if (const char* envMergeMbps = std::getenv("BLACKBOX_MERGE_MBPS")) {
+        try { mergeMBps_ = std::stod(envMergeMbps); } catch (...) {}
+    }
     if (const char* envWalBytes = std::getenv("BLACKBOX_WAL_FLUSH_BYTES")) {
         try { walFlushBytes_ = std::max<uint64_t>(4096, std::stoull(envWalBytes)); } catch (...) {}
     }
@@ -1757,12 +1760,27 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
     auto computeRecall = [&](const std::vector<SearchHit>& approx) {
         const size_t maxExact = 2000;
         if (approx.empty()) return;
-        if (idx.vectors.size() > maxExact) return;
+        bool sampled = false;
         std::vector<SearchHit> exact;
-        exact.reserve(idx.vectors.size());
-        for (const auto& kv : idx.vectors) {
-            double score = dot(queryVec, kv.second) / (qn * norm(kv.second) + 1e-9);
-            exact.push_back({kv.first, score});
+        exact.reserve(std::min(idx.vectors.size(), maxExact));
+        if (idx.vectors.size() > maxExact) {
+            sampled = true;
+            size_t sampleCount = maxExact;
+            size_t stride = std::max<size_t>(1, idx.vectors.size() / sampleCount);
+            size_t idxPos = 0;
+            for (const auto& kv : idx.vectors) {
+                if (idxPos % stride == 0 && exact.size() < sampleCount) {
+                    double score = dot(queryVec, kv.second) / (qn * norm(kv.second) + 1e-9);
+                    exact.push_back({kv.first, score});
+                }
+                ++idxPos;
+                if (exact.size() >= sampleCount) break;
+            }
+        } else {
+            for (const auto& kv : idx.vectors) {
+                double score = dot(queryVec, kv.second) / (qn * norm(kv.second) + 1e-9);
+                exact.push_back({kv.first, score});
+            }
         }
         std::sort(exact.begin(), exact.end(), [](const SearchHit& a, const SearchHit& b){
             if (a.score == b.score) return a.id < b.id;
@@ -1777,6 +1795,8 @@ std::vector<BlackBox::SearchHit> BlackBox::searchVector(const std::string& index
         }
         annRecallSamples_.fetch_add(1, std::memory_order_relaxed);
         annRecallHits_.fetch_add(overlap, std::memory_order_relaxed);
+        idx.annRecallSamples += 1;
+        idx.annRecallHits += overlap;
     };
 
     // Prefer HNSW graph when available
@@ -1910,6 +1930,9 @@ std::vector<BlackBox::IndexStats> BlackBox::stats() const {
         s.walUpgraded = st.wal.upgradedFromLegacy;
         s.schemaId = st.schema.schemaId;
         s.schemaVersion = st.schema.schemaVersion;
+        s.replayErrors = st.replayErrors;
+        s.annRecallSamples = st.annRecallSamples;
+        s.annRecallHits = st.annRecallHits;
         out.push_back(std::move(s));
     }
     return out;
@@ -1925,6 +1948,7 @@ nlohmann::json BlackBox::config() const {
         {"merge_segments_at", mergeSegmentsAt_},
         {"merge_throttle_ms", mergeThrottleMs_},
         {"merge_max_mb", mergeMaxMB_},
+        {"merge_mbps", mergeMBps_},
         {"snapshot_cache", snapshotCacheCapacity_},
         {"snapshot_cache_mb", snapshotCacheMaxBytes_ / (1024.0 * 1024.0)},
         {"compress_snapshots", compressSnapshots_},
@@ -2896,15 +2920,22 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         std::error_code ec;
         fs::remove(p, ec);
     }
+    uint64_t sizeMb = inputBytes == 0 ? 1 : (inputBytes + 1024ull * 1024ull - 1) / (1024ull * 1024ull);
+    uint64_t sleepMs = 0;
     if (mergeThrottleMs_ > 0) {
-        uint64_t sizeMb = inputBytes == 0 ? 1 : (inputBytes + 1024ull * 1024ull - 1) / (1024ull * 1024ull);
-        uint64_t sleepMs = mergeThrottleMs_;
+        sleepMs += mergeThrottleMs_;
         if (mergeBudgetBytes > 0 && sizeKnown && inputBytes > mergeBudgetBytes) {
             uint64_t overMb = (inputBytes - mergeBudgetBytes + 1024ull * 1024ull - 1) / (1024ull * 1024ull);
             sleepMs += overMb * mergeThrottleMs_;
         } else {
             sleepMs += sizeMb * mergeThrottleMs_;
         }
+    }
+    if (mergeMBps_ > 0.0 && sizeKnown && inputBytes > 0) {
+        double seconds = static_cast<double>(inputBytes) / (mergeMBps_ * 1024.0 * 1024.0);
+        sleepMs = std::max<uint64_t>(sleepMs, static_cast<uint64_t>(seconds * 1000.0));
+    }
+    if (sleepMs > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
     }
 }
@@ -2991,12 +3022,14 @@ void BlackBox::replayWal(IndexState& idx, uint64_t startOffset) {
                 applyUpsert(idx, rec.docId, processed, false);
             } catch (...) {
                 replayErrors_.fetch_add(1, std::memory_order_relaxed);
+                idx.replayErrors += 1;
             }
         } else if (rec.op == WalOp::Delete) {
             try {
                 applyDelete(idx, rec.docId, false);
             } catch (...) {
                 replayErrors_.fetch_add(1, std::memory_order_relaxed);
+                idx.replayErrors += 1;
             }
         }
     }

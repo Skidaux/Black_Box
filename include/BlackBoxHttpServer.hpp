@@ -39,4 +39,6 @@ private:
     int rateLimitQps_ = 0;
     std::mutex rateMutex_;
     std::unordered_map<std::string, std::pair<int64_t, int>> rateWindow_;
+    std::unordered_map<std::string, int> indexQps_;
+    std::unordered_map<std::string, size_t> indexMaxBodyKB_;
 };

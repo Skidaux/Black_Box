@@ -32,6 +32,12 @@ BlackBoxHttpServer::BlackBoxHttpServer(std::string host, int port, std::string d
     if (const char* env = std::getenv("BLACKBOX_RATE_LIMIT_QPS")) {
         try { rateLimitQps_ = std::max(0, std::stoi(env)); } catch (...) {}
     }
+    if (const char* env = std::getenv("BLACKBOX_INDEX_QPS_DEFAULT")) {
+        try { int v = std::stoi(env); if (v > 0) indexQps_["__default__"] = v; } catch (...) {}
+    }
+    if (const char* env = std::getenv("BLACKBOX_INDEX_MAX_BODY_KB")) {
+        try { size_t v = static_cast<size_t>(std::stoull(env)); if (v > 0) indexMaxBodyKB_["__default__"] = v; } catch (...) {}
+    }
     setupRoutes();
 }
 
@@ -131,6 +137,32 @@ void BlackBoxHttpServer::setupRoutes() {
         window = {windowStart, count + 1};
         return false;
     };
+    auto indexLimit = [&](const std::string& index, const httplib::Request& req, httplib::Response& res) -> bool {
+        int qps = 0;
+        auto it = indexQps_.find(index);
+        if (it != indexQps_.end()) qps = it->second;
+        else if (indexQps_.count("__default__")) qps = indexQps_["__default__"];
+        if (qps <= 0) return false;
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::lock_guard<std::mutex> lk(rateMutex_);
+        auto& window = rateWindow_[index];
+        int64_t windowStart = window.first;
+        int count = window.second;
+        if (nowMs - windowStart >= 1000) {
+            windowStart = nowMs;
+            count = 0;
+        }
+        if (count >= qps) {
+            metrics_.rateLimited.fetch_add(1, std::memory_order_relaxed);
+            res.status = 429;
+            res.set_content(err(429, "Index rate limit exceeded").dump(), "application/json");
+            addCors(res);
+            return true;
+        }
+        window = {windowStart, count + 1};
+        return false;
+    };
 
     // Handle preflight OPTIONS requests for ANY route
     server_.Options(R"(.*)", [addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
@@ -204,6 +236,12 @@ void BlackBoxHttpServer::setupRoutes() {
             oss << "blackbox_wal_bytes_total{index=\"" << s.name << "\"} " << s.walBytes << "\n";
             oss << "# TYPE blackbox_pending_ops gauge\n";
             oss << "blackbox_pending_ops{index=\"" << s.name << "\"} " << s.pendingOps << "\n";
+            oss << "# TYPE blackbox_replay_errors_index_total counter\n";
+            oss << "blackbox_replay_errors_index_total{index=\"" << s.name << "\"} " << s.replayErrors << "\n";
+            oss << "# TYPE blackbox_ann_recall_samples_index counter\n";
+            oss << "blackbox_ann_recall_samples_index{index=\"" << s.name << "\"} " << s.annRecallSamples << "\n";
+            oss << "# TYPE blackbox_ann_recall_hits_index counter\n";
+            oss << "blackbox_ann_recall_hits_index{index=\"" << s.name << "\"} " << s.annRecallHits << "\n";
         }
         metrics_.schemaMismatches.store(schemaMismatch, std::memory_order_relaxed);
         oss << "blackbox_schema_mismatch_total " << schemaMismatch << "\n";
@@ -373,6 +411,51 @@ void BlackBoxHttpServer::setupRoutes() {
         res.set_content(ok(plan).dump(), "application/json");
         addCors(res);
         logReq(rid, "ok path=/v1/ship/apply");
+    });
+
+    server_.Post("/v1/ship/fetch_apply", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/ship/fetch_apply");
+            return;
+        }
+        auto base = req.get_param_value("base");
+        if (base.empty()) {
+            res.status = 400;
+            res.set_content(err(400, "Missing base").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "bad_request path=/v1/ship/fetch_apply base");
+            return;
+        }
+        std::filesystem::path manifest = std::filesystem::path(base) / "index.manifest";
+        if (!std::filesystem::exists(manifest)) {
+            res.status = 400;
+            res.set_content(err(400, "Manifest not found at base").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "bad_request path=/v1/ship/fetch_apply missing manifest");
+            return;
+        }
+        auto loadRes = req.has_param("apply") ? true : true;
+        try {
+            loadRes = db_.loadSnapshot(manifest.string());
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(err(500, e.what()).dump(), "application/json");
+            addCors(res);
+            logReq(rid, std::string("error path=/v1/ship/fetch_apply err=") + e.what());
+            return;
+        }
+        if (!loadRes) {
+            res.status = 500;
+            res.set_content(err(500, "Failed to apply shipped snapshot").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "error path=/v1/ship/fetch_apply apply_fail");
+            return;
+        }
+        auto plan = db_.shippingPlan();
+        res.set_content(ok(plan).dump(), "application/json");
+        addCors(res);
+        logReq(rid, "ok path=/v1/ship/fetch_apply");
     });
 
     // --- STORED FIELD MATCH (non-searchable fields) ---
@@ -666,17 +749,30 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- INDEX DOCUMENT ---
-    server_.Post(R"(/v1/([^/]+)/doc)", [this, ok, err, isJsonContent, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+    server_.Post(R"(/v1/([^/]+)/doc)", [this, ok, err, isJsonContent, addCors, attachRequestId, rateLimit, logReq, indexLimit](const httplib::Request& req, httplib::Response& res) {
         auto rid = attachRequestId(req, res);
         if (rateLimit(req, res)) {
             logReq(rid, "rate_limited path=/doc");
             return;
         }
         std::string index = req.matches[1];
+        size_t maxKb = indexMaxBodyKB_.count(index) ? indexMaxBodyKB_[index] : (indexMaxBodyKB_.count("__default__") ? indexMaxBodyKB_["__default__"] : 0);
+        if (maxKb > 0 && req.body.size() > maxKb * 1024) {
+            res.status = 429;
+            res.set_content(err(429, "Index body size exceeded").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "rate_limited path=/doc body");
+            return;
+        }
+        if (indexLimit(index, req, res)) {
+            logReq(rid, "rate_limited path=/doc index");
+            return;
+        }
         if (!isJsonContent(req)) {
             res.status = 415;
             res.set_content(err(415, "Content-Type must be application/json").dump(), "application/json");
             addCors(res);
+            logReq(rid, "bad_request path=/doc content_type");
             return;
         }
         try {
@@ -856,13 +952,17 @@ void BlackBoxHttpServer::setupRoutes() {
     });
 
     // --- SEARCH ---
-    server_.Get(R"(/v1/([^/]+)/search)", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+    server_.Get(R"(/v1/([^/]+)/search)", [this, ok, err, addCors, attachRequestId, rateLimit, logReq, indexLimit](const httplib::Request& req, httplib::Response& res) {
         auto rid = attachRequestId(req, res);
         if (rateLimit(req, res)) {
             logReq(rid, "rate_limited path=/search");
             return;
         }
         std::string index = req.matches[1];
+        if (indexLimit(index, req, res)) {
+            logReq(rid, "rate_limited path=/search index");
+            return;
+        }
         if (!db_.indexExists(index)) {
             res.status = 404;
             res.set_content(err(404, "Index not found").dump(), "application/json");
