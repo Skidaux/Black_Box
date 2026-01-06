@@ -104,11 +104,15 @@ static void flushAndSync(std::ofstream& stream) {
 // Simple LRU cache for snapshot chunks to reduce disk IO when loading/reloading segments.
 class SnapshotCache {
 public:
-    explicit SnapshotCache(size_t cap = 8) : capacity_(cap) {}
+    explicit SnapshotCache(size_t cap = 8) : capacityEntries_(cap) {}
 
     bool get(const std::string& path, SnapshotChunk& chunk, uint32_t& nextId, double& avgDocLen) {
         auto it = map_.find(path);
-        if (it == map_.end()) return false;
+        if (it == map_.end()) {
+            misses_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        hits_.fetch_add(1, std::memory_order_relaxed);
         touch(it);
         chunk = it->second.data;
         nextId = it->second.nextId;
@@ -117,25 +121,30 @@ public:
     }
 
     void put(const std::string& path, const SnapshotChunk& chunk, uint32_t nextId, double avgDocLen) {
-        if (capacity_ == 0) return;
+        if (capacityEntries_ == 0) return;
+        const size_t sz = estimateSize(chunk);
         auto it = map_.find(path);
         if (it != map_.end()) {
             it->second.data = chunk;
             it->second.nextId = nextId;
             it->second.avgDocLen = avgDocLen;
+            totalBytes_ = totalBytes_ - it->second.approxBytes + sz;
+            it->second.approxBytes = sz;
             touch(it);
             return;
         }
-        if (order_.size() >= capacity_) {
-            auto evict = order_.back();
-            order_.pop_back();
-            map_.erase(evict);
-        }
+        evictIfNeeded(sz);
         order_.push_front(path);
-        map_[path] = {chunk, nextId, avgDocLen, order_.begin()};
+        map_[path] = {chunk, nextId, avgDocLen, order_.begin(), sz};
+        totalBytes_ += sz;
     }
 
-    void setCapacity(size_t cap) { capacity_ = cap; }
+    void setCapacity(size_t cap) { capacityEntries_ = cap; evictIfNeeded(0); }
+    void setMaxBytes(uint64_t bytes) { maxBytes_ = bytes; evictIfNeeded(0); }
+
+    uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
+    uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
+    uint64_t totalBytes() const { return totalBytes_; }
 
 private:
     struct Entry {
@@ -143,10 +152,58 @@ private:
         uint32_t nextId = 0;
         double avgDocLen = 0.0;
         std::list<std::string>::iterator it;
+        size_t approxBytes = 0;
     };
-    size_t capacity_;
+    size_t capacityEntries_;
+    uint64_t maxBytes_ = 0;
+    uint64_t totalBytes_ = 0;
     std::list<std::string> order_;
     std::unordered_map<std::string, Entry> map_;
+    std::atomic<uint64_t> hits_{0};
+    std::atomic<uint64_t> misses_{0};
+
+    void evictIfNeeded(size_t incoming) {
+        while ((!order_.empty()) && (order_.size() >= capacityEntries_ || (maxBytes_ > 0 && totalBytes_ + incoming > maxBytes_))) {
+            auto evict = order_.back();
+            auto it = map_.find(evict);
+            if (it != map_.end()) {
+                if (totalBytes_ >= it->second.approxBytes) totalBytes_ -= it->second.approxBytes;
+            }
+            order_.pop_back();
+            map_.erase(evict);
+        }
+    }
+
+    static size_t estimateSize(const SnapshotChunk& chunk) {
+        size_t sz = sizeof(chunk);
+        for (const auto& kv : chunk.docs) {
+            sz += sizeof(kv.first);
+            sz += kv.second.dump().size();
+        }
+        sz += chunk.docLens.size() * (sizeof(uint32_t) + sizeof(uint32_t));
+        for (const auto& kv : chunk.index) {
+            sz += kv.first.size();
+            sz += kv.second.size() * sizeof(minielastic::algo::Posting);
+        }
+        for (const auto& kv : chunk.vectors) {
+            sz += sizeof(kv.first);
+            sz += kv.second.size() * sizeof(float);
+        }
+        sz += chunk.docValues.dump().size();
+        for (const auto& c : chunk.annCentroids) sz += c.size() * sizeof(float);
+        for (const auto& b : chunk.annBuckets) sz += b.size() * sizeof(uint32_t);
+        for (const auto& g : chunk.annGraph) sz += g.second.size() * sizeof(uint32_t);
+        sz += chunk.tombstones.size() * sizeof(uint32_t);
+        for (const auto& field : chunk.images) {
+            sz += field.first.size();
+            for (const auto& img : field.second) {
+                sz += sizeof(img.first);
+                sz += img.second.format.size();
+                sz += img.second.data.size();
+            }
+        }
+        return sz;
+    }
 
     void touch(std::unordered_map<std::string, Entry>::iterator it) {
         order_.erase(it->second.it);
@@ -1291,6 +1348,9 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envSnapCache = std::getenv("BLACKBOX_SNAPSHOT_CACHE")) {
         try { snapshotCacheCapacity_ = static_cast<size_t>(std::stoull(envSnapCache)); } catch (...) {}
     }
+    if (const char* envSnapCacheMb = std::getenv("BLACKBOX_SNAPSHOT_CACHE_MB")) {
+        try { snapshotCacheMaxBytes_ = std::stoull(envSnapCacheMb) * 1024ull * 1024ull; } catch (...) {}
+    }
     if (const char* envShard = std::getenv("BLACKBOX_SHARD_ID")) {
         shardId_ = envShard;
     }
@@ -1304,6 +1364,7 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
         shipMethod_ = envShipMethod;
     }
     gSnapshotCache.setCapacity(snapshotCacheCapacity_);
+    gSnapshotCache.setMaxBytes(snapshotCacheMaxBytes_);
 
     if (!dataDir_.empty()) {
         namespace fs = std::filesystem;
@@ -1826,6 +1887,7 @@ nlohmann::json BlackBox::config() const {
         {"merge_throttle_ms", mergeThrottleMs_},
         {"merge_max_mb", mergeMaxMB_},
         {"snapshot_cache", snapshotCacheCapacity_},
+        {"snapshot_cache_mb", snapshotCacheMaxBytes_ / (1024.0 * 1024.0)},
         {"compress_snapshots", compressSnapshots_},
         {"auto_snapshot", autoSnapshot_},
         {"default_ann_clusters", defaultAnnClusters_},
@@ -1837,6 +1899,9 @@ nlohmann::json BlackBox::config() const {
         {"ship_endpoint", shipEndpoint_},
         {"ship_method", shipMethod_}
     };
+    j["snapshot_cache_hits"] = gSnapshotCache.hits();
+    j["snapshot_cache_misses"] = gSnapshotCache.misses();
+    j["snapshot_cache_bytes"] = gSnapshotCache.totalBytes();
     return j;
 }
 
@@ -2689,18 +2754,14 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
     if (idx.segments.size() < mergeSegmentsAt_) return;
     namespace fs = std::filesystem;
     uint64_t mergeBudgetBytes = mergeMaxMB_ > 0 ? mergeMaxMB_ * 1024ull * 1024ull : 0;
+    uint64_t inputBytes = 0;
+    bool sizeKnown = true;
     if (mergeBudgetBytes > 0) {
-        uint64_t inputBytes = 0;
-        bool sizeKnown = true;
         for (const auto& seg : idx.segments) {
             std::error_code ec;
             auto sz = fs::file_size(fs::path(dataDir_) / seg.file, ec);
             if (ec) { sizeKnown = false; break; }
             inputBytes += sz;
-        }
-        if (sizeKnown && inputBytes > mergeBudgetBytes) {
-            std::cerr << "BlackBox: skipping merge for " << index << " input_bytes=" << inputBytes << " budget=" << mergeBudgetBytes << "\n";
-            return;
         }
     }
     SnapshotChunk chunk;
@@ -2779,7 +2840,15 @@ void BlackBox::maybeMergeSegments(const std::string& index, IndexState& idx) {
         fs::remove(p, ec);
     }
     if (mergeThrottleMs_ > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(mergeThrottleMs_));
+        uint64_t sizeMb = inputBytes == 0 ? 1 : (inputBytes + 1024ull * 1024ull - 1) / (1024ull * 1024ull);
+        uint64_t sleepMs = mergeThrottleMs_;
+        if (mergeBudgetBytes > 0 && sizeKnown && inputBytes > mergeBudgetBytes) {
+            uint64_t overMb = (inputBytes - mergeBudgetBytes + 1024ull * 1024ull - 1) / (1024ull * 1024ull);
+            sleepMs += overMb * mergeThrottleMs_;
+        } else {
+            sleepMs += sizeMb * mergeThrottleMs_;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
     }
 }
 

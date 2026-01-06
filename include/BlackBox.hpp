@@ -253,6 +253,7 @@ private:
     uint64_t mergeThrottleMs_ = 0;
     uint64_t mergeMaxMB_ = 0;
     size_t snapshotCacheCapacity_ = 8;
+    uint64_t snapshotCacheMaxBytes_ = 0; // 0 = unlimited
     bool compressSnapshots_ = true;
     bool autoSnapshot_ = false;
     uint32_t defaultAnnClusters_ = 8;

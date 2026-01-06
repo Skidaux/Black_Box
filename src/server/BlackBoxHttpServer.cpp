@@ -153,6 +153,7 @@ void BlackBoxHttpServer::setupRoutes() {
         auto now = std::chrono::steady_clock::now();
         double uptime = std::chrono::duration<double>(now - startTime_).count();
         auto stats = db_.stats();
+        auto cfg = db_.config();
         uint64_t schemaMismatch = 0;
         uint64_t walUpgraded = 0;
         std::ostringstream oss;
@@ -178,6 +179,12 @@ void BlackBoxHttpServer::setupRoutes() {
         oss << "blackbox_snapshot_duration_ms_count " << metrics_.snapshotCount.load(std::memory_order_relaxed) << "\n";
         oss << "# TYPE blackbox_replay_errors_total counter\n";
         oss << "blackbox_replay_errors_total " << metrics_.replayErrors.load(std::memory_order_relaxed) << "\n";
+        oss << "# TYPE blackbox_snapshot_cache_bytes gauge\n";
+        oss << "blackbox_snapshot_cache_bytes " << cfg.value("snapshot_cache_bytes", 0) << "\n";
+        oss << "# TYPE blackbox_snapshot_cache_hits counter\n";
+        oss << "blackbox_snapshot_cache_hits " << cfg.value("snapshot_cache_hits", 0) << "\n";
+        oss << "# TYPE blackbox_snapshot_cache_misses counter\n";
+        oss << "blackbox_snapshot_cache_misses " << cfg.value("snapshot_cache_misses", 0) << "\n";
         for (const auto& s : stats) {
             if (s.walSchemaMismatch) schemaMismatch++;
             if (s.walUpgraded) walUpgraded++;
@@ -265,6 +272,44 @@ void BlackBoxHttpServer::setupRoutes() {
         }
         addCors(res);
         attachRequestId(req, res);
+    });
+
+    // --- SHIPPING APPLY (load snapshot/schemas from provided path) ---
+    server_.Post("/v1/ship/apply", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/ship/apply");
+            return;
+        }
+        auto path = req.get_param_value("path");
+        if (path.empty()) {
+            res.status = 400;
+            res.set_content(err(400, "Missing path").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "bad_request path=/v1/ship/apply missing path");
+            return;
+        }
+        bool okLoad = false;
+        try {
+            okLoad = db_.loadSnapshot(path);
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(err(500, e.what()).dump(), "application/json");
+            addCors(res);
+            logReq(rid, std::string("error path=/v1/ship/apply err=") + e.what());
+            return;
+        }
+        if (!okLoad) {
+            res.status = 500;
+            res.set_content(err(500, "Failed to load snapshot").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "error path=/v1/ship/apply load_failed");
+            return;
+        }
+        auto plan = db_.shippingPlan();
+        res.set_content(ok(plan).dump(), "application/json");
+        addCors(res);
+        logReq(rid, "ok path=/v1/ship/apply");
     });
 
     // --- STORED FIELD MATCH (non-searchable fields) ---
