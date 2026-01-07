@@ -210,8 +210,6 @@ void BlackBoxHttpServer::setupRoutes() {
         oss << "blackbox_snapshot_duration_ms_sum " << metrics_.snapshotLatencyMs.load(std::memory_order_relaxed) << "\n";
         oss << "# TYPE blackbox_snapshot_duration_ms_count counter\n";
         oss << "blackbox_snapshot_duration_ms_count " << metrics_.snapshotCount.load(std::memory_order_relaxed) << "\n";
-        oss << "# TYPE blackbox_replay_errors_total counter\n";
-        oss << "blackbox_replay_errors_total " << metrics_.replayErrors.load(std::memory_order_relaxed) << "\n";
         oss << "# TYPE blackbox_snapshot_cache_bytes gauge\n";
         oss << "blackbox_snapshot_cache_bytes " << cfg.value("snapshot_cache_bytes", 0) << "\n";
         oss << "# TYPE blackbox_snapshot_cache_hits counter\n";
