@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <optional>
 #include <limits>
+#include "minielastic/Checksum.hpp"
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -278,6 +279,25 @@ void BlackBoxHttpServer::setupRoutes() {
         addCors(res);
     });
 
+    // --- CLUSTER STATE ---
+    server_.Get("/v1/cluster/state", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/cluster/state");
+            return;
+        }
+        try {
+            auto state = db_.clusterState();
+            res.set_content(ok(state).dump(), "application/json");
+            logReq(rid, "ok path=/v1/cluster/state");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(err(500, e.what()).dump(), "application/json");
+            logReq(rid, std::string("error path=/v1/cluster/state err=") + e.what());
+        }
+        addCors(res);
+    });
+
     // --- METRICS/STATS ---
     server_.Get("/v1/metrics", [this, ok, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
         auto now = std::chrono::steady_clock::now();
@@ -524,6 +544,88 @@ void BlackBoxHttpServer::setupRoutes() {
         }
         addCors(res);
         attachRequestId(req, res);
+    });
+
+    // --- SHIPPING WAL FETCH (chunked) ---
+    server_.Get("/v1/ship/wal", [this, ok, err, addCors, attachRequestId, rateLimit, logReq](const httplib::Request& req, httplib::Response& res) {
+        auto rid = attachRequestId(req, res);
+        if (rateLimit(req, res)) {
+            logReq(rid, "rate_limited path=/v1/ship/wal");
+            return;
+        }
+        std::string index = req.get_param_value("index");
+        if (index.empty()) {
+            res.status = 400;
+            res.set_content(err(400, "Missing index").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "bad_request path=/v1/ship/wal missing index");
+            return;
+        }
+        auto plan = db_.shippingPlan();
+        std::string walPath;
+        uint64_t walBytes = 0;
+        for (const auto& idx : plan["indexes"]) {
+            if (idx.value("name", "") == index) {
+                walPath = idx.value("wal_path", "");
+                walBytes = idx.value("wal_bytes", 0);
+                break;
+            }
+        }
+        if (walPath.empty()) {
+            res.status = 404;
+            res.set_content(err(404, "Index not found").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "not_found path=/v1/ship/wal index=" + index);
+            return;
+        }
+        uint64_t offset = 0;
+        uint64_t limit = 1024 * 1024;
+        try { offset = std::stoull(req.get_param_value("offset")); } catch (...) {}
+        try { limit = std::max<uint64_t>(1024, std::min<uint64_t>(limit, std::stoull(req.get_param_value("limit")))); } catch (...) {}
+        std::ifstream in(walPath, std::ios::binary);
+        if (!in) {
+            res.status = 404;
+            res.set_content(err(404, "WAL not readable").dump(), "application/json");
+            addCors(res);
+            logReq(rid, "not_found path=/v1/ship/wal unreadable index=" + index);
+            return;
+        }
+        in.seekg(0, std::ios::end);
+        uint64_t fileSize = static_cast<uint64_t>(in.tellg());
+        if (offset > fileSize) offset = fileSize;
+        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        std::string chunk;
+        chunk.resize(static_cast<size_t>(std::min<uint64_t>(limit, fileSize - offset)));
+        in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        chunk.resize(static_cast<size_t>(in.gcount()));
+        auto hexEncode = [](const std::string& input) {
+            static const char* hex = "0123456789abcdef";
+            std::string out;
+            out.reserve(input.size() * 2);
+            for (unsigned char c : input) {
+                out.push_back(hex[c >> 4]);
+                out.push_back(hex[c & 0x0F]);
+            }
+            return out;
+        };
+        uint32_t chunkCrc = minielastic::crc32(chunk);
+        constexpr const char* kWalMagicLocal = "BBWAL";
+        constexpr uint16_t kWalVersionLocal = 2;
+        json payload = {
+            {"index", index},
+            {"offset", offset},
+            {"next_offset", offset + chunk.size()},
+            {"eof", offset + chunk.size() >= fileSize},
+            {"total_bytes", fileSize},
+            {"reported_wal_bytes", walBytes},
+            {"magic", kWalMagicLocal},
+            {"version", kWalVersionLocal},
+            {"chunk_crc32", chunkCrc},
+            {"data_hex", hexEncode(chunk)}
+        };
+        res.set_content(ok(payload).dump(), "application/json");
+        addCors(res);
+        logReq(rid, "ok path=/v1/ship/wal index=" + index + " bytes=" + std::to_string(chunk.size()));
     });
 
     // --- PROMETHEUS METRICS ---

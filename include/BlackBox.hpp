@@ -187,6 +187,7 @@ public:
     std::vector<IndexStats> stats() const;
     nlohmann::json config() const;
     nlohmann::json shippingPlan() const;
+    nlohmann::json clusterState() const;
     uint64_t replayErrors() const;
     uint64_t annRecallSamples() const;
     uint64_t annRecallHits() const;
@@ -419,6 +420,7 @@ private:
     };
 
     std::string dataDir_;
+    std::string clusterId_;
     std::string shardId_;
     std::string replicaId_;
     std::string shipEndpoint_;

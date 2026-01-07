@@ -1302,6 +1302,11 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
         std::string v(envAuto);
         autoSnapshot_ = !(v == "0" || v == "false" || v == "off");
     }
+    if (const char* envCluster = std::getenv("BLACKBOX_CLUSTER_ID")) {
+        clusterId_ = envCluster;
+    } else {
+        clusterId_ = "local";
+    }
     if (const char* envAnn = std::getenv("BLACKBOX_ANN_CLUSTERS")) {
         try { defaultAnnClusters_ = static_cast<uint32_t>(std::max<uint64_t>(1, std::stoull(envAnn))); } catch (...) {}
     }
@@ -2044,6 +2049,7 @@ nlohmann::json BlackBox::config() const {
         {"field_cache_misses", fieldCache_.misses()},
         {"compress_snapshots", compressSnapshots_},
         {"auto_snapshot", autoSnapshot_},
+        {"cluster_id", clusterId_},
         {"default_ann_clusters", defaultAnnClusters_},
         {"default_ann_probes", defaultAnnProbes_},
         {"default_ann_m", defaultAnnM_},
@@ -2070,6 +2076,7 @@ nlohmann::json BlackBox::shippingPlan() const {
     std::shared_lock<std::shared_mutex> lk(mutex_);
     json plan{
         {"cluster", {
+            {"cluster_id", clusterId_},
             {"shard_id", shardId_},
             {"replica_id", replicaId_},
             {"ship_endpoint", shipEndpoint_},
@@ -2120,6 +2127,52 @@ uint64_t BlackBox::annRecallSamples() const {
 }
 uint64_t BlackBox::annRecallHits() const {
     return annRecallHits_.load(std::memory_order_relaxed);
+}
+
+nlohmann::json BlackBox::clusterState() const {
+    namespace fs = std::filesystem;
+    std::shared_lock<std::shared_mutex> lk(mutex_);
+    size_t mergeQueueDepth = 0;
+    uint64_t mergeOutstanding = 0;
+    {
+        std::lock_guard<std::mutex> lkM(mergeMtx_);
+        mergeQueueDepth = mergeQueue_.size();
+    }
+    {
+        std::lock_guard<std::mutex> lkIo(mergeIoMtx_);
+        mergeOutstanding = mergeOutstandingBytes_;
+    }
+    json state{
+        {"cluster_id", clusterId_},
+        {"shard_id", shardId_},
+        {"replica_id", replicaId_},
+        {"ship_endpoint", shipEndpoint_},
+        {"ship_method", shipMethod_},
+        {"data_dir", dataDir_},
+        {"manifest_path", (fs::path(dataDir_) / "index.manifest").string()},
+        {"merge_queue_depth", mergeQueueDepth},
+        {"merge_outstanding_bytes", mergeOutstanding},
+        {"indexes", json::array()}
+    };
+    for (const auto& kv : indexes_) {
+        const auto& st = kv.second;
+        std::lock_guard<std::mutex> lkIdx(*st.mtx);
+        state["indexes"].push_back({
+            {"name", kv.first},
+            {"schema_id", st.schema.schemaId},
+            {"schema_version", st.schema.schemaVersion},
+            {"documents", st.documents.size()},
+            {"segments", st.segments.size()},
+            {"wal_path", st.wal.path},
+            {"wal_bytes", st.wal.offset},
+            {"last_flushed_wal_offset", st.lastFlushedWalOffset},
+            {"ann_clusters", st.annClusters},
+            {"ann_probes", st.annProbes},
+            {"ann_m", st.annM},
+            {"ann_ef_search", st.annEfSearch}
+        });
+    }
+    return state;
 }
 
 void BlackBox::indexJson(IndexState& idx, DocId id, const json& j) {
