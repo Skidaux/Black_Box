@@ -31,6 +31,9 @@ const serverCmd =
   // process.env.BLACKBOX_SERVER ||
   path.join("build", pathing[0], pathing[1]);
 const serverCwd = path.resolve(__dirname, "..");
+let serverSeq = 0;
+const restartDelayMs = parseInt(process.env.BLACKBOX_RESTART_DELAY_MS || "500", 10);
+const nowIso = () => new Date().toISOString();
 
 async function timeStep(label, fn) {
   const start = hrMs();
@@ -72,16 +75,41 @@ async function runSearch(index, params) {
   return axios.get(`/v1/${index}/search?${qs}`);
 }
 
-async function waitForServer(timeoutMs = 15000) {
+async function waitForServer(timeoutMs = 20000) {
   const start = Date.now();
+  let lastError = null;
+  const debug = process.env.DEBUG_WAIT === "1";
+  let attempts = 0;
   while (Date.now() - start < timeoutMs) {
+    attempts += 1;
     try {
-      const res = await axios.get("/v1/health");
-      if (res.status === 200) return;
-    } catch (_) {}
+      // Use a short per-request timeout so a stalled connection doesn't consume the full wait window.
+      const res = await axios.get("/v1/health", { timeout: 2000 });
+      if (res.status === 200) {
+        if (debug) console.log(`[wait] healthy after ${attempts} attempts`);
+        return;
+      }
+      lastError = `status=${res.status}`;
+    } catch (e) {
+      lastError = e.code || e.message;
+    }
+    if (debug) {
+      console.log(`[wait] attempt ${attempts} failed: ${lastError}`);
+      if (attempts === 5) {
+        try {
+          const lsof = require("child_process").execSync("lsof -i :8080 || true", {
+            encoding: "utf8",
+          });
+          console.log(`[wait] lsof :8080\n${lsof}`);
+        } catch (e) {
+          console.log(`[wait] lsof failed: ${e.message}`);
+        }
+      }
+    }
     await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error("Server did not become healthy in time");
+  const suffix = lastError ? ` (last error: ${lastError})` : "";
+  throw new Error(`Server did not become healthy in time${suffix}`);
 }
 
 function startServerProcess() {
@@ -89,22 +117,71 @@ function startServerProcess() {
     cwd: serverCwd,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const seq = ++serverSeq;
+  console.log(`[server ${seq}] spawned pid=${proc.pid}`);
   proc.stdout.on("data", (chunk) =>
-    process.stdout.write(`[BlackBox] ${chunk.toString()}`)
+    process.stdout.write(`[BlackBox ${seq}] ${chunk.toString()}`)
   );
   proc.stderr.on("data", (chunk) =>
-    process.stderr.write(`[BlackBox] ${chunk.toString()}`)
+    process.stderr.write(`[BlackBox ${seq}] ${chunk.toString()}`)
+  );
+  proc.once("exit", (code, signal) =>
+    console.log(
+      `[server ${seq}] exited at ${nowIso()} code=${code} signal=${signal}`
+    )
   );
   return proc;
 }
 
+async function startServerAndWait(label = "server", retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const proc = startServerProcess();
+    try {
+      await waitForServer();
+      if (process.env.DEBUG_WAIT === "1") {
+        console.log(`[${label}] healthy on attempt ${attempt}`);
+      }
+      return proc;
+    } catch (err) {
+      if (process.env.DEBUG_WAIT === "1") {
+        console.log(
+          `[${label}] start attempt ${attempt} failed: ${err.message}`
+        );
+      }
+      await stopServerProcess(proc);
+      if (attempt === retries) throw err;
+      if (restartDelayMs > 0)
+        await new Promise((r) => setTimeout(r, restartDelayMs));
+    }
+  }
+}
+
 function stopServerProcess(proc) {
   if (!proc) return Promise.resolve();
+
+  // If the child already exited (exitCode is set), resolve immediately so callers don't hang.
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    return Promise.resolve();
+  }
+
   return new Promise((resolve) => {
-    proc.once("exit", resolve);
-    proc.kill();
-    setTimeout(() => {
+    let settled = false;
+    let timeoutId = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      resolve();
+    };
+
+    proc.once("exit", finish);
+    proc.once("close", finish);
+
+    // Try graceful shutdown first, then hard kill after a short delay.
+    proc.kill("SIGTERM");
+    timeoutId = setTimeout(() => {
       if (!proc.killed) proc.kill("SIGKILL");
+      finish();
     }, 2000);
   });
 }
@@ -549,8 +626,7 @@ async function runDurability() {
 
   let proc = null;
   try {
-    proc = startServerProcess();
-    await waitForServer();
+    proc = await startServerAndWait("durability:start");
     results.steps.push({ step: "server_start", status: "ok" });
     await ensureIndex(testIndex, {
       fields: {
@@ -618,8 +694,9 @@ async function runDurability() {
     await stopServerProcess(proc);
     results.steps.push({ step: "shutdown", status: "ok" });
 
-    proc = startServerProcess();
-    await waitForServer();
+    // Give the OS a moment to release the listening socket before restarting.
+    if (restartDelayMs > 0) await new Promise((r) => setTimeout(r, restartDelayMs));
+    proc = await startServerAndWait("durability:restart");
     results.steps.push({ step: "restart", status: "ok" });
 
     const fetched = await axios.get(`/v1/${testIndex}/doc/${docId}`);
@@ -653,8 +730,8 @@ async function runDurability() {
     }
     await stopServerProcess(proc);
     results.steps.push({ step: "shutdown_post_delete", status: "ok" });
-    proc = startServerProcess();
-    await waitForServer();
+    if (restartDelayMs > 0) await new Promise((r) => setTimeout(r, restartDelayMs));
+    proc = await startServerAndWait("durability:restart_after_delete");
     results.steps.push({ step: "restart_after_delete", status: "ok" });
     const fetchAfterDelete = await axios.get(`/v1/${testIndex}/doc/${docId}`);
     results.steps.push({
@@ -686,8 +763,8 @@ async function runDurability() {
     }
     await stopServerProcess(proc);
     results.steps.push({ step: "shutdown_after_corrupt", status: "ok" });
-    proc = startServerProcess();
-    await waitForServer();
+    if (restartDelayMs > 0) await new Promise((r) => setTimeout(r, restartDelayMs));
+    proc = await startServerAndWait("durability:restart_after_corrupt");
     results.steps.push({ step: "restart_after_corrupt", status: "ok" });
     const health = await axios.get("/v1/health");
     results.steps.push({ step: "health_after_corrupt", status: health.status });
@@ -798,8 +875,7 @@ async function runSnapshotTest() {
   };
   let proc = null;
   try {
-    proc = startServerProcess();
-    await waitForServer();
+    proc = await startServerAndWait("snapshot:start");
     results.steps.push({ step: "server_start", status: "ok" });
     await ensureIndex(name, {
       fields: {
@@ -837,8 +913,8 @@ async function runSnapshotTest() {
     }
 
     // Restart and load from snapshot
-    proc = startServerProcess();
-    await waitForServer();
+    if (restartDelayMs > 0) await new Promise((r) => setTimeout(r, restartDelayMs));
+    proc = await startServerAndWait("snapshot:restart");
     results.steps.push({ step: "restart", status: "ok" });
     const loadRes = await axios.post(`/v1/snapshot/load?path=${encodeURIComponent(snapshotPath)}`);
     results.steps.push({ step: "snapshot_load", status: loadRes.status });
@@ -881,8 +957,7 @@ async function runCoverageTest() {
   const results = { timestamp: new Date().toISOString(), index, steps: [] };
   let proc = null;
   try {
-    proc = startServerProcess();
-    await waitForServer();
+    proc = await startServerAndWait("coverage:start");
     results.steps.push({ step: "server_start", status: "ok" });
 
     const createRes = await ensureIndex(index, {

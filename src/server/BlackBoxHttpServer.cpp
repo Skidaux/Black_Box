@@ -12,6 +12,9 @@
 #include <optional>
 #include <limits>
 #include "minielastic/Checksum.hpp"
+#include <numeric>
+#include <cerrno>
+#include <cstring>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -52,16 +55,23 @@ void BlackBoxHttpServer::run() {
         return new httplib::ThreadPool(static_cast<size_t>(threads));
     };
 
-    // Avoid Nagle delays on Linux; helps p99 latency on small requests
+    // Avoid Nagle delays and allow quick restarts by reusing the listening port.
     server_.set_socket_options([](socket_t sock) {
         int flag = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&flag), sizeof(flag));
+#ifdef SO_REUSEPORT
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<char*>(&flag), sizeof(flag));
+#endif
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&flag), sizeof(flag));
         return true;
     });
 
     std::cout << "BlackBox HTTP server listening on "
               << host_ << ":" << port_ << " with " << threads << " threads" << std::endl;
-    server_.listen(host_.c_str(), port_);
+    if (!server_.listen(host_.c_str(), port_)) {
+        std::cerr << "Failed to listen on " << host_ << ":" << port_
+                  << " errno=" << errno << " (" << std::strerror(errno) << ")" << std::endl;
+    }
 }
 
 void BlackBoxHttpServer::setupRoutes() {
@@ -175,7 +185,22 @@ void BlackBoxHttpServer::setupRoutes() {
 
     // --- HEALTH ---
     server_.Get("/v1/health", [this, ok, addCors, attachRequestId](const httplib::Request& req, httplib::Response& res) {
-        res.set_content(ok(json{}).dump(), "application/json");
+        auto now = std::chrono::steady_clock::now();
+        double uptime = std::chrono::duration<double>(now - startTime_).count();
+        auto stats = db_.stats();
+        uint64_t docs = 0;
+        uint64_t segments = 0;
+        for (const auto& s : stats) {
+            docs += s.documents;
+            segments += s.segments;
+        }
+        json payload{
+            {"uptime_seconds", uptime},
+            {"indexes", stats.size()},
+            {"documents", docs},
+            {"segments", segments},
+        };
+        res.set_content(ok(payload).dump(), "application/json");
         addCors(res);
         attachRequestId(req, res);
     });
