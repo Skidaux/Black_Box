@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -147,6 +148,27 @@ try {
     auto vid = db.indexDocument(vecIndex, R"({"title":"v1","vec":[1,0,0]})");
     auto vHits = db.searchVector(vecIndex, {1.0f, 0.0f, 0.0f}, 5, 8, 64);
     expect(!vHits.empty() && vHits[0].id == vid, "vector search with overrides should find doc");
+    bool vecTooLongThrew = false;
+    try {
+        db.indexDocument(vecIndex, R"({"title":"v2","vec":[1,0,0,9]})");
+    } catch (...) {
+        vecTooLongThrew = true;
+    }
+    expect(vecTooLongThrew, "vector field should reject extra dimensions");
+
+    // Schema-less snapshot should preserve searchable content across reload
+    const std::string rawIndex = "raw_index";
+    BlackBox::IndexSchema rawSchema;
+    expect(db.createIndex(rawIndex, rawSchema), "create raw index");
+    auto rawId = db.indexDocument(rawIndex, R"({"title":"raw alpha","body":"persist me"})");
+    auto rawHits = db.search(rawIndex, "persist", "bm25");
+    expect(!rawHits.empty() && rawHits[0].id == rawId, "raw index search before snapshot");
+    expect(db.saveSnapshot(), "snapshot save with schema-less index");
+    {
+        BlackBox dbReload(dataDir);
+        auto rawReloadHits = dbReload.search(rawIndex, "persist", "bm25");
+        expect(!rawReloadHits.empty() && rawReloadHits[0].id == rawId, "schema-less index should survive snapshot reload");
+    }
 
     // Delete durability: index + delete + restart should not resurrect
     const std::string delIndex = "del_index";
@@ -254,6 +276,14 @@ try {
     expect(db.createIndex(uniqIndex, uniqSchema), "create uniq index");
     auto uid1 = db.indexDocument(uniqIndex, R"({"title":"first","sku":"ABC"})");
     expect(uid1 == 1, "first doc id");
+    auto beforeUpdate = db.getDocument(uniqIndex, uid1);
+    auto beforeTs = beforeUpdate["_updated_at"].get<int64_t>();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    expect(db.updateDocument(uniqIndex, uid1, R"({"title":"updated title"})", true), "update existing doc_id");
+    auto afterUpdate = db.getDocument(uniqIndex, uid1);
+    auto afterTs = afterUpdate["_updated_at"].get<int64_t>();
+    expect(afterUpdate["title"] == "updated title", "updated title should persist");
+    expect(afterTs >= beforeTs, "_updated_at should advance or stay monotonic on update");
     bool threw = false;
     try {
         db.indexDocument(uniqIndex, R"({"title":"dupe","sku":"ABC"})");
@@ -298,10 +328,8 @@ try {
     auto extraStored = db.scanStoredEquals(extraIndex, "version", 1);
     expect(!extraStored.empty(), "doc-values numeric stored");
 
-    // Doc_id uniqueness: updating same doc_id should be allowed
     auto uid1b = db.lookupDocId(uniqIndex, "ABC");
     expect(uid1b.has_value(), "doc_id should be present");
-    expect(db.updateDocument(uniqIndex, *uid1b, R"({"title":"updated title"})", true), "update existing doc_id");
     auto updatedDoc = db.getDocument(uniqIndex, *uid1b);
     expect(updatedDoc["title"] == "updated title", "doc updated in place");
 

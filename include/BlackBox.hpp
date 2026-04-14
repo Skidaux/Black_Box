@@ -132,6 +132,7 @@ public:
 
     // Index a document from a JSON string and return its ID in the given index.
     DocId indexDocument(const std::string& index, const std::string& jsonStr);
+    DocId indexDocumentJson(const std::string& index, const nlohmann::json& doc);
     // Update a document (partial merge if partial=true, else replace).
     bool updateDocument(const std::string& index, DocId id, const std::string& jsonStr, bool partial);
 
@@ -402,6 +403,7 @@ private:
         std::vector<SegmentMetadata> segments;
         WalWriter wal;
         size_t opsSinceFlush = 0;
+        uint64_t docLengthSum = 0;
         uint64_t nextOpId = 1;
         bool manifestDirty = false;
         std::unordered_set<DocId> tombstones;

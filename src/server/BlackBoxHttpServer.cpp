@@ -1020,7 +1020,7 @@ void BlackBoxHttpServer::setupRoutes() {
         ids.reserve(docsNode->size());
         for (size_t i = 0; i < docsNode->size(); ++i) {
             try {
-                auto id = db_.indexDocument(index, (*docsNode)[i].dump());
+                auto id = db_.indexDocumentJson(index, (*docsNode)[i]);
                 ids.push_back(id);
             } catch (const std::exception& e) {
                 errors.push_back(json{{"index", i}, {"error", e.what()}});

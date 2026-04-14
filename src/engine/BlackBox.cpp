@@ -1546,6 +1546,11 @@ const std::unordered_map<std::string, std::unordered_map<std::string, std::vecto
 }
 
 BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::string& jsonStr) {
+    json j = json::parse(jsonStr);
+    return indexDocumentJson(index, j);
+}
+
+BlackBox::DocId BlackBox::indexDocumentJson(const std::string& index, const json& j) {
     std::shared_lock<std::shared_mutex> lk(mutex_);
     auto it = indexes_.find(index);
     if (it == indexes_.end()) throw std::runtime_error("index not found");
@@ -1553,7 +1558,6 @@ BlackBox::DocId BlackBox::indexDocument(const std::string& index, const std::str
     lk.unlock();
     std::lock_guard<std::mutex> lkIdx(*idx.mtx);
 
-    json j = json::parse(jsonStr);
     if (!validateDocument(idx, j)) {
         throw std::runtime_error("document does not conform to schema");
     }
@@ -1663,11 +1667,16 @@ bool BlackBox::updateDocument(const std::string& index, DocId id, const std::str
         throw std::runtime_error("document does not conform to schema");
     }
 
+    auto nowTs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    merged["_updated_at"] = nowTs;
+    if (!merged.contains("_created_at")) {
+        merged["_created_at"] = nowTs;
+    }
+
     auto processed = preprocessIncomingDocument(idx, merged);
     applyUpsert(idx, id, processed, true);
     refreshAverages(idx);
-    // Update timestamp
-    idx.documents[id]["_updated_at"] = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     idx.manifestDirty = true;
     manifestDirty_.store(true, std::memory_order_relaxed);
     bool doSnapshot = autoSnapshot_;
@@ -1917,9 +1926,7 @@ void BlackBox::refreshAverages(IndexState& idx) {
         idx.avgDocLen = 0.0;
         return;
     }
-    uint64_t total = 0;
-    for (const auto& kv : idx.docLengths) total += kv.second;
-    idx.avgDocLen = static_cast<double>(total) / static_cast<double>(idx.docLengths.size());
+    idx.avgDocLen = static_cast<double>(idx.docLengthSum) / static_cast<double>(idx.docLengths.size());
 }
 
 uint64_t BlackBox::estimateMergeBytes(const IndexState& idx) const {
@@ -2181,6 +2188,7 @@ void BlackBox::indexJson(IndexState& idx, DocId id, const json& j) {
     } else {
         indexStructured(idx, id, j);
     }
+    idx.docLengthSum += idx.docLengths[id];
 }
 
 void BlackBox::indexJsonRecursive(IndexState& idx, DocId id, const json& node) {
@@ -2587,7 +2595,7 @@ bool BlackBox::validateDocument(const IndexState& idx, const nlohmann::json& doc
             break;
         case FieldType::Vector:
             if (!val.is_array()) return false;
-            if (val.size() < idx.schema.vectorDim) return false;
+            if (val.size() != idx.schema.vectorDim) return false;
             break;
         case FieldType::Image:
             if (!val.is_object()) return false;
@@ -2737,6 +2745,10 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const Processed
     // remove old if updating
     auto existing = idx.documents.find(assignId);
     if (existing != idx.documents.end()) {
+        auto lenIt = idx.docLengths.find(assignId);
+        if (lenIt != idx.docLengths.end()) {
+            idx.docLengthSum -= lenIt->second;
+        }
         removeJson(idx, assignId, existing->second);
         idx.docLengths.erase(assignId);
         idx.vectors.erase(assignId);
@@ -2791,7 +2803,7 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const Processed
         idx.imageValues[img.first][assignId] = img.second;
     }
     idx.docLengths[assignId] = 0;
-    indexStructured(idx, assignId, doc);
+    indexJson(idx, assignId, doc);
 
     if (logWal) {
         if (!idx.wal.stream.is_open() && !idx.wal.path.empty()) {
@@ -2824,8 +2836,12 @@ BlackBox::DocId BlackBox::applyUpsert(IndexState& idx, DocId id, const Processed
 bool BlackBox::applyDelete(IndexState& idx, DocId id, bool logWal) {
     auto it = idx.documents.find(id);
     if (it == idx.documents.end()) return false;
+    auto lenIt = idx.docLengths.find(id);
+    if (lenIt != idx.docLengths.end()) {
+        idx.docLengthSum -= lenIt->second;
+    }
     removeJson(idx, id, it->second);
-        idx.documents.erase(it);
+    idx.documents.erase(it);
     auto extIt = idx.docIdToExternal.find(id);
     if (extIt != idx.docIdToExternal.end()) {
         idx.externalToDocId.erase(extIt->second);
@@ -2909,11 +2925,7 @@ void BlackBox::flushIfNeeded(const std::string& index, IndexState& idx) {
         }
     }
 
-    double avg = idx.docLengths.empty() ? 0.0 : [&]() {
-        uint64_t total = 0;
-        for (const auto& kv : idx.docLengths) total += kv.second;
-        return static_cast<double>(total) / static_cast<double>(idx.docLengths.size());
-    }();
+    double avg = idx.avgDocLen;
 
     fs::path segFile = fs::path(dataDir_) / (index + "_seg" + std::to_string(idx.segments.size()) + ".skd");
     if (!writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
@@ -3022,11 +3034,7 @@ bool BlackBox::performMerge(const std::string& index, IndexState& idx) {
             chunk.images[field.first][entry.first] = SnapshotChunk::SnapshotImage{entry.second.format, entry.second.data};
         }
     }
-    double avg = idx.docLengths.empty() ? 0.0 : [&]() {
-        uint64_t total = 0;
-        for (const auto& kv : idx.docLengths) total += kv.second;
-        return static_cast<double>(total) / static_cast<double>(idx.docLengths.size());
-    }();
+    double avg = idx.avgDocLen;
 
     fs::path segFile = fs::path(dataDir_) / (index + "_merge" + std::to_string(idx.segments.size()) + ".skd");
     if (!writeSnapshotFile(segFile.string(), chunk, idx.nextId, avg, compressSnapshots_)) {
@@ -3230,8 +3238,7 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
                 if (itDoc == idx.documents.end()) continue;
                 tmp.nextId = std::max(tmp.nextId, id + 1);
                 tmp.documents[id] = itDoc->second;
-                tmp.docLengths[id] = 0;
-                const_cast<BlackBox*>(this)->indexStructured(tmp, id, itDoc->second);
+                const_cast<BlackBox*>(this)->indexJson(tmp, id, itDoc->second);
                 auto vecIt = idx.vectors.find(id);
                 if (vecIt != idx.vectors.end()) tmp.vectors[id] = vecIt->second;
                 // carry query_values index for searchable fields
@@ -3274,11 +3281,7 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
                     chunk.images[field.first][imgEntry.first] = SnapshotChunk::SnapshotImage{imgEntry.second.format, imgEntry.second.data};
                 }
             }
-            double avg = tmp.docLengths.empty() ? 0.0 : [&]() {
-                uint64_t total = 0;
-                for (const auto& kv : tmp.docLengths) total += kv.second;
-                return static_cast<double>(total) / static_cast<double>(tmp.docLengths.size());
-            }();
+            double avg = tmp.docLengths.empty() ? 0.0 : static_cast<double>(tmp.docLengthSum) / static_cast<double>(tmp.docLengths.size());
 
             fs::path shardFile = manifestPath.parent_path() / (name + "_seg" + std::to_string(segs.size()) + ".skd");
             if (!writeSnapshotFile(shardFile.string(), chunk, tmp.nextId, avg, compressSnapshots_)) {
@@ -3437,7 +3440,10 @@ bool BlackBox::loadSnapshot(const std::string& path) {
                     } catch (...) {}
                 }
             }
-            for (const auto& kv : chunk.docLens) state.docLengths[kv.first] = kv.second;
+            for (const auto& kv : chunk.docLens) {
+                state.docLengths[kv.first] = kv.second;
+                state.docLengthSum += kv.second;
+            }
             for (const auto& kv : chunk.index) {
                 auto& dest = state.invertedIndex[kv.first];
                 dest.insert(dest.end(), kv.second.begin(), kv.second.end());
@@ -3544,7 +3550,6 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             state.annDirty = !state.vectors.empty();
         }
 
-        refreshAverages(state);
         rebuildQueryValues(state);
         // init WAL
         if (!dataDir_.empty()) {
@@ -3554,6 +3559,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             state.wal.enableFsync = walFsyncEnabled_;
             state.wal.open();
             replayWal(state, maxWalPos);
+            refreshAverages(state);
             if (state.annProbes == 0) state.annProbes = defaultAnnProbes_;
             if (state.annM == 0) state.annM = defaultAnnM_;
             if (state.annEfSearch == 0) state.annEfSearch = defaultAnnEfSearch_;
@@ -3644,6 +3650,7 @@ void BlackBox::loadWalOnly() {
             std::cerr << "BlackBox: WAL schema mismatch for index " << name << " header=" << state.wal.headerSchemaId << " schema=" << state.schema.schemaId << "\n";
         }
         replayWal(state);
+        refreshAverages(state);
         state.lastFlushedWalOffset = 0;
         state.lastFlushAt = std::chrono::steady_clock::now();
         state.annProbes = defaultAnnProbes_;

@@ -4,3 +4,4 @@
 /scripts/node_modules
 /scripts/*results.json
 scripts/snapshots/
+/testdata

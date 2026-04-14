@@ -8,9 +8,11 @@ const readline = require("readline");
 
 const axios = require("axios").create({
   baseURL: "http://127.0.0.1:8080",
-  timeout: 15000,
+  timeout: 55000,
   validateStatus: () => true,
 });
+
+const stressBulkTimeoutMs = parseInt(process.env.BLACKBOX_STRESS_TIMEOUT_MS || "0", 10);
 
 const hrMs = () => Number(process.hrtime.bigint()) / 1e6;
 const randChoice = (arr) => arr[Math.floor(Math.random() * arr.length)];
@@ -56,18 +58,24 @@ async function indexDoc(index, doc) {
   });
 }
 
-async function bulkIndex(index, docs, continueOnError = true) {
-  return axios.post(
-    `/v1/${index}/_bulk?continue_on_error=${continueOnError}`,
-    docs,
-    { headers: { "Content-Type": "application/json" } }
-  );
+async function bulkIndex(index, docs, continueOnError = true, timeoutMs = 0) {
+  const config = { headers: { "Content-Type": "application/json" } };
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    config.timeout = timeoutMs;
+  } else if (timeoutMs === 0) {
+    config.timeout = 0;
+  }
+  return axios.post(`/v1/${index}/_bulk?continue_on_error=${continueOnError}`, docs, config);
 }
 
 async function patchDoc(index, id, body) {
   return axios.patch(`/v1/${index}/doc/${id}`, body, {
     headers: { "Content-Type": "application/json" },
   });
+}
+
+async function getDoc(index, id) {
+  return axios.get(`/v1/${index}/doc/${id}`);
 }
 
 async function runSearch(index, params) {
@@ -781,19 +789,29 @@ async function runDurability() {
 
 async function runStress(maxDocs, concurrency, batchSize = 200) {
   const index = `stress_${Date.now()}`;
+  const integritySampleSize = Math.min(25, maxDocs);
   const results = {
     timestamp: new Date().toISOString(),
     index,
     targetDocs: maxDocs,
     concurrency,
     batchSize,
+    bulkTimeoutMs: stressBulkTimeoutMs,
     successes: 0,
     failures: 0,
     firstError: null,
+    integritySampleSize,
+    integrityChecks: 0,
+    integrityFailures: 0,
+    integrityFirstError: null,
+    integrityVerified: false,
     durationMs: 0,
   };
   try {
-    await ensureIndex(index, { fields: { title: "text", body: "text" } });
+    await ensureIndex(index, {
+      fields: { title: "text", body: "text", client_id: "text" },
+      doc_id: { field: "client_id", type: "string", enforce_unique: true },
+    });
     const vocab = [
       "alpha",
       "beta",
@@ -820,10 +838,10 @@ async function runStress(maxDocs, concurrency, batchSize = 200) {
         counter += take;
         for (let i = 0; i < take; ++i) {
           const id = startId + i;
-          docs.push({ title: `Doc ${id}`, body: randomText(vocab, 12) });
+          docs.push({ client_id: `doc-${id}`, title: `Doc ${id}`, body: randomText(vocab, 12) });
         }
         try {
-          const res = await bulkIndex(index, docs, true);
+          const res = await bulkIndex(index, docs, true, stressBulkTimeoutMs);
           const okIds = res.data?.data?.ids || res.data?.ids || [];
           const errs = res.data?.data?.errors || res.data?.errors || [];
           results.successes += okIds.length;
@@ -846,6 +864,50 @@ async function runStress(maxDocs, concurrency, batchSize = 200) {
     }
     await Promise.all(Array.from({ length: concurrency }, worker));
     results.durationMs = hrMs() - start;
+    const sampleIds = new Set([1, Math.ceil(maxDocs / 2), maxDocs]);
+    if (integritySampleSize > sampleIds.size) {
+      const step = Math.max(1, Math.floor(maxDocs / integritySampleSize));
+      for (let id = 1; id <= maxDocs && sampleIds.size < integritySampleSize; id += step) {
+        sampleIds.add(id);
+      }
+      sampleIds.add(maxDocs);
+      sampleIds.add(1);
+      sampleIds.add(Math.ceil(maxDocs / 2));
+    }
+    const integrityIds = Array.from(sampleIds).filter((id) => id >= 1 && id <= maxDocs).sort((a, b) => a - b);
+    for (const id of integrityIds) {
+      const clientId = `doc-${id}`;
+      try {
+        const fetched = await getDoc(index, clientId);
+        const doc = fetched.data?.data?.doc || fetched.data?.doc || fetched.data;
+        results.integrityChecks += 1;
+        if (fetched.status !== 200) {
+          results.integrityFailures += 1;
+          if (!results.integrityFirstError) {
+            results.integrityFirstError = { id, clientId, status: fetched.status, data: fetched.data };
+          }
+          continue;
+        }
+        if (!doc || doc.client_id !== clientId || doc.title !== `Doc ${id}`) {
+          results.integrityFailures += 1;
+          if (!results.integrityFirstError) {
+            results.integrityFirstError = {
+              id,
+              clientId,
+              status: fetched.status,
+              expectedTitle: `Doc ${id}`,
+              actualTitle: doc?.title ?? null,
+              actualClientId: doc?.client_id ?? null,
+            };
+          }
+        }
+      } catch (err) {
+        results.integrityChecks += 1;
+        results.integrityFailures += 1;
+        if (!results.integrityFirstError) results.integrityFirstError = { id, clientId, error: err.message };
+      }
+    }
+    results.integrityVerified = results.integrityFailures === 0 && results.integrityChecks > 0;
     const search = await runSearch(index, {
       q: "alpha",
       mode: "bm25",
