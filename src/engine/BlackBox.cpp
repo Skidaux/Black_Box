@@ -1232,14 +1232,18 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
             if (crcComputed != crcRead) {
                 auto pos = in.tellg();
                 std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
+                in.close();
                 std::error_code ec;
                 try {
                     std::filesystem::resize_file(path, lastGoodOffset, ec);
                 } catch (const std::exception& e) {
                     std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
+                    break;
                 }
                 if (ec) {
                     std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
+                } else {
+                    flushFilePath(path);
                 }
                 break;
             }
@@ -1269,14 +1273,18 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
             if (crcComputed != crcRead) {
                 auto pos = in.tellg();
                 std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
+                in.close();
                 std::error_code ec;
                 try {
                     std::filesystem::resize_file(path, lastGoodOffset, ec);
                 } catch (const std::exception& e) {
                     std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
+                    break;
                 }
                 if (ec) {
                     std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
+                } else {
+                    flushFilePath(path);
                 }
                 break;
             }
@@ -3312,9 +3320,37 @@ bool BlackBox::saveSnapshot(const std::string& path) const {
             {"wal_bytes", idx.wal.offset}
         });
     }
-    std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
-    out << manifest.dump(2);
-    return static_cast<bool>(out);
+    namespace fs2 = std::filesystem;
+    fs2::path tmpManifest = manifestPath;
+    tmpManifest += ".tmp";
+    {
+        std::ofstream out(tmpManifest, std::ios::binary | std::ios::trunc);
+        out << manifest.dump(2);
+        flushAndSync(out);
+        if (!out) {
+            std::cerr << "BlackBox: failed to write temp manifest at " << tmpManifest << "\n";
+            std::error_code rmEc;
+            fs2::remove(tmpManifest, rmEc);
+            return false;
+        }
+    }
+    flushFilePath(tmpManifest.string());
+    std::error_code ec;
+    fs2::rename(tmpManifest, manifestPath, ec);
+    if (ec) {
+        // rename may fail on Windows if destination exists; fall back to remove+rename
+        fs2::remove(manifestPath, ec);
+        ec.clear();
+        fs2::rename(tmpManifest, manifestPath, ec);
+        if (ec) {
+            std::cerr << "BlackBox: failed to replace manifest at " << manifestPath << " err=" << ec.message() << "\n";
+            std::error_code rmEc;
+            fs2::remove(tmpManifest, rmEc);
+            return false;
+        }
+    }
+    flushFilePath(manifestPath.string());
+    return true;
 }
 
 bool BlackBox::loadSnapshot(const std::string& path) {

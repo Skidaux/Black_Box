@@ -3,7 +3,33 @@
 #include <filesystem>
 #include <iostream>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 using json = nlohmann::json;
+
+namespace {
+void fsyncPath(const std::string& path) {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+#else
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
+#endif
+}
+}
 
 namespace minielastic {
 
@@ -96,6 +122,11 @@ void LogStore::append(const LogRecord& record) {
     stream_.write(payload.data(), payload.size());
     stream_.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
     stream_.flush();
+    if (stream_) {
+        fsyncPath(logPath_);
+    } else {
+        std::cerr << "LogStore: append write failed for " << logPath_ << "\n";
+    }
 }
 
 } // namespace minielastic
