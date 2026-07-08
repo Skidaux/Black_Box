@@ -1146,7 +1146,22 @@ bool WalWriter::append(const WalRecord& rec) {
         offset += written;
         pendingBytes += written;
     }
-    maybeFlush(false);
+    // Always push the just-written record out of our userspace buffer and
+    // into the OS immediately. This is a plain write()/flush(), not an
+    // fsync, so it's cheap (no disk-I/O wait) -- but it's what makes an
+    // acknowledged write survive a process crash (SIGKILL, OOM-kill, etc.):
+    // once the bytes leave our buffer they live in the OS page cache, which
+    // a crashed process can't take with it. Without this, a record could
+    // sit unflushed for up to flushInterval/flushThresholdBytes and be lost
+    // entirely on crash even though the caller already got an ack.
+    stream.flush();
+    if (!stream) {
+        std::cerr << "WalWriter: stream write failed for " << path << "\n";
+        return false;
+    }
+    // fsync (durability against power loss / OS crash) remains batched by
+    // default for throughput, unless syncEveryWrite opts into fsync-per-commit.
+    maybeFlush(syncEveryWrite);
     if (!stream) {
         std::cerr << "WalWriter: stream write failed for " << path << "\n";
     }
@@ -1198,12 +1213,39 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
     }
     uint64_t lastGoodOffset = static_cast<uint64_t>(in.tellg());
     uint64_t syntheticOpId = 0;
+
+    // Truncates the file back to the last known-good record boundary. Used
+    // whenever we hit bytes we can't parse -- checksum mismatch, unrecognized
+    // record version, or a torn/partial record from an interrupted write.
+    // Unparseable bytes must never linger in the middle of the append-only
+    // WAL: if they did, the next append would land right after them, and
+    // everything appended from that point on would be silently unreachable
+    // (skipped over) on every future replay, since replay always stops at
+    // the first byte it can't parse.
+    auto truncateTail = [&](const std::string& reason) {
+        auto pos = in.tellg();
+        std::cerr << "WAL " << reason << " at offset " << pos << " in " << path << ", truncating tail\n";
+        in.close();
+        std::error_code ec;
+        try {
+            std::filesystem::resize_file(path, lastGoodOffset, ec);
+        } catch (const std::exception& e) {
+            std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
+            return;
+        }
+        if (ec) {
+            std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
+        } else {
+            flushFilePath(path);
+        }
+    };
+
     while (true) {
         if (hasHeader && walVersion >= 2) {
             uint16_t recVersion = 0;
             if (!walReadLE(in, recVersion)) break;
             if (recVersion != kWalRecordVersion) {
-                std::cerr << "WAL unsupported record version " << recVersion << " in " << path << "\n";
+                truncateTail("unsupported record version " + std::to_string(recVersion));
                 break;
             }
             uint8_t opByte = 0;
@@ -1230,21 +1272,7 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
             if (!payload.empty()) buf.append(payload.data(), payload.size());
             uint32_t crcComputed = crc32(buf);
             if (crcComputed != crcRead) {
-                auto pos = in.tellg();
-                std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
-                in.close();
-                std::error_code ec;
-                try {
-                    std::filesystem::resize_file(path, lastGoodOffset, ec);
-                } catch (const std::exception& e) {
-                    std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
-                    break;
-                }
-                if (ec) {
-                    std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
-                } else {
-                    flushFilePath(path);
-                }
+                truncateTail("checksum mismatch");
                 break;
             }
             out.push_back({op, opId, docId, std::move(payload)});
@@ -1271,21 +1299,7 @@ std::vector<WalRecord> readWalRecords(const std::string& path, uint64_t startOff
             if (!payload.empty()) buf.append(payload.data(), payload.size());
             uint32_t crcComputed = crc32(buf);
             if (crcComputed != crcRead) {
-                auto pos = in.tellg();
-                std::cerr << "WAL checksum mismatch at offset " << pos << " in " << path << ", truncating tail\n";
-                in.close();
-                std::error_code ec;
-                try {
-                    std::filesystem::resize_file(path, lastGoodOffset, ec);
-                } catch (const std::exception& e) {
-                    std::cerr << "WAL truncate threw for " << path << " err=" << e.what() << "\n";
-                    break;
-                }
-                if (ec) {
-                    std::cerr << "WAL truncate failed for " << path << " err=" << ec.message() << "\n";
-                } else {
-                    flushFilePath(path);
-                }
+                truncateTail("checksum mismatch");
                 break;
             }
             uint64_t assignedOpId = ++syntheticOpId;
@@ -1351,6 +1365,10 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
     if (const char* envWalFsync = std::getenv("BLACKBOX_WAL_FSYNC")) {
         std::string v(envWalFsync);
         walFsyncEnabled_ = !(v == "0" || v == "false" || v == "off");
+    }
+    if (const char* envWalSyncEvery = std::getenv("BLACKBOX_WAL_SYNC_EVERY_WRITE")) {
+        std::string v(envWalSyncEvery);
+        walSyncEveryWrite_ = (v == "1" || v == "true" || v == "on");
     }
     if (const char* envFlushMs = std::getenv("BLACKBOX_FLUSH_MS")) {
         try { flushEveryMs_ = std::stoull(envFlushMs); } catch (...) {}
@@ -1422,6 +1440,16 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
             loadWalOnly();
         } else {
             std::cerr << "BlackBox: loadSnapshot succeeded\n";
+            // The manifest we just loaded may predate one or more indexes:
+            // e.g. an index was created and written to, then the process
+            // crashed before the next manifest flush ever ran. Trusting the
+            // manifest's index list alone would silently drop those WAL
+            // files forever, since nothing else ever looks at them again.
+            // Always cross-check the data directory for WAL files the
+            // manifest doesn't know about yet.
+            if (scanOrphanWalFiles() > 0) {
+                (void)writeManifest();
+            }
         }
         // open WALs for existing indexes
         for (auto& kv : indexes_) {
@@ -1432,6 +1460,7 @@ BlackBox::BlackBox(const std::string& dataDir) : dataDir_(dataDir) {
             kv.second.wal.flushThresholdBytes = walFlushBytes_;
             kv.second.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
             kv.second.wal.enableFsync = walFsyncEnabled_;
+            kv.second.wal.syncEveryWrite = walSyncEveryWrite_;
             if (!kv.second.wal.stream.is_open()) {
                 kv.second.wal.open();
             }
@@ -1486,6 +1515,7 @@ bool BlackBox::createIndex(const std::string& name, const IndexSchema& schema) {
         indexes_[name].wal.flushThresholdBytes = walFlushBytes_;
         indexes_[name].wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
         indexes_[name].wal.enableFsync = walFsyncEnabled_;
+        indexes_[name].wal.syncEveryWrite = walSyncEveryWrite_;
         indexes_[name].wal.reset();
         indexes_[name].wal.open();
         if (indexes_[name].wal.schemaMismatch) {
@@ -3593,6 +3623,7 @@ bool BlackBox::loadSnapshot(const std::string& path) {
             state.wal.flushThresholdBytes = walFlushBytes_;
             state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
             state.wal.enableFsync = walFsyncEnabled_;
+            state.wal.syncEveryWrite = walSyncEveryWrite_;
             state.wal.open();
             replayWal(state, maxWalPos);
             refreshAverages(state);
@@ -3646,9 +3677,15 @@ nlohmann::json BlackBox::migrateCompatibility(const std::string& snapshotPath) c
 }
 
 void BlackBox::loadWalOnly() {
+    scanOrphanWalFiles();
+    (void)writeManifest();
+}
+
+size_t BlackBox::scanOrphanWalFiles() {
     namespace fs = std::filesystem;
-    if (dataDir_.empty()) return;
-    std::cerr << "BlackBox: scanning WAL-only in " << dataDir_ << "\n";
+    if (dataDir_.empty()) return 0;
+    size_t discovered = 0;
+    std::cerr << "BlackBox: scanning for orphan WAL files in " << dataDir_ << "\n";
     for (const auto& entry : fs::directory_iterator(dataDir_)) {
         if (!entry.is_regular_file()) continue;
         auto path = entry.path();
@@ -3680,6 +3717,7 @@ void BlackBox::loadWalOnly() {
         state.wal.flushThresholdBytes = walFlushBytes_;
         state.wal.flushInterval = std::chrono::milliseconds(walFlushMs_);
         state.wal.enableFsync = walFsyncEnabled_;
+        state.wal.syncEveryWrite = walSyncEveryWrite_;
         state.wal.open();
         if (!state.wal.headerSchemaId.empty() && !state.schema.schemaId.empty() && state.wal.headerSchemaId != state.schema.schemaId) {
             state.wal.schemaMismatch = true;
@@ -3695,8 +3733,9 @@ void BlackBox::loadWalOnly() {
         rebuildQueryValues(state);
         indexes_[name] = std::move(state);
         std::cerr << "BlackBox: built index " << name << " from WAL\n";
+        ++discovered;
     }
-    (void)writeManifest();
+    return discovered;
 }
 
 void BlackBox::configureSchema(IndexState& state) {

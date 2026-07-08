@@ -65,6 +65,11 @@ inline void readLE(std::istream& in, T& value) {
         std::chrono::steady_clock::time_point lastFlush = std::chrono::steady_clock::now();
         std::chrono::milliseconds flushInterval{200};
         bool enableFsync = true;
+        // When true, every append() fsyncs immediately (survives power loss,
+        // at a latency cost). When false, fsync is batched by
+        // flushThresholdBytes/flushInterval, but the OS-level write() still
+        // happens on every append regardless of this flag.
+        bool syncEveryWrite = false;
         bool legacyFormat = false;
         uint16_t fileVersion = 0;
         uint16_t fileFlags = 0;
@@ -453,6 +458,7 @@ private:
     uint64_t walFlushBytes_ = 64 * 1024;
     uint64_t walFlushMs_ = 200;
     bool walFsyncEnabled_ = true;
+    bool walSyncEveryWrite_ = false;
     std::atomic<bool> manifestDirty_{false};
     std::thread maintenanceThread_;
     std::atomic<bool> stopMaintenance_{false};
@@ -512,6 +518,12 @@ private:
     bool writeManifest() const;
     void replayWal(IndexState& idx, uint64_t startOffset = 0);
     void loadWalOnly();
+    // Scans dataDir_ for ".wal" files that aren't already in indexes_ and
+    // rebuilds an IndexState for each purely from its WAL. Used both when the
+    // manifest is entirely missing and when a manifest loaded successfully but
+    // doesn't (yet) list every index -- e.g. an index created and written to
+    // between manifest flushes. Returns the number of indexes discovered.
+    size_t scanOrphanWalFiles();
     void configureSchema(IndexState& state);
     void persistSchema(const std::string& name, const IndexState& state) const;
     std::optional<std::string> extractCustomId(const IndexState& idx, const nlohmann::json& doc) const;

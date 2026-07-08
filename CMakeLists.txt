@@ -55,3 +55,22 @@ add_executable(BlackBoxTests
 target_include_directories(BlackBoxTests PRIVATE include)
 target_compile_options(BlackBoxTests PRIVATE ${BLACKBOX_OPT_FLAGS})
 target_link_libraries(BlackBoxTests PRIVATE Threads::Threads)
+
+# Durability tests (crash/restart, WAL replay, corruption recovery). POSIX-only
+# (uses fork() to simulate crashes); skipped on MSVC/Windows generators.
+if(NOT WIN32)
+  add_executable(BlackBoxDurabilityTests
+      src/engine/BlackBox.cpp
+      src/core/Analyzer.cpp
+      src/storage/LogStore.cpp
+      src/algorithms/SearchAlgorithms.cpp
+      tests/DurabilityTests.cpp
+  )
+  target_include_directories(BlackBoxDurabilityTests PRIVATE include)
+  target_compile_options(BlackBoxDurabilityTests PRIVATE ${BLACKBOX_OPT_FLAGS})
+  target_link_libraries(BlackBoxDurabilityTests PRIVATE Threads::Threads)
+
+  enable_testing()
+  add_test(NAME durability COMMAND BlackBoxDurabilityTests)
+  add_test(NAME engine COMMAND BlackBoxTests)
+endif()
